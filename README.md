@@ -16,7 +16,7 @@
 ## Architecture
 
 ```
-quant_trading_system/
+openquant/
 ├── core/              # State Machine & Double-Entry Ledger (Memory)
 ├── data/              # Market Data Ingestion & Indicators (Sensors)
 ├── strategy/          # Multi-Factor Scoring & Signal Generation (Brain)
@@ -137,17 +137,17 @@ python3 -m venv .venv
 source .venv/bin/activate
 
 # Install
-pip install -r quant_trading_system/requirements.txt
+pip install -r requirements.txt
 
 # Test
-python -m pytest quant_trading_system/tests/ -v
+python -m pytest tests/ -v
 
 # Configure (edit API keys)
-cp quant_trading_system/config/settings.json quant_trading_system/config/settings.local.json
+cp config/settings.json config/settings.local.json
 # Edit settings.local.json with your Binance API keys
 
 # Run
-python quant_trading_system/main.py
+python main.py
 ```
 
 ---
@@ -163,7 +163,7 @@ python quant_trading_system/main.py
 ## 系统架构
 
 ```
-quant_trading_system/
+openquant/
 ├── core/              # 状态机 & 复式记账账本（记忆）
 ├── data/              # 行情数据摄取 & 技术指标（传感器）
 ├── strategy/          # 多因子评分 & 信号生成（大脑）
@@ -284,17 +284,17 @@ python3 -m venv .venv
 source .venv/bin/activate
 
 # 安装依赖
-pip install -r quant_trading_system/requirements.txt
+pip install -r requirements.txt
 
 # 运行测试
-python -m pytest quant_trading_system/tests/ -v
+python -m pytest tests/ -v
 
 # 配置（编辑 API 密钥）
-cp quant_trading_system/config/settings.json quant_trading_system/config/settings.local.json
+cp config/settings.json config/settings.local.json
 # 编辑 settings.local.json，填入你的 Binance API 密钥
 
 # 启动
-python quant_trading_system/main.py
+python main.py
 ```
 
 ---
