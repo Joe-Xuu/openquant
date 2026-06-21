@@ -5,7 +5,8 @@
 
 ---
 
-# English {#english}
+<a id="english"></a>
+# 🇬🇧 English
 
 ## Overview
 
@@ -152,7 +153,8 @@ python main.py
 
 ---
 
-# 中文 {#chinese}
+<a id="chinese"></a>
+# 🇨🇳 中文
 
 ## 概述
 
