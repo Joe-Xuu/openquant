@@ -1,0 +1,103 @@
+{
+    "_comment": "=== Quantitative Trading System Configuration ===",
+
+    "exchange": {
+        "name": "binance",
+        "api_key": "YOUR_BINANCE_API_KEY_HERE",
+        "api_secret": "YOUR_BINANCE_API_SECRET_HERE",
+        "testnet": true,
+        "testnet_api_key": "YOUR_TESTNET_API_KEY_HERE",
+        "testnet_api_secret": "YOUR_TESTNET_API_SECRET_HERE",
+        "rest_base_url": "https://api.binance.com",
+        "testnet_rest_base_url": "https://testnet.binance.vision",
+        "ws_base_url": "wss://stream.binance.com:9443/ws",
+        "testnet_ws_base_url": "wss://testnet.binance.vision/ws",
+        "recv_window": 5000,
+        "rate_limit_rps": 10.0
+    },
+
+    "trading": {
+        "symbols": ["BTCUSDT", "ETHUSDT"],
+        "base_quote_asset": "USDT",
+        "initial_capital": 10000.0,
+        "max_positions_per_symbol": 1,
+        "max_total_positions": 5,
+        "order_timeout_seconds": 30,
+        "slippage_bps": 2.5
+    },
+
+    "risk": {
+        "max_drawdown_pct": 15.0,
+        "max_daily_loss_pct": 5.0,
+        "max_position_size_pct": 20.0,
+        "max_leverage": 1.0,
+        "max_exposure_pct": 80.0,
+        "stop_loss_pct": 2.0,
+        "trailing_stop_pct": 1.5,
+        "circuit_breaker": {
+            "consecutive_losses": 5,
+            "volatility_spike_multiplier": 3.0,
+            "cooldown_minutes": 30
+        }
+    },
+
+    "strategy": {
+        "mode": "regime_switching",
+        "regime_detection": {
+            "lookback_periods": 100,
+            "adx_threshold": 25,
+            "volatility_window": 20,
+            "volatility_percentile_low": 25,
+            "volatility_percentile_high": 75
+        },
+        "grid_trading": {
+            "type": "geometric",
+            "upper_bound_pct": 5.0,
+            "lower_bound_pct": 5.0,
+            "grid_levels": 10,
+            "profit_per_grid_pct": 0.5,
+            "rebalance_threshold_pct": 1.0
+        },
+        "trend_following": {
+            "ema_fast": 12,
+            "ema_slow": 26,
+            "macd_signal": 9,
+            "atr_period": 14,
+            "atr_multiplier": 2.0,
+            "trailing_stop_atr_multiplier": 3.0
+        },
+        "multi_factor": {
+            "weights": {
+                "trend_strength": 0.30,
+                "volatility_regime": 0.25,
+                "momentum": 0.20,
+                "volume_profile": 0.15,
+                "market_microstructure": 0.10
+            }
+        }
+    },
+
+    "data": {
+        "kline_intervals": ["1m", "5m", "15m", "1h"],
+        "primary_interval": "5m",
+        "max_klines_per_request": 500,
+        "ws_reconnect_delay_seconds": 5,
+        "indicator_cache_ttl_seconds": 60
+    },
+
+    "database": {
+        "path": "data/trading_ledger.db",
+        "journal_mode": "WAL",
+        "synchronous": "NORMAL",
+        "busy_timeout_ms": 5000,
+        "cache_size_kb": -64000
+    },
+
+    "logging": {
+        "level": "INFO",
+        "file": "logs/trading_system.log",
+        "rotation": "10 MB",
+        "retention": "30 days",
+        "json_format": false
+    }
+}
