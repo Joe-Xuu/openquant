@@ -1,0 +1,142 @@
+
+============================================================
+  BTCUSDT
+============================================================
+  Loaded 52000 candles
+  Range: 2025-12-23 → 2026-06-21
+  Price: $87711.79 → $64264.00
+  B&H: -26.73%
+
+  [GRID ONLY]
+  Return: +379.46%  |  Sharpe: 10.77
+  Trades: 1129  |  Win Rate: 87.6%
+  Profit Factor: 4.97  |  Max DD: 0.9%
+  Calmar: 439.80  |  Sortino: 157.00
+
+  [TREND ONLY]
+  Return: -42.82%  |  Sharpe: -2.12
+  Trades: 87  |  Win Rate: 40.2%
+  Profit Factor: 0.18  |  Max DD: 47.6%
+  Calmar: 0.90  |  Sortino: -2.76
+
+  [REGIME SWITCH]
+  Return: -24.93%  |  Sharpe: -2.15
+  Trades: 144  |  Win Rate: 54.9%
+  Profit Factor: 0.30  |  Max DD: 38.2%
+  Calmar: 0.65  |  Sortino: -2.24
+  Regime: 68 switches, Grid 7% / Trend 93%
+
+============================================================
+  ETHUSDT
+============================================================
+  Loaded 52000 candles
+  Range: 2025-12-23 → 2026-06-21
+  Price: $2973.34 → $1737.30
+  B&H: -41.57%
+
+  [GRID ONLY]
+  Return: +573.46%  |  Sharpe: 13.13
+  Trades: 1851  |  Win Rate: 92.3%
+  Profit Factor: 11.28  |  Max DD: 0.6%
+  Calmar: 1037.62  |  Sortino: 225.21
+
+  [TREND ONLY]
+  Return: -50.31%  |  Sharpe: -1.93
+  Trades: 56  |  Win Rate: 35.7%
+  Profit Factor: 0.14  |  Max DD: 58.3%
+  Calmar: 0.86  |  Sortino: -2.52
+
+  [REGIME SWITCH]
+  Return: -39.42%  |  Sharpe: -2.38
+  Trades: 119  |  Win Rate: 63.0%
+  Profit Factor: 0.25  |  Max DD: 50.0%
+  Calmar: 0.79  |  Sortino: -2.35
+  Regime: 64 switches, Grid 6% / Trend 94%
+
+============================================================
+  SOLUSDT
+============================================================
+  Loaded 52000 candles
+  Range: 2025-12-23 → 2026-06-21
+  Price: $125.04 → $74.19
+  B&H: -40.67%
+
+  [GRID ONLY]
+  Return: +721.82%  |  Sharpe: 14.17
+  Trades: 2252  |  Win Rate: 92.2%
+  Profit Factor: 9.59  |  Max DD: 0.7%
+  Calmar: 1053.61  |  Sortino: 252.11
+
+  [TREND ONLY]
+  Return: -50.46%  |  Sharpe: -1.68
+  Trades: 65  |  Win Rate: 44.6%
+  Profit Factor: 0.17  |  Max DD: 62.1%
+  Calmar: 0.81  |  Sortino: -2.18
+
+  [REGIME SWITCH]
+  Return: +45.60%  |  Sharpe: 2.49
+  Trades: 275  |  Win Rate: 76.0%
+  Profit Factor: 0.91  |  Max DD: 24.2%
+  Calmar: 1.89  |  Sortino: 3.16
+  Regime: 88 switches, Grid 11% / Trend 89%
+
+
+==========================================================================================
+  FINAL COMPARISON
+==========================================================================================
+
+  --- Return % ---
+  Symbol               Grid Only        Trend Only     Regime Switch
+  ------------------------------------------------------------
+  BTCUSDT                 379.46            -42.82            -24.93
+  ETHUSDT                 573.46            -50.31            -39.42
+  SOLUSDT                 721.82            -50.46             45.60
+
+  --- Sharpe ---
+  Symbol               Grid Only        Trend Only     Regime Switch
+  ------------------------------------------------------------
+  BTCUSDT                  10.77             -2.12             -2.15
+  ETHUSDT                  13.13             -1.93             -2.38
+  SOLUSDT                  14.17             -1.68              2.49
+
+  --- Max DD % ---
+  Symbol               Grid Only        Trend Only     Regime Switch
+  ------------------------------------------------------------
+  BTCUSDT                   0.86             47.64             38.20
+  ETHUSDT                   0.55             58.33             50.00
+  SOLUSDT                   0.69             62.06             24.19
+
+  --- Win Rate % ---
+  Symbol               Grid Only        Trend Only     Regime Switch
+  ------------------------------------------------------------
+  BTCUSDT                  87.60             40.23             54.86
+  ETHUSDT                  92.33             35.71             63.03
+  SOLUSDT                  92.23             44.62             76.00
+
+  --- Profit Factor ---
+  Symbol               Grid Only        Trend Only     Regime Switch
+  ------------------------------------------------------------
+  BTCUSDT                   4.97              0.18              0.30
+  ETHUSDT                  11.28              0.14              0.25
+  SOLUSDT                   9.59              0.17              0.91
+
+  --- Calmar ---
+  Symbol               Grid Only        Trend Only     Regime Switch
+  ------------------------------------------------------------
+  BTCUSDT                 439.80              0.90              0.65
+  ETHUSDT                1037.62              0.86              0.79
+  SOLUSDT                1053.61              0.81              1.89
+
+  --- Trades ---
+  Symbol               Grid Only        Trend Only     Regime Switch
+  ------------------------------------------------------------
+  BTCUSDT                   1129                87               144
+  ETHUSDT                   1851                56               119
+  SOLUSDT                   2252                65               275
+
+  --- WINNER ---
+  Symbol        Best Strategy             Return    Sharpe
+  -------------------------------------------------------
+  BTCUSDT       Grid Only               +379.46%     10.77
+  ETHUSDT       Grid Only               +573.46%     13.13
+  SOLUSDT       Grid Only               +721.82%     14.17
