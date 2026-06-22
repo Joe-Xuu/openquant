@@ -500,55 +500,41 @@ class TradingSystem:
         # 4. Generate strategy signal based on regime
         signal: Optional[StrategySignal] = None
 
-        if regime_result.is_trending and regime_result.confidence > 0.6:
-            # Trend mode
-            if not self.state_machine.state == SystemState.ACTIVE_TREND:
-                if self.state_machine.activate_trend():
-                    logger.info(f" Switching to TREND mode ({symbol}, score={regime_result.score:.3f})")
+        # -- ALWAYS run grid first (our best strategy) --
+        current_grid = self._grid_configs.get(symbol)
+        if current_grid is None:
+            ref_price = self.grid_strategy.compute_rebalance_price(ohlcv)
+            current_grid = self.grid_strategy.compute_grid(
+                reference_price=ref_price, symbol=symbol, atr=indicators.atr,
+            )
+            self._grid_configs[symbol] = current_grid
+            signal = self.grid_strategy.generate_signal(current_grid)
+            logger.info(f" Grid deployed for {symbol}: {len(current_grid.levels)} levels @ {ref_price:.2f}")
+            self.state_machine.activate_grid()
 
+        elif self.grid_strategy.check_rebalance(indicators.close, current_grid):
+            ref_price = self.grid_strategy.compute_rebalance_price(ohlcv)
+            new_grid = self.grid_strategy.compute_grid(
+                reference_price=ref_price, symbol=symbol, atr=indicators.atr,
+            )
+            self._grid_configs[symbol] = new_grid
+            signal = self.grid_strategy.generate_signal(new_grid)
+            logger.info(f" Grid rebalanced for {symbol} @ {ref_price:.2f}")
+
+        # -- If trending with high confidence, ALSO try trend (on top of grid) --
+        if regime_result.is_trending and regime_result.confidence > 0.80:
             trend_state = self._trend_states.get(symbol, TrendState.flat(symbol))
-            signal = self.trend_strategy.evaluate(
-                symbol=symbol,
-                current_price=indicators.close,
-                ema_fast_val=indicators.ema_fast,
-                ema_slow_val=indicators.ema_slow,
-                macd_hist=indicators.macd_hist,
-                atr=indicators.atr,
+            trend_signal = self.trend_strategy.evaluate(
+                symbol=symbol, current_price=indicators.close,
+                ema_fast_val=indicators.ema_fast, ema_slow_val=indicators.ema_slow,
+                macd_hist=indicators.macd_hist, atr=indicators.atr,
                 current_state=trend_state,
                 capital=self.ledger.get_total_equity(),
             )
+            if trend_signal is not None:
+                signal = trend_signal  # Trend entry/exit takes priority over grid
 
-        elif regime_result.is_ranging and regime_result.confidence > 0.6:
-            # Grid mode
-            if not self.state_machine.state == SystemState.ACTIVE_GRID:
-                if self.state_machine.activate_grid():
-                    logger.info(f" Switching to GRID mode ({symbol}, score={regime_result.score:.3f})")
-
-            current_grid = self._grid_configs.get(symbol)
-            if current_grid is None:
-                # Start a new grid
-                ref_price = self.grid_strategy.compute_rebalance_price(ohlcv)
-                current_grid = self.grid_strategy.compute_grid(
-                    reference_price=ref_price,
-                    symbol=symbol,
-                    atr=indicators.atr,
-                )
-                self._grid_configs[symbol] = current_grid
-                signal = self.grid_strategy.generate_signal(current_grid)
-
-            elif self.grid_strategy.check_rebalance(indicators.close, current_grid):
-                # Grid needs rebalancing
-                logger.info(f"Rebalancing grid for {symbol} at {indicators.close}")
-                ref_price = self.grid_strategy.compute_rebalance_price(ohlcv)
-                new_grid = self.grid_strategy.compute_grid(
-                    reference_price=ref_price,
-                    symbol=symbol,
-                    atr=indicators.atr,
-                )
-                self._grid_configs[symbol] = new_grid
-                signal = self.grid_strategy.generate_signal(new_grid)
-
-        # 5. No signal? Check if we need to stop active strategy
+        # 5. No signal? Nothing to do this tick
         if signal is None and regime_result.switched:
             prev_mode = "trend" if regime_result.is_ranging else "grid"
             logger.info(f"Regime switch detected — closing {prev_mode} position for {symbol}")
