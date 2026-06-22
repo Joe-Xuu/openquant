@@ -178,47 +178,52 @@ def run_traced_backtest(
 
 def find_best_segment(
     equity_curve: List[Dict],
+    events: List[Dict],
     window: int = 100,
-    metric: str = "sharpe",
+    min_trades: int = 4,
 ) -> Tuple[int, int, float]:
     """
-    Find the best performing 100-candle window.
+    Find the 100-candle window with the most trading activity AND best return.
 
-    Args:
-        equity_curve: List of {index, equity, price} dicts.
-        window: Number of candles in the segment.
-        metric: "sharpe" or "return".
-
-    Returns:
-        (start_index, end_index, score).
+    Filters to segments with at least `min_trades` buy/sell pairs,
+    then picks the one with highest Sharpe. This guarantees the chart
+    actually shows trade markers.
     """
     best_score = -float('inf')
     best_start = 0
 
+    # Build trade count per candle index
+    trade_counts = {}
+    for e in events:
+        idx = e['index']
+        trade_counts[idx] = trade_counts.get(idx, 0) + 1
+
     for i in range(len(equity_curve) - window):
+        # Count trades in this window
+        trades_in_window = sum(
+            trade_counts.get(j, 0) for j in range(i, i + window)
+        )
+        if trades_in_window < min_trades * 2:  # each trade has buy+sell
+            continue
+
         segment = equity_curve[i:i + window]
         returns = []
         for j in range(1, len(segment)):
             if segment[j - 1]['equity'] > 0:
-                returns.append(
-                    segment[j]['equity'] / segment[j - 1]['equity'] - 1
-                )
+                returns.append(segment[j]['equity'] / segment[j - 1]['equity'] - 1)
 
         if len(returns) < 10:
             continue
 
-        if metric == "sharpe":
-            mean_ret = sum(returns) / len(returns)
-            std_ret = (sum((r - mean_ret) ** 2 for r in returns) / (len(returns) - 1)) ** 0.5
-            score = mean_ret / std_ret if std_ret > 0 else 0
-        else:
-            score = segment[-1]['equity'] / segment[0]['equity'] - 1
+        mean_ret = sum(returns) / len(returns)
+        std_ret = (sum((r - mean_ret) ** 2 for r in returns) / (len(returns) - 1)) ** 0.5
+        score = mean_ret / std_ret if std_ret > 0 else 0
 
         if score > best_score:
             best_score = score
             best_start = i
 
-    return best_start, best_start + window, best_score
+    return best_start, best_start + window, best_score, trades_in_window if best_score > -float('inf') else 0
 
 
 # ============================================================================
@@ -452,41 +457,51 @@ def main():
 
     os.makedirs(args.output, exist_ok=True)
 
-    print(f"\n{'='*60}")
-    print(f"  OpenQuant Backtest Visualizer")
-    print(f"  Symbol: {args.symbol}  |  Strategy: {args.strategy}")
-    print(f"{'='*60}\n")
+    # Generate only the 2 best charts
+    targets = [
+        ("BTCUSDT", "grid_only"),
+        ("SOLUSDT", "grid_only"),
+    ]
 
     # Load data
     data = load_data(args.data)
-    if args.symbol not in data:
-        print(f"Symbol {args.symbol} not found in {args.data}")
-        print(f"Available: {list(data.keys())}")
-        return
-    ohlcv = data[args.symbol]
 
-    # Run traced backtest
-    print(f"Running traced backtest on {len(ohlcv)} candles...")
-    events, equity_curve, trades = run_traced_backtest(
-        ohlcv, strategy_mode=args.strategy, capital=args.capital,
-    )
-    print(f"  Found {len(events)} trade events, {len(trades)} completed trades")
+    for symbol, strategy in targets:
+        if symbol not in data:
+            print(f"Symbol {symbol} not found, skipping")
+            continue
 
-    # Find best segments
-    segments = [
-        ("sharpe", "Best Sharpe"),
-        ("return", "Best Return"),
-    ]
+        ohlcv = data[symbol]
+        print(f"\n{'='*60}")
+        print(f"  {symbol} — {strategy}")
+        print(f"  {len(ohlcv)} candles, "
+              f"${ohlcv[0]['close']:.2f} → ${ohlcv[-1]['close']:.2f}")
+        print(f"{'='*60}")
 
-    for metric, label in segments:
-        start, end, score = find_best_segment(equity_curve, window=100, metric=metric)
-        segment_ohlcv = ohlcv[start:end]
-
-        title = (
-            f"{args.symbol} — {args.strategy.replace('_',' ').title()} "
-            f"[{label}: {score:.3f}]"
+        # Run traced backtest
+        print(f"Running...", end=" ", flush=True)
+        events, equity_curve, trades = run_traced_backtest(
+            ohlcv, strategy_mode=strategy, capital=args.capital,
         )
-        filename = f"{args.output}/{args.symbol}_{args.strategy}_{metric}.png"
+
+        # Find best segment with actual trades
+        start, end, score, trade_count = find_best_segment(
+            equity_curve, events, window=100, min_trades=6,
+        )
+
+        if score == -float('inf'):
+            print(f"  WARNING: No segment with ≥6 trades found, lowering threshold...")
+            start, end, score, trade_count = find_best_segment(
+                equity_curve, events, window=100, min_trades=3,
+            )
+
+        active_trades = len([e for e in events if start <= e['index'] < end])
+        title = (
+            f"{symbol} — Grid Trading  [Sharpe: {score:.2f}  |  "
+            f"Trades: {active_trades}  |  "
+            f"${ohlcv[start]['close']:,.0f} → ${ohlcv[end-1]['close']:,.0f}]"
+        )
+        filename = f"{args.output}/{symbol}_{strategy}_best.png"
 
         plot_candlestick_with_trades(
             ohlcv=ohlcv,
@@ -499,8 +514,8 @@ def main():
         )
 
     print(f"\nDone! Charts saved to: {args.output}/")
-    print(f"  {args.symbol}_{args.strategy}_sharpe.png")
-    print(f"  {args.symbol}_{args.strategy}_return.png")
+    for f in sorted(os.listdir(args.output)):
+        print(f"  {f}")
 
 
 if __name__ == "__main__":

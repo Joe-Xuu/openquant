@@ -30,12 +30,17 @@ The Brain NEVER calls the Hands. main.py is the event bus.
 import asyncio
 import json
 import logging
+import os
 import signal
 import sys
 import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, List, Optional
+
+# Load environment variables from .env
+from dotenv import load_dotenv
+load_dotenv()
 
 # --- Core ---
 from core.local_ledger import LedgerEngine, get_ledger
@@ -174,11 +179,23 @@ class TradingSystem:
         )
 
         # --- Initialize Execution ---
-        api_cfg = config.get("exchange", {})
+        # Load API credentials: env vars take priority over config file
+        use_testnet = os.getenv("BINANCE_TESTNET", "true").lower() == "true"
+        api_key = os.getenv(
+            "BINANCE_TESTNET_API_KEY" if use_testnet else "BINANCE_API_KEY", ""
+        ) or api_cfg.get("testnet_api_key" if use_testnet else "api_key", "")
+        api_secret = os.getenv(
+            "BINANCE_TESTNET_API_SECRET" if use_testnet else "BINANCE_API_SECRET", ""
+        ) or api_cfg.get("testnet_api_secret" if use_testnet else "api_secret", "")
+
+        if not api_key or api_key.startswith("your_"):
+            logger.warning("  API keys not configured! Set them in .env file")
+            logger.warning("  cp .env.example .env  →  edit .env with your keys")
+
         self.exchange_client = ExchangeClient(
-            api_key=api_cfg.get("testnet_api_key" if api_cfg.get("testnet") else "api_key", ""),
-            api_secret=api_cfg.get("testnet_api_secret" if api_cfg.get("testnet") else "api_secret", ""),
-            testnet=api_cfg.get("testnet", True),
+            api_key=api_key,
+            api_secret=api_secret,
+            testnet=use_testnet,
             recv_window=api_cfg.get("recv_window", 5000),
             rate_limit_rps=api_cfg.get("rate_limit_rps", 10.0),
         )
