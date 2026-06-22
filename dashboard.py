@@ -87,22 +87,25 @@ var mainChart=null, volChart=null, candleSeries=null, volSeries=null;
 var gridLines=[], markerLines=[];
 var failCount=0;
 
-function initCharts(){
-  // Always recreate charts to avoid stale state
-  if(mainChart){try{mainChart.remove()}catch(e){}}
-  if(volChart){try{volChart.remove()}catch(e){}}
+function ensureCharts(){
+  if(mainChart) return;  // Charts already exist, reuse them
   var opts={layout:{background:{color:'#161b22'},textColor:'#8b949e'},grid:{vertLines:{color:'#21262d'},horzLines:{color:'#21262d'}},crosshair:{mode:0},rightPriceScale:{borderColor:'#30363d'},timeScale:{borderColor:'#30363d',timeVisible:true,secondsVisible:false}};
   mainChart=LightweightCharts.createChart(document.getElementById('chart'),Object.assign({},opts,{height:400}));
   volChart=LightweightCharts.createChart(document.getElementById('chart2'),Object.assign({},opts,{height:250}));
-  candleSeries=null; volSeries=null;
-  gridLines=[]; markerLines=[];
+}
+
+function clearAllSeries(){
+  if(candleSeries){try{mainChart.removeSeries(candleSeries)}catch(e){}} candleSeries=null;
+  if(volSeries){try{volChart.removeSeries(volSeries)}catch(e){}} volSeries=null;
+  gridLines.forEach(function(s){try{mainChart.removeSeries(s)}catch(e){}}); gridLines=[];
+  markerLines.forEach(function(s){try{mainChart.removeSeries(s)}catch(e){}}); markerLines=[];
 }
 
 function switchSymbol(sym,el){
   document.querySelectorAll('.tab').forEach(function(t){t.classList.remove('active')});
   el.classList.add('active');
   currentSymbol=sym;
-  initCharts();  // Fresh charts for new symbol
+  clearAllSeries();
   fetchData();
 }
 
