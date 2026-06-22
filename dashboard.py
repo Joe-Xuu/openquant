@@ -206,7 +206,7 @@ function renderChart(d){
       gridLines.push(ls);
     });
 
-    // Trade markers: colored dots on candles like Binance
+    // Trade markers: large colored dots on candles
     markerLines.forEach(function(s){try{mainChart.removeSeries(s)}catch(e){}});
     markerLines=[];
 
@@ -215,9 +215,9 @@ function renderChart(d){
       d.fill_markers.forEach(function(f,idx){
         var t=f.t||t0;
         if(f.side=='BUY'){
-          buyMarks.push({time:t,position:'inBar',color:'#00ff88',shape:'circle',size:2});
+          buyMarks.push({time:t,position:'inBar',color:'#00ff88',shape:'circle',size:3});
         }else{
-          sellMarks.push({time:t,position:'inBar',color:'#ff4444',shape:'circle',size:2});
+          sellMarks.push({time:t,position:'inBar',color:'#ff4444',shape:'circle',size:3});
         }
       });
       if(buyMarks.length>0){
@@ -228,6 +228,7 @@ function renderChart(d){
         var sm=mainChart.addLineSeries({color:'#ffffff00',lineWidth:0,priceLineVisible:false,lastValueVisible:false});
         sm.setMarkers(sellMarks); markerLines.push(sm);
       }
+      mainChart.timeScale().fitContent();
     }
   }catch(e){
     document.getElementById('err').textContent='Chart error: '+e.message;
@@ -285,7 +286,7 @@ def build_api(symbol):
     except:
         total_equity = 10000.0; unrealized_pnl_total = 0.0
 
-    # ---- LIVE GRID LEVELS (from exchange open orders) ----
+    # ---- GRID LEVELS (computed from strategy, plus live exchange orders) ----
     grid_levels = []
     orders_list = []
     try:
@@ -296,6 +297,22 @@ def build_api(symbol):
             orders_list.append({"side": o['side'], "price": float(o['price']),
                                "qty": float(o['origQty']), "status": o['status']})
     except:
+        pass
+
+    # Add INTENDED grid levels (both sides) from strategy config
+    try:
+        if price > 0:
+            from strategy.grid_strategy import GridStrategy
+            gs = GridStrategy(grid_type='geometric', upper_bound_pct=5.0, lower_bound_pct=5.0,
+                              grid_levels=10, profit_per_grid_pct=0.5, total_capital=7000)
+            full_grid = gs.compute_grid(price, symbol)
+            # Add all levels not already present
+            existing_prices = {g['price'] for g in grid_levels}
+            for lvl in full_grid.levels:
+                p = round(lvl.price, 2)
+                if p not in existing_prices:
+                    grid_levels.append({"side": lvl.side.value, "price": p})
+    except Exception:
         pass
 
     # ---- FILLS (last 24h) and Position (FIFO) ----
