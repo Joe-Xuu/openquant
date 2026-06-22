@@ -52,7 +52,10 @@ class BacktestConfig:
     initial_capital: float = 10000.0
     fee_pct: float = 0.1  # 0.1% per trade
     slippage_pct: float = 0.05  # 0.05% slippage
-    warmup_candles: int = 200  # candles needed for indicator warmup
+    max_position_pct: float = 25.0  # max single position as % of equity
+    warmup_candles: int = 200
+    confidence_threshold_trend: float = 0.92  # min confidence to switch to trend
+    min_strategy_bars: int = 96  # min bars (~8h) before allowing strategy switch  # candles needed for indicator warmup
     lookback_candles: int = 500  # max candles for indicator calculation (O(n) optimization)
     grid_upper_pct: float = 5.0
     grid_lower_pct: float = 5.0
@@ -186,8 +189,10 @@ class BacktestEngine:
     def __init__(self, config: BacktestConfig):
         self.cfg = config
         self.cash = config.initial_capital
-        self.position_qty = 0.0
-        self.position_entry_price = 0.0
+        self.position_qty = 0.0          # absolute quantity (always positive)
+        self.position_entry_price = 0.0   # average entry price
+        self.position_direction = "FLAT"  # "LONG", "SHORT", or "FLAT"
+        self.short_margin_locked = 0.0    # collateral locked for short position
         self.trades: List[Trade] = []
         self.equity_curve: List[EquityPoint] = []
         self._trade_id_counter = 0
@@ -216,6 +221,7 @@ class BacktestEngine:
         # Per-run state
         self._current_regime = MarketRegime.RANGING
         self._trend_state = TrendState.flat(config.symbol)
+        self._last_switch_bar = 0
         self._grid_config: Optional[GridConfig] = None
         self._active_grid_levels: Dict[int, Dict] = {}  # level_index → {side, price, qty, tp}
         self._filled_grid_levels: Dict[int, Dict] = {}  # filled buy/sell waiting for TP
@@ -254,7 +260,7 @@ class BacktestEngine:
             elif strategy_mode == "trend_only":
                 regime_result = self._force_trend_regime(indicators)
             else:
-                regime_result = self.regime_detector.detect(
+                raw_regime = self.regime_detector.detect(
                     ohlcv=window,
                     current_regime=self._current_regime,
                     adx=indicators.adx, plus_di=indicators.plus_di,
@@ -263,13 +269,37 @@ class BacktestEngine:
                     macd_hist=indicators.macd_hist, atr=indicators.atr,
                     volume=indicators.volume,
                 )
-                if regime_result.switched:
-                    self._regime_history.append((
-                        current_bar["timestamp"],
-                        regime_result.score,
-                    ))
+                raw_score = raw_regime.score
+                raw_confidence = raw_regime.confidence
 
-            self._current_regime = regime_result.regime
+                # ---- Strategy lock & confidence filter ----
+                bars_since_switch = i - self._last_switch_bar
+                locked = bars_since_switch < self.cfg.min_strategy_bars
+
+                switched_this_tick = False
+                if raw_regime.switched and not locked:
+                    if raw_regime.regime == MarketRegime.TRENDING:
+                        if raw_regime.confidence >= self.cfg.confidence_threshold_trend:
+                            self._current_regime = raw_regime.regime
+                            self._last_switch_bar = i
+                            switched_this_tick = True
+                            self._regime_history.append((current_bar["timestamp"], raw_regime.score))
+                            if self._grid_config is not None:
+                                self._cancel_unfilled_levels()
+                                self._grid_config = None
+                    else:
+                        self._current_regime = raw_regime.regime
+                        self._last_switch_bar = i
+                        switched_this_tick = True
+                        self._regime_history.append((current_bar["timestamp"], raw_regime.score))
+
+                regime_result = RegimeResult(
+                    regime=self._current_regime,
+                    score=raw_score,
+                    factor_scores=None,
+                    confidence=raw_confidence,
+                    switched=switched_this_tick,
+                )
 
             # Simulate fills on grid levels
             self._check_grid_fills(current_bar)
@@ -280,11 +310,15 @@ class BacktestEngine:
             # Mark-to-market equity
             self._record_equity(current_bar, indicators, regime_result)
 
-        # Close any remaining position
+        # Close any remaining position at end of backtest
         if self.position_qty > 0:
             last_price = ohlcv[-1]["close"]
             self._close_position(last_price, ohlcv[-1]["timestamp"], "end_of_backtest",
                                strategy_mode)
+        # Unlock any remaining margin
+        if self.short_margin_locked > 0:
+            self.cash += self.short_margin_locked
+            self.short_margin_locked = 0.0
 
         return self._calculate_performance(strategy_mode)
 
@@ -293,10 +327,13 @@ class BacktestEngine:
         self.cash = self.cfg.initial_capital
         self.position_qty = 0.0
         self.position_entry_price = 0.0
+        self.position_direction = "FLAT"
+        self.short_margin_locked = 0.0
         self.trades = []
         self.equity_curve = []
         self._current_regime = MarketRegime.RANGING
         self._trend_state = TrendState.flat(self.cfg.symbol)
+        self._last_switch_bar = 0
         self._grid_config = None
         self._active_grid_levels = {}
         self._filled_grid_levels = {}
@@ -386,17 +423,20 @@ class BacktestEngine:
             return
 
         if signal.action == SignalAction.START_TREND:
-            # Entry
             direction = TrendDirection(signal.metadata["direction"])
             target_qty = signal.metadata.get("position_size", 0)
 
             if self.position_qty > 0:
-                # Already in a position — only act if reversing
-                if (direction == TrendDirection.LONG and self._trend_state.direction == TrendDirection.SHORT) or \
-                   (direction == TrendDirection.SHORT and self._trend_state.direction == TrendDirection.LONG):
+                # Already in a position — act if reversing (LONG→SHORT or SHORT→LONG)
+                needs_reverse = (
+                    (direction == TrendDirection.LONG and self.position_direction == "SHORT") or
+                    (direction == TrendDirection.SHORT and self.position_direction == "LONG")
+                )
+                if needs_reverse:
                     self._close_position(price, bar["timestamp"], "trend_reversal", mode)
-                    self._open_position(price, bar["timestamp"], "BUY" if direction == TrendDirection.LONG else "SELL",
-                                       target_qty, mode)
+                    new_side = "BUY" if direction == TrendDirection.LONG else "SELL"
+                    self._open_position(price, bar["timestamp"], new_side, target_qty, mode)
+                # Same direction → ignore (already in position)
             else:
                 side = "BUY" if direction == TrendDirection.LONG else "SELL"
                 self._open_position(price, bar["timestamp"], side, target_qty, mode)
@@ -407,7 +447,6 @@ class BacktestEngine:
 
         elif signal.action == SignalAction.STOP_TREND:
             if self.position_qty > 0:
-                exit_side = "SELL" if self._trend_state.direction == TrendDirection.LONG else "BUY"
                 self._close_position(price, bar["timestamp"],
                                     signal.metadata.get("exit_reason", "signal"), mode)
             self._trend_state = TrendState.flat(self.cfg.symbol)
@@ -435,6 +474,9 @@ class BacktestEngine:
 
     def _check_grid_fills(self, bar: Dict):
         """Check if any active grid levels were hit this candle."""
+        # Grid is long-only — don't interfere with short positions
+        if self.position_direction == "SHORT":
+            return
         high, low = bar["high"], bar["low"]
 
         filled_indices = []
@@ -518,42 +560,101 @@ class BacktestEngine:
     # ------------------------------------------------------------------
 
     def _open_position(self, price: float, timestamp: str, side: str, quantity: float, mode: str):
-        """Open a new position (trend strategy)."""
-        if quantity <= 0:
+        """
+        Open a new position. Handles both LONG and SHORT.
+
+        LONG:  Buy asset with cash. Cash decreases, position is positive.
+               P&L = exit_price - entry_price.
+
+        SHORT: Sell borrowed asset, receive cash, lock margin (110% of notional).
+               Cash increases on open, but margin is locked.
+               P&L = entry_price - exit_price.
+        """
+        if quantity <= 0 or price <= 0:
             return
-        cost = price * quantity
-        fee = cost * self.cfg.fee_decimal
-        slippage = cost * self.cfg.slippage_decimal
-        total_cost = cost + fee + slippage
 
-        if total_cost > self.cash:
-            # Scale down
-            quantity = self.cash / (price * (1 + self.cfg.fee_decimal + self.cfg.slippage_decimal))
-            cost = price * quantity
-            fee = cost * self.cfg.fee_decimal
-            slippage = cost * self.cfg.slippage_decimal
-            total_cost = cost + fee + slippage
+        # Cap position size: max_position_pct% of current equity
+        equity = self._get_equity()
+        max_notional = equity * (self.cfg.max_position_pct / 100.0)
+        notional = price * quantity
+        if notional > max_notional:
+            quantity = max_notional / price
+            notional = max_notional
+        fee = notional * self.cfg.fee_decimal
+        slippage = notional * self.cfg.slippage_decimal
 
-        self.cash -= total_cost
-        self.position_qty = quantity
-        self.position_entry_price = price
+        if side.upper() == "BUY":
+            # ---- LONG: buy with cash ----
+            total_cost = notional + fee + slippage
+            if total_cost > self.cash:
+                quantity = self.cash / (price * (1 + self.cfg.fee_decimal + self.cfg.slippage_decimal))
+                notional = price * quantity
+                fee = notional * self.cfg.fee_decimal
+                slippage = notional * self.cfg.slippage_decimal
+                total_cost = notional + fee + slippage
+
+            self.cash -= total_cost
+            self.position_qty = quantity
+            self.position_direction = "LONG"
+            self.position_entry_price = price
+            self.short_margin_locked = 0.0
+
+        else:
+            # ---- SHORT: sell borrowed asset, lock margin ----
+            # Margin requirement: 110% of notional (conservative)
+            margin_required = notional * 1.10
+            available = self.cash
+            if margin_required > available:
+                # Scale down
+                quantity = available / (price * 1.10 * (1 + self.cfg.fee_decimal + self.cfg.slippage_decimal))
+                notional = price * quantity
+                fee = notional * self.cfg.fee_decimal
+                slippage = notional * self.cfg.slippage_decimal
+
+            # Receive cash from sale, lock margin
+            self.cash += notional  # receive sale proceeds
+            self.cash -= fee + slippage  # pay fees
+            self.short_margin_locked = notional * 1.10  # lock margin
+            self.position_qty = quantity
+            self.position_direction = "SHORT"
+            self.position_entry_price = price
 
     def _close_position(self, price: float, timestamp: str, reason: str, mode: str):
-        """Close current position."""
+        """
+        Close current position. Handles both LONG and SHORT.
+
+        LONG close:  Sell asset → receive cash. P&L = exit - entry.
+        SHORT close: Buy back asset → return it, unlock margin. P&L = entry - exit.
+        """
         if self.position_qty <= 0:
             return
-        revenue = price * self.position_qty
-        fee = revenue * self.cfg.fee_decimal
-        slippage = revenue * self.cfg.slippage_decimal
-        net_revenue = revenue - fee - slippage
+        notional = price * self.position_qty
+        fee = notional * self.cfg.fee_decimal
+        slippage = notional * self.cfg.slippage_decimal
 
-        pnl = net_revenue - (self.position_entry_price * self.position_qty)
-        pnl_pct = (price / self.position_entry_price - 1) * 100
+        if self.position_direction == "LONG":
+            # Sell the asset
+            net_revenue = notional - fee - slippage
+            pnl = net_revenue - (self.position_entry_price * self.position_qty)
+            pnl_pct = (price / self.position_entry_price - 1) * 100
+            trade_side = "SELL"
+
+            self.cash += net_revenue
+
+        else:
+            # SHORT: Buy back to cover
+            buyback_cost = notional + fee + slippage
+            pnl = (self.position_entry_price * self.position_qty) - notional - fee - slippage
+            pnl_pct = (self.position_entry_price / price - 1) * 100 if price > 0 else 0
+            trade_side = "BUY"
+
+            self.cash -= buyback_cost
+            self.cash += self.short_margin_locked  # Unlock margin
 
         self.trades.append(Trade(
             entry_time="", exit_time=timestamp,
             symbol=self.cfg.symbol,
-            side="SELL",
+            side=trade_side,
             strategy=mode,
             entry_price=self.position_entry_price,
             exit_price=price,
@@ -564,9 +665,10 @@ class BacktestEngine:
             exit_reason=reason,
         ))
 
-        self.cash += net_revenue
         self.position_qty = 0.0
         self.position_entry_price = 0.0
+        self.position_direction = "FLAT"
+        self.short_margin_locked = 0.0
 
     # ------------------------------------------------------------------
     # Equity Tracking
@@ -578,17 +680,30 @@ class BacktestEngine:
         return "backtest"
 
     def _get_equity(self) -> float:
-        """Current total equity = cash + position market value."""
-        # Use last known price for position valuation
+        """
+        Current total equity.
+        LONG: equity = cash + position_value
+        SHORT: equity = cash + short_margin_locked - position_liability
+               (unrealized P&L is built into this)
+        """
         pos_value = self.position_qty * self.position_entry_price
-        return self.cash + pos_value
+        if self.position_direction == "SHORT":
+            return self.cash + self.short_margin_locked - pos_value
+        else:
+            return self.cash + pos_value
 
     def _record_equity(self, bar: Dict, indicators: IndicatorBundle, regime: RegimeResult):
-        """Record equity point."""
+        """Record equity point with correct short position valuation."""
         pos_value = self.position_qty * bar["close"]
+        if self.position_direction == "SHORT":
+            # For shorts: equity rises as price drops
+            equity = self.cash + self.short_margin_locked - pos_value
+        else:
+            equity = self.cash + pos_value
+
         self.equity_curve.append(EquityPoint(
             timestamp=bar["timestamp"],
-            equity=self.cash + pos_value,
+            equity=equity,
             position_value=pos_value,
             cash=self.cash,
             regime=regime.regime.value,
@@ -711,22 +826,31 @@ def load_ohlcv(filepath: str) -> List[Dict]:
     return data
 
 
-def run_comparison(symbols: List[str], capital: float = 10000.0):
-    """Run full comparison across symbols and strategies."""
+def run_comparison(symbols: List[str], capital: float = 10000.0, data_file: str = "data/sampled_10k.json"):
+    """Run full comparison across symbols and strategies using sampled data."""
     strategies = ["grid_only", "trend_only", "regime_switch"]
     all_reports: Dict[str, Dict[str, PerformanceReport]] = {}
 
+    # Load combined sampled data
+    if os.path.exists(data_file):
+        with open(data_file, "r") as f:
+            all_ohlcv = json.load(f)
+        print(f"Using sampled data: {data_file} "
+              f"({sum(len(v) for v in all_ohlcv.values())} total candles)")
+    else:
+        # Fallback: load individual files
+        all_ohlcv = {}
+        for symbol in symbols:
+            fp = f"data/{symbol}_5m.json"
+            if os.path.exists(fp):
+                all_ohlcv[symbol] = load_ohlcv(fp)
+
     for symbol in symbols:
-        filepath = f"data/{symbol}_5m.json"
-        if not os.path.exists(filepath):
-            print(f"  Data not found: {filepath}, skipping {symbol}")
+        if symbol not in all_ohlcv:
+            print(f"  Data not found for {symbol}, skipping")
             continue
 
-        print(f"\n{'='*60}")
-        print(f"  {symbol}")
-        print(f"{'='*60}")
-
-        ohlcv = load_ohlcv(filepath)
+        ohlcv = all_ohlcv[symbol]
         print(f"  Loaded {len(ohlcv)} candles")
         print(f"  Range: {ohlcv[0]['timestamp'][:10]} → {ohlcv[-1]['timestamp'][:10]}")
         print(f"  Price: ${ohlcv[0]['close']:.2f} → ${ohlcv[-1]['close']:.2f}")
