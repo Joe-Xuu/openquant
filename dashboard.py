@@ -183,17 +183,21 @@ function renderChart(d){
     ensureCharts();
     var cdata=d.candles.map(function(c){return {time:c.t/1000,open:c.o,high:c.h,low:c.l,close:c.c,volume:c.v};});
 
-    // Candlestick — always create fresh
+    // Remove old candle/volume series before creating new ones
+    if(candleSeries){try{mainChart.removeSeries(candleSeries)}catch(e){}}
+    if(volSeries){try{volChart.removeSeries(volSeries)}catch(e){}}
+    // Remove old grid/marker series
+    gridLines.forEach(function(s){try{mainChart.removeSeries(s)}catch(e){}}); gridLines=[];
+    markerLines.forEach(function(s){try{mainChart.removeSeries(s)}catch(e){}}); markerLines=[];
+
+    // Create new series (only once per render)
     candleSeries=mainChart.addCandlestickSeries({upColor:'#3fb950',downColor:'#f85149',borderUpColor:'#3fb950',borderDownColor:'#f85149',wickUpColor:'#3fb950',wickDownColor:'#f85149'});
     candleSeries.setData(cdata);
 
-    // Volume — always create fresh
     volSeries=volChart.addHistogramSeries({color:'#3fb95055',priceFormat:{type:'volume'},priceScaleId:''});
     volSeries.setData(cdata.map(function(c){return {time:c.time,value:c.volume,color:c.c>=c.o?'#3fb95055':'#f8514955'};}));
 
-    // Grid lines (rebuild)
-    gridLines.forEach(function(s){try{mainChart.removeSeries(s)}catch(e){}});
-    gridLines=[];
+    // Grid lines
     var t0=cdata[0]?.time||0, t1=cdata[cdata.length-1]?.time||0;
     (d.grid_levels||[]).forEach(function(l){
       var ls=mainChart.addLineSeries({color:l.side=='BUY'?'#00b4d8':'#ff6b00',lineWidth:1,lineStyle:2,priceLineVisible:false,lastValueVisible:false});
@@ -201,10 +205,7 @@ function renderChart(d){
       gridLines.push(ls);
     });
 
-    // Trade markers: combine into buy/sell series for performance
-    markerLines.forEach(function(s){try{mainChart.removeSeries(s)}catch(e){}});
-    markerLines=[];
-
+    // Trade markers
     if(d.fill_markers.length>0){
       var buyData=[], sellData=[];
       d.fill_markers.forEach(function(f){
