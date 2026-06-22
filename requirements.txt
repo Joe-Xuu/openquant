@@ -38,6 +38,13 @@ loguru>=0.7.0
 # --- Cryptography (for API key handling) ---
 cryptography>=41.0.0
 
+# --- Configuration ---
+python-dotenv>=1.0.0
+
+# --- Visualization ---
+matplotlib>=3.8.0
+mplfinance>=0.12.10b0
+
 # --- Testing ---
 pytest>=7.4.0
 pytest-asyncio>=0.21.0

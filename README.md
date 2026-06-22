@@ -140,14 +140,36 @@ source .venv/bin/activate
 # Install
 pip install -r requirements.txt
 
-# Test
+# Unit tests
 python -m pytest tests/ -v
+```
 
-# Configure (edit API keys)
-cp config/settings.json config/settings.local.json
-# Edit settings.local.json with your Binance API keys
+### Backtest
+```bash
+# Download historical data
+python -c "
+import requests, json
+# See backtest.py for full data-fetching logic
+"
 
-# Run
+# Run backtest (3 symbols × 3 strategies ≈ 5 min)
+python backtest.py
+```
+
+### Visualization
+```bash
+# Generate candlestick charts with buy/sell markers
+python visualize.py --symbol BTCUSDT --strategy grid_only
+# Charts saved to charts/ directory
+```
+
+### Live Trading
+```bash
+# Configure API keys
+cp .env.example .env
+# Edit .env with your Binance API keys
+
+# Run live (use testnet first!)
 python main.py
 ```
 
@@ -290,12 +312,28 @@ pip install -r requirements.txt
 
 # 运行测试
 python -m pytest tests/ -v
+```
 
-# 配置（编辑 API 密钥）
-cp config/settings.json config/settings.local.json
-# 编辑 settings.local.json，填入你的 Binance API 密钥
+### 回测
+```bash
+# 运行回测（3 个标的 × 3 种策略 ≈ 5 分钟）
+python backtest.py
+```
 
-# 启动
+### 可视化
+```bash
+# 生成带买卖标记的 K 线图
+python visualize.py --symbol BTCUSDT --strategy grid_only
+# 图表保存到 charts/ 目录
+```
+
+### 实盘交易
+```bash
+# 配置 API 密钥
+cp .env.example .env
+# 编辑 .env 填入你的 Binance API 密钥
+
+# 启动（先用模拟盘！）
 python main.py
 ```
 
