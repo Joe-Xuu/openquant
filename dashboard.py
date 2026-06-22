@@ -138,15 +138,11 @@ function fetchData(){
 
 function renderStats(d){
   var eqClass=d.total_pnl>=0?'g':'r';
-  var pnlClass=d.pnl>=0?'g':'r';
-  var upnlClass=d.unrealized_pnl>=0?'g':'r';
-  var posStr=d.net_qty>0.0001?d.net_qty.toFixed(4)+' L':d.net_qty<-0.0001?Math.abs(d.net_qty).toFixed(4)+' S':'无';
   document.getElementById('stats').innerHTML=
-    '<div class=card><div class="val '+eqClass+'">$'+d.equity.toLocaleString()+'</div><div class=lbl>真实总权益 (交易所)</div></div>'+
+    '<div class=card><div class="val '+eqClass+'">$'+d.equity.toLocaleString()+'</div><div class=lbl>交易所总权益</div></div>'+
     '<div class=card><div class="val '+eqClass+'">'+(d.total_pnl>=0?'+':'')+d.total_pnl.toFixed(2)+'</div><div class=lbl>总盈亏</div></div>'+
-    '<div class=card><div class="val '+pnlClass+'">'+(d.pnl>=0?'+':'')+d.pnl.toFixed(4)+'</div><div class=lbl>已实现 ('+d.symbol+')</div></div>'+
-    '<div class=card><div class="val '+upnlClass+'">'+(d.unrealized_pnl>=0?'+':'')+d.unrealized_pnl.toFixed(2)+'</div><div class=lbl>未实现 ('+d.symbol+')</div></div>'+
-    '<div class=card><div class=val>'+posStr+' @ '+d.avg_entry.toFixed(2)+'</div><div class=lbl>仓位 / 挂单'+d.open_orders+' · 成交'+d.filled_today+'笔</div></div>';
+    '<div class=card><div class=val>'+d.open_orders+' ORDER</div><div class=lbl>当前挂单</div></div>'+
+    '<div class=card><div class=val>'+d.filled_today+' FILL</div><div class=lbl>今日成交</div></div>';
 }
 
 function renderOrders(d){
@@ -159,12 +155,11 @@ function renderOrders(d){
 }
 
 function renderFills(d){
-  var h='<div class=card><table class=tbl><tr><th>方向</th><th>价格</th><th>数量</th><th>未实现盈亏</th></tr>';
+  var h='<div class=card><table class=tbl><tr><th>方向</th><th>价格</th><th>数量</th><th>时间</th></tr>';
   if(d.fills.length===0) h+='<tr><td colspan=4 style=color:#555>暂无成交</td></tr>';
-  d.fills.forEach(function(f){
-    var upnl=f.price>0?(d.price-f.price)*f.qty*(f.side=='BUY'?1:-1):0;
-    var cls=upnl>=0?'g':'r';
-    h+='<tr><td><span class="'+(f.side=='SELL'?'sell':'buy')+'">'+f.side+'</span></td><td>$'+f.price.toFixed(2)+'</td><td>'+f.qty.toFixed(5)+'</td><td class='+cls+'>'+(upnl>=0?'+':'')+upnl.toFixed(4)+'</td></tr>';
+  d.fills.slice(-10).reverse().forEach(function(f){
+    var ts=f.time?new Date(f.time).toLocaleString():'';
+    h+='<tr><td><span class="'+(f.side=='SELL'?'sell':'buy')+'">'+f.side+'</span></td><td>$'+f.price.toFixed(2)+'</td><td>'+f.qty.toFixed(5)+'</td><td style=font-size:11px;color:#888>'+ts+'</td></tr>';
   });
   document.getElementById('fills').innerHTML=h+'</table></div>';
 }
