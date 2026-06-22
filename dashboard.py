@@ -5,6 +5,7 @@ http://localhost:8080
 """
 
 import json, os, sys, time, requests
+from decimal import Decimal
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from datetime import datetime, timezone
 from urllib.parse import urlparse, parse_qs
@@ -14,6 +15,13 @@ from core.local_ledger import get_ledger
 
 # PostgreSQL connection from environment
 LEDGER_DSN = None  # uses env vars PG_HOST/PG_USER/etc
+
+# PostgreSQL returns NUMERIC as Decimal — convert for JSON
+def _to_float(v):
+    if isinstance(v, Decimal): return float(v)
+    if isinstance(v, dict): return {k: _to_float(vv) for k, vv in v.items()}
+    if isinstance(v, list): return [_to_float(x) for x in v]
+    return v
 
 # Show fills from last 24 hours (not just current session)
 FILL_LOOKBACK_MS = 24 * 3600 * 1000
@@ -228,11 +236,9 @@ setInterval(fetchData,5000);
 
 def build_api(symbol):
     ledger = get_ledger(LEDGER_DSN)
-    conn = ledger._get_connection()
 
     # Fetch candles from Binance
     try:
-        # Fetch ~25 hours of 5m candles (300 candles)
         r = requests.get(f"https://api.binance.com/api/v3/klines?symbol={symbol}&interval=5m&limit=300", timeout=5)
         candles = [{"t": c[0], "o": float(c[1]), "h": float(c[2]), "l": float(c[3]), "c": float(c[4]), "v": float(c[5])} for c in r.json()]
         price = candles[-1]["c"]
@@ -248,9 +254,9 @@ def build_api(symbol):
     stats = ledger.get_trade_statistics()
 
     # Open orders from ledger
-    orders = conn.execute(
-        "SELECT order_id, symbol, side, price, quantity, status FROM orders WHERE status IN ('OPEN','PENDING') AND symbol=? ORDER BY price DESC", (symbol,)
-    ).fetchall()
+    orders = ledger._query(
+        "SELECT order_id, symbol, side, price, quantity, status FROM orders WHERE status IN ('OPEN','PENDING') AND symbol=%s ORDER BY price DESC", (symbol,)
+    )
 
     # Exchange fills (only from current session)
     fills = []
@@ -317,7 +323,7 @@ def build_api(symbol):
     # Grid levels from ledger orders
     grid_levels = [{"side": o["side"], "price": o["price"]} for o in orders]
 
-    return {
+    data = {
         "symbol": symbol,
         "price": price,
         "equity": round(equity + realized_pnl, 2),
@@ -330,12 +336,13 @@ def build_api(symbol):
         "filled_today": len(fills),
         "total_trades": stats.get("total_trades", 0),
         "candles": candles,
-        "orders": [{"side": o["side"], "price": o["price"], "qty": o["quantity"], "status": o["status"]} for o in orders],
-        "fills": [{"side": f["side"], "price": f["price"], "qty": f["qty"]} for f in fills],
-        "completed_trades": completed,
+        "orders": [{"side": o["side"], "price": _to_float(o["price"]), "qty": _to_float(o["quantity"]), "status": o["status"]} for o in orders],
+        "fills": [{"side": f["side"], "price": _to_float(f["price"]), "qty": _to_float(f["qty"])} for f in fills],
+        "completed_trades": [{"side": t["side"], "entry": _to_float(t["entry"]), "exit": _to_float(t["exit"]), "qty": _to_float(t["qty"]), "pnl": _to_float(t["pnl"])} for t in completed],
         "fill_markers": fill_markers,
         "grid_levels": grid_levels,
     }
+    return _to_float(data)
 
 
 class Handler(BaseHTTPRequestHandler):
