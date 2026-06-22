@@ -25,6 +25,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple
@@ -545,7 +546,36 @@ class OrderManager:
                             filled_quantity=fill_qty,
                             fill_price=fill_price,
                         )
-                        logger.info(f"  Fill: {symbol} {fill_side} {fill_qty} @ ${fill_price:.2f}")
+                    logger.info(f"  Fill: {symbol} {fill_side} {fill_qty} @ ${fill_price:.2f}")
+
+                    # ---- AUTO PLACE TAKE-PROFIT ORDER ----
+                    # When a BUY fills, place a SELL at 0.5% profit.
+                    # Works regardless of whether we found the original order in ledger.
+                    if fill_side == "BUY" and fill_qty > 0:
+                        tp_price = round(fill_price * 1.005, 2)
+                        # Deduplicate by exchange trade ID
+                        trade_id = str(trade.get("id", ""))
+                        tp_tag = f"tp_{trade_id}"
+                        already_placed = any(
+                            o.client_order_id and o.client_order_id == tp_tag
+                            for o in self._orders.values()
+                        )
+                        if not already_placed:
+                            try:
+                                tp_req = OrderRequest(
+                                    symbol=symbol, side="SELL", order_type="LIMIT",
+                                    price=tp_price, quantity=round(fill_qty, 5),
+                                    time_in_force="GTC", client_order_id=tp_tag,
+                                )
+                                tp_resp = await self._client.place_order(tp_req)
+                                logger.info(f"  TP placed: SELL {fill_qty:.5f} @ ${tp_price:.2f} (entry ${fill_price:.2f})")
+                                self._orders[tp_tag] = TrackedOrder(
+                                    order_id=tp_tag, exchange_order_id=tp_resp.exchange_order_id,
+                                    symbol=symbol, side="SELL", order_type="LIMIT",
+                                    price=tp_price, quantity=fill_qty, status="OPEN",
+                                )
+                            except Exception as e:
+                                logger.error(f"  Failed to place TP: {e}")
 
             except Exception as e:
                 logger.debug(f"Reconciliation skipped for {symbol}: {e}")
