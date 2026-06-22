@@ -877,7 +877,7 @@ class GridStrategy:
         """
         # Include hour-window for uniqueness across restarts
         import time as _time
-        window = int(_time.time() / 3600)
+        window = int(_time.time() / 300)  # 5-min window for uniqueness
         seed = f"{symbol}|{reference_price:.2f}|{upper_bound:.2f}|{lower_bound:.2f}|{window}"
         return hashlib.sha256(seed.encode()).hexdigest()[:12]
 

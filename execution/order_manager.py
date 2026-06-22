@@ -501,7 +501,7 @@ class OrderManager:
         """
         Sync local order state with exchange — detect fills via myTrades API.
         """
-        symbols = set(o.symbol for o in self._orders.values()) or {"BTCUSDT", "ETHUSDT"}
+        symbols = set(o.symbol for o in self._orders.values()) or {"DOGEUSDT"}
         for symbol in symbols:
             try:
                 # Query recent trades (fills) from exchange

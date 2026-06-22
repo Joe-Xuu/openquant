@@ -420,10 +420,10 @@ class RiskGuard:
                 price = level_dict.get("price", 0)
                 qty = level_dict.get("quantity", 0)
                 notional = price * qty
-                if notional < 10.0:  # $10 minimum
+                if notional < 0.5:  # $0.50 minimum (small account compatible)
                     return RiskVerdict.block(
                         f"DUST_ORDER: level price={price}, qty={qty}, "
-                        f"notional={notional:.2f} < $10 minimum"
+                        f"notional={notional:.2f} < \$0.50 minimum"
                     )
 
         elif signal.is_trend_signal():

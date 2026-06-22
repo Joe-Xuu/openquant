@@ -164,7 +164,7 @@ class TradingSystem:
 
         # Grid uses 70% of capital so total exposure stays within risk limit (80%)
         max_exposure_pct = config.get("risk", {}).get("max_exposure_pct", 80.0) / 100.0
-        grid_capital = config.get("trading", {}).get("initial_capital", 10000.0) * 0.60  # 60% for grid, 40% buffer
+        grid_capital = config.get("trading", {}).get("initial_capital", 10000.0) * 0.85  # 85% for small account
 
         self.grid_strategy = GridStrategy(
             grid_type=grid_cfg.get("type", "geometric"),

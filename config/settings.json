@@ -17,9 +17,9 @@
     },
 
     "trading": {
-        "symbols": ["BTCUSDT", "ETHUSDT"],
+        "symbols": ["DOGEUSDT"],
         "base_quote_asset": "USDT",
-        "initial_capital": 10000.0,
+        "initial_capital": 12.0,
         "max_positions_per_symbol": 1,
         "max_total_positions": 5,
         "order_timeout_seconds": 30,
@@ -54,9 +54,9 @@
             "type": "geometric",
             "upper_bound_pct": 5.0,
             "lower_bound_pct": 5.0,
-            "grid_levels": 10,
+            "grid_levels": 3,
             "profit_per_grid_pct": 0.5,
-            "rebalance_threshold_pct": 1.0
+            "rebalance_threshold_pct": 5.0
         },
         "trend_following": {
             "ema_fast": 12,
