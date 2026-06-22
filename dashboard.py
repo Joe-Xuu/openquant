@@ -85,27 +85,24 @@ h1{color:#58a6ff;font-size:20px;margin-bottom:4px}
 var currentSymbol='BTCUSDT';
 var mainChart=null, volChart=null, candleSeries=null, volSeries=null;
 var gridLines=[], markerLines=[];
-var failCount=0, chartInited=false;
+var failCount=0;
 
 function initCharts(){
-  if(chartInited) return;
+  // Always recreate charts to avoid stale state
+  if(mainChart){try{mainChart.remove()}catch(e){}}
+  if(volChart){try{volChart.remove()}catch(e){}}
   var opts={layout:{background:{color:'#161b22'},textColor:'#8b949e'},grid:{vertLines:{color:'#21262d'},horzLines:{color:'#21262d'}},crosshair:{mode:0},rightPriceScale:{borderColor:'#30363d'},timeScale:{borderColor:'#30363d',timeVisible:true,secondsVisible:false}};
   mainChart=LightweightCharts.createChart(document.getElementById('chart'),Object.assign({},opts,{height:400}));
   volChart=LightweightCharts.createChart(document.getElementById('chart2'),Object.assign({},opts,{height:250}));
-  chartInited=true;
+  candleSeries=null; volSeries=null;
+  gridLines=[]; markerLines=[];
 }
 
 function switchSymbol(sym,el){
   document.querySelectorAll('.tab').forEach(function(t){t.classList.remove('active')});
   el.classList.add('active');
   currentSymbol=sym;
-  // Remove old series, create fresh for new symbol
-  if(candleSeries){mainChart.removeSeries(candleSeries);candleSeries=null;}
-  if(volSeries){volChart.removeSeries(volSeries);volSeries=null;}
-  gridLines.forEach(function(s){try{mainChart.removeSeries(s)}catch(e){}});
-  gridLines=[];
-  markerLines.forEach(function(s){try{mainChart.removeSeries(s)}catch(e){}});
-  markerLines=[];
+  initCharts();  // Fresh charts for new symbol
   fetchData();
 }
 
@@ -183,16 +180,12 @@ function renderChart(d){
     initCharts();
     var cdata=d.candles.map(function(c){return {time:c.t/1000,open:c.o,high:c.h,low:c.l,close:c.c,volume:c.v};});
 
-    // Candlestick
-    if(!candleSeries){
-      candleSeries=mainChart.addCandlestickSeries({upColor:'#3fb950',downColor:'#f85149',borderUpColor:'#3fb950',borderDownColor:'#f85149',wickUpColor:'#3fb950',wickDownColor:'#f85149'});
-    }
+    // Candlestick — always create fresh
+    candleSeries=mainChart.addCandlestickSeries({upColor:'#3fb950',downColor:'#f85149',borderUpColor:'#3fb950',borderDownColor:'#f85149',wickUpColor:'#3fb950',wickDownColor:'#f85149'});
     candleSeries.setData(cdata);
 
-    // Volume
-    if(!volSeries){
-      volSeries=volChart.addHistogramSeries({color:'#3fb95055',priceFormat:{type:'volume'},priceScaleId:''});
-    }
+    // Volume — always create fresh
+    volSeries=volChart.addHistogramSeries({color:'#3fb95055',priceFormat:{type:'volume'},priceScaleId:''});
     volSeries.setData(cdata.map(function(c){return {time:c.time,value:c.volume,color:c.c>=c.o?'#3fb95055':'#f8514955'};}));
 
     // Grid lines (rebuild)
