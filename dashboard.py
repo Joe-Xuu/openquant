@@ -275,7 +275,13 @@ def build_api(symbol):
         rp = requests.get('https://api.binance.com/api/v3/ticker/price?symbol=ETHUSDT', timeout=5)
         eth_px = float(rp.json()['price'])
         total_equity = usdt_bal + btc_qty * btc_px + eth_qty * eth_px
-        unrealized_pnl_total = total_equity - 10000.0  # Initial capital
+        # Track initial equity for correct P&L
+        initial_key = f"initial_equity_{os.uname().nodename}"
+        initial = ledger.get_metadata(initial_key)
+        if initial is None:
+            ledger.set_metadata(initial_key, str(total_equity))
+            initial = str(total_equity)
+        unrealized_pnl_total = total_equity - float(initial)
     except:
         total_equity = 10000.0; unrealized_pnl_total = 0.0
 
