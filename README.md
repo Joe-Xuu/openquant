@@ -18,17 +18,35 @@
 
 ```
 openquant/
-├── core/              # State Machine & Double-Entry Ledger (Memory)
-├── data/              # Market Data Ingestion & Indicators (Sensors)
-├── strategy/          # Multi-Factor Scoring & Signal Generation (Brain)
-├── execution/         # Exchange API Routing & Order Management (Hands)
-├── risk/              # Independent Risk Guard (Immune System)
+├── core/              # State Machine & Double-Entry Ledger
+├── data/              # Market Data Ingestion & Indicators
+├── strategy/          # Multi-Factor Scoring & Signal Generation
+├── execution/         # Exchange API Routing & Order Management
+├── risk/              # Independent Risk Guard
 ├── config/            # JSON Configuration
 ├── tests/             # Unit Tests (101 passing)
-└── main.py            # Event Bus & Main Loop
+├── main.py            # Event Bus & Main Loop
+├── backtest.py        # Historical Backtesting Engine
+├── dashboard.py       # Real-Time Trading Dashboard
+└── visualize.py       # Candlestick Chart Generator
 ```
 
 **Hard rule:** The Brain (`strategy/`) NEVER imports the Hands (`execution/`). All communication goes through standardized, immutable `StrategySignal` data classes via the event bus in `main.py`.
+
+## Project Status
+
+| Feature | Status |
+|---|---|
+| Strategy Engine (Grid + Trend + Regime) | ✅ Complete |
+| Double-Entry Ledger (SQLite + WAL) | ✅ Complete |
+| Risk Guard (Drawdown, Exposure, Circuit Breaker) | ✅ Complete |
+| Binance REST & WebSocket Integration | ✅ Complete |
+| Spot Testnet Trading | ✅ **LIVE — verified 35+ orders** |
+| Futures Support (for shorting) | ✅ Ready |
+| Backtesting (4 market regimes) | ✅ Complete |
+| Real-Time Web Dashboard | ✅ Complete |
+| Candlestick Visualization | ✅ Complete |
+| 101 Unit Tests | ✅ All Passing |
 
 ## Strategy Explained
 
@@ -144,33 +162,35 @@ pip install -r requirements.txt
 python -m pytest tests/ -v
 ```
 
+### Live Trading (Testnet)
+```bash
+# 1. Get API keys: https://testnet.binance.vision/ (GitHub login → Generate API Key)
+# 2. Configure
+cp .env.example .env
+# Edit .env: paste your BINANCE_TESTNET_API_KEY and BINANCE_TESTNET_API_SECRET
+
+# 3. Run
+python main.py
+```
+
+### Dashboard
+```bash
+# Real-time web dashboard at http://localhost:8080
+python dashboard.py
+# Shows: equity, P&L, open orders, trade history, balances — auto-refreshes
+```
+
 ### Backtest
 ```bash
-# Download historical data
-python -c "
-import requests, json
-# See backtest.py for full data-fetching logic
-"
-
-# Run backtest (3 symbols × 3 strategies ≈ 5 min)
+# Run backtest on sampled data (4 market regimes, ~5 min)
 python backtest.py
 ```
 
 ### Visualization
 ```bash
-# Generate candlestick charts with buy/sell markers
-python visualize.py --symbol BTCUSDT --strategy grid_only
+# Generate candlestick charts with buy/sell markers + P&L annotations
+python visualize.py
 # Charts saved to charts/ directory
-```
-
-### Live Trading
-```bash
-# Configure API keys
-cp .env.example .env
-# Edit .env with your Binance API keys
-
-# Run live (use testnet first!)
-python main.py
 ```
 
 ---
@@ -188,17 +208,35 @@ python main.py
 
 ```
 openquant/
-├── core/              # 状态机 & 复式记账账本（记忆）
-├── data/              # 行情数据摄取 & 技术指标（传感器）
-├── strategy/          # 多因子评分 & 信号生成（大脑）
-├── execution/         # 交易所 API 路由 & 订单管理（双手）
-├── risk/              # 独立风险守卫（免疫系统）
+├── core/              # 状态机 & 复式记账账本
+├── data/              # 行情数据摄取 & 技术指标
+├── strategy/          # 多因子评分 & 信号生成
+├── execution/         # 交易所 API 路由 & 订单管理
+├── risk/              # 独立风险守卫
 ├── config/            # JSON 配置
 ├── tests/             # 单元测试（101 项全部通过）
-└── main.py            # 事件总线 & 主循环
+├── main.py            # 事件总线 & 主循环
+├── backtest.py        # 历史回测引擎
+├── dashboard.py       # 实时交易看板
+└── visualize.py       # K 线图生成器
 ```
 
 **铁律：** 大脑（`strategy/`）绝不导入双手（`execution/`）。所有通信通过标准化、不可变的 `StrategySignal` 数据类，经由 `main.py` 中的事件总线传递。
+
+## 项目状态
+
+| 功能 | 状态 |
+|---|---|
+| 策略引擎（网格 + 趋势 + 状态检测） | ✅ 完成 |
+| 复式记账账本（SQLite + WAL） | ✅ 完成 |
+| 风险守卫（回撤、敞口、熔断） | ✅ 完成 |
+| Binance REST & WebSocket 接入 | ✅ 完成 |
+| 现货测试网交易 | ✅ **已上线—35+ 笔订单验证通过** |
+| 合约支持（做空） | ✅ 就绪 |
+| 回测（4 种市场状态） | ✅ 完成 |
+| 实时网页看板 | ✅ 完成 |
+| K 线可视化 | ✅ 完成 |
+| 101 项单元测试 | ✅ 全部通过 |
 
 ## 策略详解
 
@@ -314,27 +352,35 @@ pip install -r requirements.txt
 python -m pytest tests/ -v
 ```
 
+### 实盘交易（测试网）
+```bash
+# 1. 获取 API 密钥: https://testnet.binance.vision/ (GitHub 登录 → 生成 API Key)
+# 2. 配置
+cp .env.example .env
+# 编辑 .env: 填入 BINANCE_TESTNET_API_KEY 和 BINANCE_TESTNET_API_SECRET
+
+# 3. 启动
+python main.py
+```
+
+### 看板
+```bash
+# 实时网页看板 http://localhost:8080
+python dashboard.py
+# 显示: 权益、盈亏、挂单、成交记录、余额 — 自动刷新
+```
+
 ### 回测
 ```bash
-# 运行回测（3 个标的 × 3 种策略 ≈ 5 分钟）
+# 运行回测（4 种市场状态，约 5 分钟）
 python backtest.py
 ```
 
 ### 可视化
 ```bash
-# 生成带买卖标记的 K 线图
-python visualize.py --symbol BTCUSDT --strategy grid_only
+# 生成带买卖标记和盈亏标注的 K 线图
+python visualize.py
 # 图表保存到 charts/ 目录
-```
-
-### 实盘交易
-```bash
-# 配置 API 密钥
-cp .env.example .env
-# 编辑 .env 填入你的 Binance API 密钥
-
-# 启动（先用模拟盘！）
-python main.py
 ```
 
 ---
