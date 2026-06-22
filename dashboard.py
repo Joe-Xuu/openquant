@@ -131,7 +131,7 @@ function renderStats(d){
   var posColor=d.position_side=='LONG'?'g':d.position_side=='SHORT'?'r':'';
   document.getElementById('stats').innerHTML=
     '<div class=card><div class="val '+pnlClass+'">$'+d.equity.toLocaleString()+'</div><div class=lbl>总权益</div></div>'+
-    '<div class=card><div class="val '+pnlClass+'">'+(d.pnl>=0?'+':'')+d.pnl.toFixed(2)+'</div><div class=lbl>已实现盈亏</div></div>'+
+    '<div class=card><div class="val '+pnlClass+'">'+(d.pnl>=0?'+':'')+d.pnl.toFixed(4)+'</div><div class=lbl>已实现盈亏</div></div>'+
     '<div class=card><div class="val '+upnlClass+'">'+(d.unrealized_pnl>=0?'+':'')+d.unrealized_pnl.toFixed(2)+'</div><div class=lbl>未实现盈亏</div></div>'+
     '<div class=card><div class="val '+posColor+'">'+posStr+'</div><div class=lbl>当前持仓 @ '+d.avg_entry.toFixed(2)+'</div></div>'+
     '<div class=card><div class=val>'+d.open_orders+'</div><div class=lbl>挂单 / 成交'+d.filled_today+'笔</div></div>';
@@ -276,15 +276,22 @@ def build_api(symbol):
     except Exception:
         pass
 
-    # Completed trades (B→S pairs with P&L)
+    # Completed trades: FIFO match buys→sells to calculate realized P&L
     completed = []
-    buys = [f for f in fills if f["side"] == "BUY"]
-    sells = [f for f in fills if f["side"] == "SELL"]
-    for i in range(min(len(buys), len(sells))):
-        b, s = buys[i], sells[i]
-        cpnl = (s["price"] - b["price"]) * min(b["qty"], s["qty"])
-        completed.append({"side": "BUY→SELL", "entry": b["price"], "exit": s["price"],
-                          "qty": min(b["qty"], s["qty"]), "pnl": cpnl})
+    realized_pnl = 0.0
+    buy_queue = [(f["qty"], f["price"]) for f in fills if f["side"] == "BUY"]
+    sell_queue = [(f["qty"], f["price"]) for f in fills if f["side"] == "SELL"]
+    bi = 0; si = 0
+    while bi < len(buy_queue) and si < len(sell_queue):
+        bq, bp = buy_queue[bi]; sq, sp = sell_queue[si]
+        match_qty = min(bq, sq)
+        trade_pnl = (sp - bp) * match_qty
+        realized_pnl += trade_pnl
+        completed.append({"side": "BUY→SELL", "entry": bp, "exit": sp, "qty": match_qty, "pnl": trade_pnl})
+        buy_queue[bi] = (bq - match_qty, bp)
+        sell_queue[si] = (sq - match_qty, sp)
+        if buy_queue[bi][0] < 0.000001: bi += 1
+        if sell_queue[si][0] < 0.000001: si += 1
 
     # Fill markers for chart
     fill_markers = [{"t": f["time"] / 1000, "side": f["side"], "price": f["price"], "p": f["price"]} for f in fills]
@@ -312,8 +319,8 @@ def build_api(symbol):
     return {
         "symbol": symbol,
         "price": price,
-        "equity": round(equity, 2),
-        "pnl": round(pnl, 2),
+        "equity": round(equity + realized_pnl, 2),
+        "pnl": round(realized_pnl, 2),
         "unrealized_pnl": round(unrealized, 2),
         "net_qty": round(net_qty, 6),
         "avg_entry": round(avg_entry, 2),
