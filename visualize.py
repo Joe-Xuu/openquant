@@ -316,34 +316,41 @@ def plot_candlestick_with_trades(
         )
 
     # ---- Buy/Sell markers with P&L labels ----
+    price_min = min(lows)
+    price_max = max(highs)
+    price_range = price_max - price_min
+    label_offset = price_range * 0.06  # 6% of full chart height — consistent across all candles
+
     buy_labeled = set()
     sell_labeled = set()
     for buy_idx, sell_idx, bp, sp, pnl, pnl_pct in trade_pairs:
         is_win = pnl > 0
         marker_color = COLORS['buy'] if is_win else COLORS['sell']
 
-        # Buy marker (below the candle)
-        buy_y = lows[buy_idx] - (highs[buy_idx] - lows[buy_idx]) * 0.15
+        # Buy marker: arrow ABOVE the buy price so it's visible inside the candle area
+        buy_y = bp + label_offset * 0.6
         if buy_idx not in buy_labeled:
-            ax_price.scatter(buy_idx, bp, marker='^', s=140, color=COLORS['buy'],
-                           edgecolors='white', linewidth=1.2, zorder=10)
+            ax_price.scatter(buy_idx, bp, marker='^', s=160, color=COLORS['buy'],
+                           edgecolors='white', linewidth=1.5, zorder=10)
             ax_price.annotate(
-                f'${bp:,.0f}', (buy_idx, buy_y),
-                fontsize=6.5, color=COLORS['buy'], ha='center', va='top',
+                f'Buy\n${bp:,.0f}', (buy_idx, buy_y),
+                fontsize=7, color=COLORS['buy'], ha='center', va='bottom',
                 fontweight='bold',
+                bbox=dict(boxstyle='round,pad=0.3', facecolor='#1a1a2e',
+                         edgecolor=COLORS['buy'], alpha=0.85, linewidth=0.8),
             )
             buy_labeled.add(buy_idx)
 
-        # Sell marker (above the candle) with P&L
-        sell_y = highs[sell_idx] + (highs[sell_idx] - lows[sell_idx]) * 0.2
+        # Sell marker: arrow BELOW the sell price, with P&L above
+        sell_y = max(sp - label_offset * 0.8, price_min + label_offset * 0.3)
         if sell_idx not in sell_labeled:
-            ax_price.scatter(sell_idx, sp, marker='v', s=140, color=marker_color,
-                           edgecolors='white', linewidth=1.2, zorder=10)
-            pnl_str = f'+${pnl:,.0f} ({pnl_pct:+.2f}%)' if is_win else f'-${abs(pnl):,.0f} ({pnl_pct:+.2f}%)'
+            ax_price.scatter(sell_idx, sp, marker='v', s=160, color=marker_color,
+                           edgecolors='white', linewidth=1.5, zorder=10)
+            pnl_str = f'+${pnl:,.0f}\n({pnl_pct:+.2f}%)' if is_win else f'-${abs(pnl):,.0f}\n({pnl_pct:+.2f}%)'
             ax_price.annotate(
                 pnl_str, (sell_idx, sell_y),
                 fontsize=7, color=COLORS['buy'] if is_win else COLORS['sell'],
-                ha='center', va='bottom', fontweight='bold',
+                ha='center', va='top', fontweight='bold',
                 bbox=dict(boxstyle='round,pad=0.3', facecolor='#1a1a2e',
                          edgecolor=marker_color, alpha=0.9, linewidth=0.8),
             )
