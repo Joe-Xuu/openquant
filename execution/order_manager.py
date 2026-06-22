@@ -469,10 +469,11 @@ class OrderManager:
         """Round price and quantity to exchange-allowed tick sizes."""
         # Binance spot tick sizes
         ticks = {
-            "BTCUSDT": (2, 5),   # price: 0.01 (2dp), qty: 0.00001 (5dp)
-            "ETHUSDT": (2, 4),   # price: 0.01 (2dp), qty: 0.0001 (4dp)
-            "SOLUSDT": (2, 2),   # price: 0.01 (2dp), qty: 0.01 (2dp)
-            "BNBUSDT": (1, 3),   # price: 0.1 (1dp), qty: 0.001 (3dp)
+            "BTCUSDT": (2, 5),     # price: 0.01, qty: 5dp
+            "ETHUSDT": (2, 4),
+            "SOLUSDT": (2, 2),
+            "BNBUSDT": (1, 3),
+            "DOGEUSDT": (5, 0),   # price: 0.00001, qty: whole DOGE
         }
         price_dp, qty_dp = ticks.get(symbol.upper(), (2, 5))
 

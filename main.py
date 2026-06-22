@@ -164,7 +164,7 @@ class TradingSystem:
 
         # Grid uses 70% of capital so total exposure stays within risk limit (80%)
         max_exposure_pct = config.get("risk", {}).get("max_exposure_pct", 80.0) / 100.0
-        grid_capital = config.get("trading", {}).get("initial_capital", 10000.0) * 0.70
+        grid_capital = config.get("trading", {}).get("initial_capital", 10000.0) * 0.60  # 60% for grid, 40% buffer
 
         self.grid_strategy = GridStrategy(
             grid_type=grid_cfg.get("type", "geometric"),
@@ -470,7 +470,8 @@ class TradingSystem:
             7. Dispatch to execution
             8. Record in ledger
         """
-        symbols = self.config.get("trading", {}).get("symbols", ["BTCUSDT"])
+        symbols = self.config.get("trading", {}).get("symbols", ["DOGEUSDT"])
+        self.grid_capital_pct = 0.60  # use 60% of equity for grid
         tick_interval = self._get_tick_interval_seconds()
 
         while self.running:
