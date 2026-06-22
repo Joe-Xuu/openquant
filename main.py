@@ -376,6 +376,19 @@ class TradingSystem:
         # Start order manager
         await self.order_manager.start()
 
+        # ---- CRITICAL: Startup reconciliation ----
+        # First, cancel any stale orders from previous sessions to avoid duplicates
+        # Then sync fills that happened while we were offline
+        logger.info("Running startup cleanup & reconciliation...")
+        for symbol in self.config.get("trading", {}).get("symbols", []):
+            try:
+                await self.exchange_client.cancel_all_orders(symbol)
+                logger.info(f"  Cleared old orders for {symbol}")
+            except Exception as e:
+                logger.debug(f"  No old orders to clear for {symbol}: {e}")
+        await self.order_manager.reconcile()
+        logger.info("Startup reconciliation complete")
+
         # Start data engine (fetches historical + opens WebSocket)
         self.state_machine.transition(StateTransition.DATA_READY)
         await self.data_engine.start()
@@ -396,13 +409,10 @@ class TradingSystem:
         self.running = False
         self.state_machine.shutdown()
 
-        # Cancel all open orders
-        for symbol in self.config.get("trading", {}).get("symbols", []):
-            try:
-                await self.exchange_client.cancel_all_orders(symbol)
-                logger.info(f"Cancelled all orders for {symbol}")
-            except Exception:
-                pass
+        # Save shutdown timestamp for next startup reconciliation
+        self.ledger.set_metadata("last_shutdown", datetime.now(timezone.utc).isoformat())
+        # NOTE: We do NOT cancel open orders — they survive restarts.
+        # The next startup will reconcile fills and resume grid state.
 
         await self.order_manager.stop()
         await self.data_engine.stop()
