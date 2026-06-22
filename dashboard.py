@@ -138,13 +138,13 @@ function fetchData(){
 
 function renderStats(d){
   var eqClass=d.total_pnl>=0?'g':'r';
-  var rpnlClass=d.pnl>=0?'g':'r';
+  var rpnlClass=d.combined_pnl>=0?'g':'r';
   var upnlClass=d.unrealized_pnl>=0?'g':'r';
   document.getElementById('stats').innerHTML=
     '<div class=card><div class="val '+eqClass+'">$'+d.equity.toLocaleString()+'</div><div class=lbl>总权益</div></div>'+
     '<div class=card><div class="val '+eqClass+'">'+(d.total_pnl>=0?'+':'')+d.total_pnl.toFixed(2)+'</div><div class=lbl>总盈亏</div></div>'+
-    '<div class=card><div class="val '+rpnlClass+'">'+(d.pnl>=0?'+':'')+d.pnl.toFixed(4)+'</div><div class=lbl>已实现盈亏</div></div>'+
-    '<div class=card><div class="val '+upnlClass+'">'+(d.unrealized_pnl>=0?'+':'')+d.unrealized_pnl.toFixed(2)+'</div><div class=lbl>未实现盈亏</div></div>'+
+    '<div class=card><div class="val '+rpnlClass+'">'+(d.combined_pnl>=0?'+':'')+d.combined_pnl.toFixed(4)+'</div><div class=lbl>已实现 (BTC+ETH)</div></div>'+
+    '<div class=card><div class="val '+upnlClass+'">'+(d.unrealized_pnl>=0?'+':'')+d.unrealized_pnl.toFixed(2)+'</div><div class=lbl>未实现 ('+d.symbol+')</div></div>'+
     '<div class=card><div class=val>'+d.open_orders+'</div><div class=lbl>挂单</div></div>'+
     '<div class=card><div class=val>'+d.filled_today+'</div><div class=lbl>成交笔数</div></div>';
 }
@@ -347,11 +347,33 @@ def build_api(symbol):
 
     fill_markers = [{"t": f["time"] / 1000, "side": f["side"], "price": f["price"], "p": f["price"]} for f in fills]
 
+    # Calculate combined realized P&L across all symbols
+    combined_pnl = realized_pnl
+    try:
+        other = "ETHUSDT" if symbol == "BTCUSDT" else "BTCUSDT"
+        rr = _signed_get('/api/v3/myTrades', {'symbol': other, 'limit': 100})
+        other_fills = []
+        for t in rr.json():
+            if t.get('time', 0) < int(time.time() * 1000) - FILL_LOOKBACK_MS: continue
+            other_fills.append({"side": "BUY" if t.get('isBuyer') else "SELL",
+                               "price": float(t.get('price', 0)), "qty": float(t.get('qty', 0))})
+        ob = [(f["qty"], f["price"]) for f in other_fills if f["side"] == "BUY"]
+        os_list = [(f["qty"], f["price"]) for f in other_fills if f["side"] == "SELL"]
+        bi = si = 0
+        while bi < len(ob) and si < len(os_list):
+            bq, bp = ob[bi]; sq, sp = os_list[si]; m = min(bq, sq)
+            combined_pnl += (sp - bp) * m
+            ob[bi] = (bq - m, bp); os_list[si] = (sq - m, sp)
+            if ob[bi][0] < 0.000001: bi += 1
+            if os_list[si][0] < 0.000001: si += 1
+    except: pass
+
     data = {
         "symbol": symbol,
         "price": price,
         "equity": round(total_equity, 2),
         "pnl": round(realized_pnl, 2),
+        "combined_pnl": round(combined_pnl, 2),
         "unrealized_pnl": round(unrealized, 2),
         "total_pnl": round(unrealized_pnl_total, 2),
         "net_qty": round(net_qty, 6),
