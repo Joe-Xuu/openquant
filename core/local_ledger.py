@@ -1143,6 +1143,18 @@ class LedgerEngine:
             )
         return order_id
 
+    def update_order_open(self, order_id: str, exchange_order_id: str) -> None:
+        """
+        Update order status to OPEN after exchange confirms placement.
+        Called by order_manager after receiving exchange response.
+        """
+        with self._write_transaction(f"Open order {order_id}") as conn:
+            conn.execute(
+                """UPDATE orders SET exchange_order_id=?, status='OPEN',
+                   updated_at=datetime('now') WHERE order_id=?""",
+                (exchange_order_id, order_id),
+            )
+
     def update_order_fill(
         self,
         order_id: str,

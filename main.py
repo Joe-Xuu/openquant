@@ -249,6 +249,7 @@ class TradingSystem:
         self.order_manager = OrderManager(
             exchange_client=self.exchange_client,
             ledger_record_order=self._ledger_record_order,
+            ledger_order_open=self._ledger_order_open,
             ledger_update_fill=self._ledger_update_fill,
             ledger_record_trade_open=self._ledger_record_trade_open,
             ledger_record_trade_close=self._ledger_record_trade_close,
@@ -311,6 +312,10 @@ class TradingSystem:
             quantity=quantity,
             price=price,
         )
+
+    def _ledger_order_open(self, order_id, exchange_order_id):
+        """Update order status to OPEN after exchange confirms placement."""
+        self.ledger.update_order_open(order_id, exchange_order_id)
 
     def _ledger_update_fill(self, order_id, exchange_order_id, filled_quantity, fill_price, fee=0.0):
         """Update order fill in the ledger."""

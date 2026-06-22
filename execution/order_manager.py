@@ -80,9 +80,10 @@ class OrderManager:
         self,
         exchange_client: ExchangeClient,
         ledger_record_order: Callable,
-        ledger_update_fill: Callable,
-        ledger_record_trade_open: Callable,
-        ledger_record_trade_close: Callable,
+        ledger_order_open: Callable = None,
+        ledger_update_fill: Callable = None,
+        ledger_record_trade_open: Callable = None,
+        ledger_record_trade_close: Callable = None,
         ledger_register_grid: Callable = None,
         reconcile_interval: float = 30.0,
     ):
@@ -92,6 +93,7 @@ class OrderManager:
         Args:
             exchange_client: The ExchangeClient instance.
             ledger_record_order: Callback to record an order in the ledger.
+            ledger_order_open: Callback to update order status to OPEN.
             ledger_update_fill: Callback to update order fill in the ledger.
             ledger_record_trade_open: Callback to record trade open.
             ledger_record_trade_close: Callback to record trade close.
@@ -100,10 +102,11 @@ class OrderManager:
         """
         self._client = exchange_client
         self._ledger_record_order = ledger_record_order
-        self._ledger_update_fill = ledger_update_fill
-        self._ledger_record_trade_open = ledger_record_trade_open
-        self._ledger_record_trade_close = ledger_record_trade_close
-        self._ledger_register_grid = ledger_register_grid or ledger_record_trade_open
+        self._ledger_order_open = ledger_order_open or (lambda oid, eid: None)
+        self._ledger_update_fill = ledger_update_fill or (lambda *a, **kw: None)
+        self._ledger_record_trade_open = ledger_record_trade_open or (lambda *a, **kw: "")
+        self._ledger_record_trade_close = ledger_record_trade_close or (lambda *a, **kw: (0,0))
+        self._ledger_register_grid = ledger_register_grid or (lambda tid, sym: tid)
         self.reconcile_interval = reconcile_interval
 
         # Tracked orders: internal_order_id → TrackedOrder
@@ -225,6 +228,9 @@ class OrderManager:
 
                 # Place order on exchange
                 response = await self._client.place_order(order_req)
+
+                # Update ledger: order is now OPEN on exchange
+                self._ledger_order_open(order_id, response.exchange_order_id)
 
                 # Track the order
                 tracked = TrackedOrder(
