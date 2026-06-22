@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple
@@ -509,24 +510,42 @@ class OrderManager:
 
                     fill_qty = float(trade.get("qty", 0))
                     fill_price = float(trade.get("price", 0))
+                    # Binance myTrades uses isBuyer, not side
+                    fill_side = "BUY" if trade.get("isBuyer", False) else "SELL"
 
-                    # Find matching order in our tracking
-                    matched = None
+                    # Find matching order: first check in-memory, then ledger
+                    order_id = None
                     for oid, order in self._orders.items():
                         if order.exchange_order_id == ex_order_id:
-                            matched = order
+                            order_id = oid
+                            order.status = "FILLED"
+                            order.filled_quantity = fill_qty
                             break
 
-                    if matched and matched.status != "FILLED":
-                        matched.status = "FILLED"
-                        matched.filled_quantity = fill_qty
+                    # If not in memory, check ledger for the order
+                    if order_id is None:
+                        try:
+                            import sqlite3
+                            ledger_path = os.environ.get("DB_PATH", "data/trading_ledger.db")
+                            conn = sqlite3.connect(ledger_path)
+                            row = conn.execute(
+                                "SELECT order_id FROM orders WHERE exchange_order_id=?",
+                                (ex_order_id,)
+                            ).fetchone()
+                            conn.close()
+                            if row:
+                                order_id = row[0]
+                        except Exception:
+                            pass
+
+                    if order_id:
                         self._ledger_update_fill(
-                            order_id=matched.order_id,
+                            order_id=order_id,
                             exchange_order_id=ex_order_id,
                             filled_quantity=fill_qty,
                             fill_price=fill_price,
                         )
-                        logger.info(f"  Fill: {symbol} {matched.side} {fill_qty} @ ${fill_price:.2f}")
+                        logger.info(f"  Fill: {symbol} {fill_side} {fill_qty} @ ${fill_price:.2f}")
 
             except Exception as e:
                 logger.debug(f"Reconciliation skipped for {symbol}: {e}")

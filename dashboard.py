@@ -257,7 +257,7 @@ def build_api(symbol):
                 if trade_time < SESSION_START:
                     continue  # Skip old fills from previous sessions
                 fills.append({
-                    "side": t.get("side", "?"),
+                    "side": "BUY" if t.get("isBuyer") else "SELL",
                     "price": float(t.get("price", 0)),
                     "qty": float(t.get("qty", 0)),
                     "time": trade_time,
