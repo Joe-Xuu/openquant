@@ -489,46 +489,47 @@ class OrderManager:
 
     async def reconcile(self) -> None:
         """
-        Sync local order state with exchange.
-
-        Queries open orders and fills from the exchange, updating our
-        internal tracking and the ledger accordingly.
+        Sync local order state with exchange — detect fills via myTrades API.
         """
-        symbols = set(o.symbol for o in self._orders.values())
+        symbols = set(o.symbol for o in self._orders.values()) or {"BTCUSDT", "ETHUSDT"}
         for symbol in symbols:
             try:
-                open_orders = await self._client.get_open_orders(symbol)
-                exchange_order_ids = {str(o.get("orderId", "")) for o in open_orders}
+                # Query recent trades (fills) from exchange
+                trades = await self._client._signed_request("GET",
+                    f"{self._client._api_prefix}/myTrades",
+                    {"symbol": symbol.upper(), "limit": 50},
+                )
+                processed_ids = set()
 
-                # Mark locally-tracked orders as filled if they're not in open orders
-                for order in list(self._orders.values()):
-                    if order.symbol != symbol:
+                for trade in trades:
+                    ex_order_id = str(trade.get("orderId", ""))
+                    if not ex_order_id or ex_order_id in processed_ids:
                         continue
-                    if order.exchange_order_id and order.exchange_order_id not in exchange_order_ids:
-                        if order.status == "OPEN":
-                            # Order is no longer open — check if filled
-                            try:
-                                status = await self._client.get_order_status(
-                                    symbol=symbol,
-                                    order_id=order.exchange_order_id,
-                                )
-                                new_status = status.get("status", "UNKNOWN")
-                                if new_status == "FILLED":
-                                    order.status = "FILLED"
-                                    order.filled_quantity = float(status.get("executedQty", 0))
-                                    fill_price = float(status.get("cummulativeQuoteQty", 0)) / order.filled_quantity if order.filled_quantity > 0 else 0
-                                    self._ledger_update_fill(
-                                        order_id=order.order_id,
-                                        exchange_order_id=order.exchange_order_id,
-                                        filled_quantity=order.filled_quantity,
-                                        fill_price=fill_price,
-                                    )
-                                    logger.info(f"Reconciled fill: {order.order_id}")
-                            except Exception:
-                                pass
+                    processed_ids.add(ex_order_id)
+
+                    fill_qty = float(trade.get("qty", 0))
+                    fill_price = float(trade.get("price", 0))
+
+                    # Find matching order in our tracking
+                    matched = None
+                    for oid, order in self._orders.items():
+                        if order.exchange_order_id == ex_order_id:
+                            matched = order
+                            break
+
+                    if matched and matched.status != "FILLED":
+                        matched.status = "FILLED"
+                        matched.filled_quantity = fill_qty
+                        self._ledger_update_fill(
+                            order_id=matched.order_id,
+                            exchange_order_id=ex_order_id,
+                            filled_quantity=fill_qty,
+                            fill_price=fill_price,
+                        )
+                        logger.info(f"  Fill: {symbol} {matched.side} {fill_qty} @ ${fill_price:.2f}")
 
             except Exception as e:
-                logger.error(f"Reconciliation failed for {symbol}: {e}")
+                logger.debug(f"Reconciliation skipped for {symbol}: {e}")
 
 
 from collections import defaultdict
