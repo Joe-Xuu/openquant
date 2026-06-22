@@ -138,11 +138,15 @@ function fetchData(){
 
 function renderStats(d){
   var eqClass=d.total_pnl>=0?'g':'r';
+  var rpnlClass=d.pnl>=0?'g':'r';
+  var upnlClass=d.unrealized_pnl>=0?'g':'r';
   document.getElementById('stats').innerHTML=
-    '<div class=card><div class="val '+eqClass+'">$'+d.equity.toLocaleString()+'</div><div class=lbl>交易所总权益</div></div>'+
+    '<div class=card><div class="val '+eqClass+'">$'+d.equity.toLocaleString()+'</div><div class=lbl>总权益</div></div>'+
     '<div class=card><div class="val '+eqClass+'">'+(d.total_pnl>=0?'+':'')+d.total_pnl.toFixed(2)+'</div><div class=lbl>总盈亏</div></div>'+
-    '<div class=card><div class=val>'+d.open_orders+' ORDER</div><div class=lbl>当前挂单</div></div>'+
-    '<div class=card><div class=val>'+d.filled_today+' FILL</div><div class=lbl>今日成交</div></div>';
+    '<div class=card><div class="val '+rpnlClass+'">'+(d.pnl>=0?'+':'')+d.pnl.toFixed(4)+'</div><div class=lbl>已实现盈亏</div></div>'+
+    '<div class=card><div class="val '+upnlClass+'">'+(d.unrealized_pnl>=0?'+':'')+d.unrealized_pnl.toFixed(2)+'</div><div class=lbl>未实现盈亏</div></div>'+
+    '<div class=card><div class=val>'+d.open_orders+'</div><div class=lbl>挂单</div></div>'+
+    '<div class=card><div class=val>'+d.filled_today+'</div><div class=lbl>成交笔数</div></div>';
 }
 
 function renderOrders(d){
