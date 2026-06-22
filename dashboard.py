@@ -14,8 +14,8 @@ from core.local_ledger import get_ledger
 
 LEDGER_PATH = "data/trading_ledger.db"
 
-# Session start time — only show fills from this session
-SESSION_START = int(time.time() * 1000)
+# Show fills from last 24 hours (not just current session)
+FILL_LOOKBACK_MS = 24 * 3600 * 1000
 
 HTML = r"""<!DOCTYPE html><html><head><meta charset="utf-8">
 <title>OpenQuant Dashboard</title>
@@ -71,24 +71,29 @@ h1{color:#58a6ff;font-size:20px;margin-bottom:4px}
 
 <script>
 var currentSymbol='BTCUSDT';
-var charts={}, candleSeries={}, volumeSeries={}, gridLines=[], markerSeries=[];
-var failCount=0;
+var mainChart=null, volChart=null, candleSeries=null, volSeries=null;
+var gridLines=[], markerLines=[];
+var failCount=0, chartInited=false;
 
-function makeChart(id,h){
-  var c=LightweightCharts.createChart(document.getElementById(id),{
-    layout:{background:{color:'#161b22'},textColor:'#8b949e'},
-    grid:{vertLines:{color:'#21262d'},horzLines:{color:'#21262d'}},
-    crosshair:{mode:0}, rightPriceScale:{borderColor:'#30363d'},
-    timeScale:{borderColor:'#30363d',timeVisible:true,secondsVisible:false},
-    height:h
-  });
-  return c;
+function initCharts(){
+  if(chartInited) return;
+  var opts={layout:{background:{color:'#161b22'},textColor:'#8b949e'},grid:{vertLines:{color:'#21262d'},horzLines:{color:'#21262d'}},crosshair:{mode:0},rightPriceScale:{borderColor:'#30363d'},timeScale:{borderColor:'#30363d',timeVisible:true,secondsVisible:false}};
+  mainChart=LightweightCharts.createChart(document.getElementById('chart'),Object.assign({},opts,{height:400}));
+  volChart=LightweightCharts.createChart(document.getElementById('chart2'),Object.assign({},opts,{height:250}));
+  chartInited=true;
 }
 
 function switchSymbol(sym,el){
   document.querySelectorAll('.tab').forEach(function(t){t.classList.remove('active')});
   el.classList.add('active');
   currentSymbol=sym;
+  // Remove old series, create fresh for new symbol
+  if(candleSeries){mainChart.removeSeries(candleSeries);candleSeries=null;}
+  if(volSeries){volChart.removeSeries(volSeries);volSeries=null;}
+  gridLines.forEach(function(s){try{mainChart.removeSeries(s)}catch(e){}});
+  gridLines=[];
+  markerLines.forEach(function(s){try{mainChart.removeSeries(s)}catch(e){}});
+  markerLines=[];
   fetchData();
 }
 
@@ -161,48 +166,42 @@ function renderTrades(d){
 
 function renderChart(d){
   try{
+    initCharts();
     var cdata=d.candles.map(function(c){return {time:c.t/1000,open:c.o,high:c.h,low:c.l,close:c.c,volume:c.v};});
-    var key=currentSymbol;
-    if(!charts[key]){
-      charts[key]={c1:makeChart('chart',400),c2:makeChart('chart2',250)};
-      charts[key].c1.timeScale().fitContent();
-      charts[key].c2.timeScale().fitContent();
-    }
-    var ch=charts[key];
 
-    // Candlestick (create once, reuse)
-    if(!candleSeries[key]){
-      candleSeries[key]=ch.c1.addCandlestickSeries({upColor:'#3fb950',downColor:'#f85149',borderUpColor:'#3fb950',borderDownColor:'#f85149',wickUpColor:'#3fb950',wickDownColor:'#f85149'});
+    // Candlestick
+    if(!candleSeries){
+      candleSeries=mainChart.addCandlestickSeries({upColor:'#3fb950',downColor:'#f85149',borderUpColor:'#3fb950',borderDownColor:'#f85149',wickUpColor:'#3fb950',wickDownColor:'#f85149'});
     }
-    candleSeries[key].setData(cdata);
+    candleSeries.setData(cdata);
 
     // Volume
-    if(!volumeSeries[key]){
-      volumeSeries[key]=ch.c2.addHistogramSeries({color:'#3fb95055',priceFormat:{type:'volume'},priceScaleId:''});
+    if(!volSeries){
+      volSeries=volChart.addHistogramSeries({color:'#3fb95055',priceFormat:{type:'volume'},priceScaleId:''});
     }
-    volumeSeries[key].setData(cdata.map(function(c){return {time:c.time,value:c.volume,color:c.c>=c.o?'#3fb95055':'#f8514955'};}));
+    volSeries.setData(cdata.map(function(c){return {time:c.time,value:c.volume,color:c.c>=c.o?'#3fb95055':'#f8514955'};}));
 
     // Grid lines (rebuild)
-    gridLines.forEach(function(s){try{ch.c1.removeSeries(s)}catch(e){}});
+    gridLines.forEach(function(s){try{mainChart.removeSeries(s)}catch(e){}});
     gridLines=[];
     var t0=cdata[0]?.time||0, t1=cdata[cdata.length-1]?.time||0;
     (d.grid_levels||[]).forEach(function(l){
-      var ls=ch.c1.addLineSeries({color:l.side=='BUY'?'#00b4d8':'#ff6b00',lineWidth:1,lineStyle:2,priceLineVisible:false,lastValueVisible:false});
+      var ls=mainChart.addLineSeries({color:l.side=='BUY'?'#00b4d8':'#ff6b00',lineWidth:1,lineStyle:2,priceLineVisible:false,lastValueVisible:false});
       ls.setData([{time:t0,value:l.price},{time:t1,value:l.price}]);
       gridLines.push(ls);
     });
 
     // Trade markers (rebuild)
-    markerSeries.forEach(function(s){try{ch.c1.removeSeries(s)}catch(e){}});
-    markerSeries=[];
+    markerLines.forEach(function(s){try{mainChart.removeSeries(s)}catch(e){}});
+    markerLines=[];
     if(d.fill_markers.length>0){
       var mkdata=d.fill_markers.map(function(f){
         var t=f.t||cdata[Math.floor(cdata.length/2)]?.time||t0;
         return {time:t,position:f.side=='BUY'?'belowBar':'aboveBar',color:f.side=='BUY'?'#00b4d8':'#ff6b00',shape:f.side=='BUY'?'arrowUp':'arrowDown',text:f.side=='BUY'?'B':'S',size:2};
       });
-      var mks=ch.c1.addLineSeries({color:'#ffffff00',lineWidth:0,priceLineVisible:false,lastValueVisible:false});
+      var mks=mainChart.addLineSeries({color:'#ffffff00',lineWidth:0,priceLineVisible:false,lastValueVisible:false});
       mks.setMarkers(mkdata);
-      markerSeries.push(mks);
+      markerLines.push(mks);
     }
   }catch(e){
     document.getElementById('err').textContent='Chart error: '+e.message;
@@ -254,7 +253,7 @@ def build_api(symbol):
             rr = requests.get(f"https://testnet.binance.vision/api/v3/myTrades?{q}&signature={sig}", headers={'X-MBX-APIKEY': key}, timeout=5)
             for t in rr.json():
                 trade_time = t.get("time", 0)
-                if trade_time < SESSION_START:
+                if trade_time < int(time.time() * 1000) - FILL_LOOKBACK_MS:
                     continue  # Skip old fills from previous sessions
                 fills.append({
                     "side": "BUY" if t.get("isBuyer") else "SELL",
@@ -331,5 +330,5 @@ if __name__ == "__main__":
     print(f"\n  📊 OpenQuant Dashboard v2")
     print(f"  → http://localhost:{port}")
     print(f"  → K线图 + 网格线 + 成交标记 + 自动刷新")
-    print(f"  → 只显示本次会话成交 (启动于 {datetime.fromtimestamp(SESSION_START/1000).strftime('%H:%M:%S')})\n")
+    print(f"  → 显示最近24小时成交\n")
     HTTPServer(("0.0.0.0", port), Handler).serve_forever()
