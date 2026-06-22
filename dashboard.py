@@ -203,26 +203,29 @@ function renderChart(d){
       gridLines.push(ls);
     });
 
-    // Trade markers: bright horizontal lines at fill prices
+    // Trade markers: compact arrows on candles (no horizontal lines)
     markerLines.forEach(function(s){try{mainChart.removeSeries(s)}catch(e){}});
     markerLines=[];
 
-    d.fill_markers.forEach(function(f,idx){
-      var isBuy=f.side=='BUY';
-      var color=isBuy?'#00ff88':'#ff4444';
-      var label=isBuy?'B ':'S ';
-      var line=mainChart.addLineSeries({
-        color:color, lineWidth:2, lineStyle:0,
-        priceLineVisible:false, lastValueVisible:false,
-        title:label+'$'+f.p.toFixed(2)
+    if(d.fill_markers.length>0){
+      var buyMarks=[], sellMarks=[];
+      d.fill_markers.forEach(function(f){
+        var t=f.t||t0;
+        if(f.side=='BUY'){
+          buyMarks.push({time:t,position:'belowBar',color:'#00ff88',shape:'arrowUp',text:'↗$'+f.p.toFixed(0),size:2});
+        }else{
+          sellMarks.push({time:t,position:'aboveBar',color:'#ff4444',shape:'arrowDown',text:'↘$'+f.p.toFixed(0),size:2});
+        }
       });
-      line.setData([{time:t0,value:f.p},{time:t1,value:f.p}]);
-      markerLines.push(line);
-      // Arrow marker at the fill time
-      var arrowLine=mainChart.addLineSeries({color:'#ffffff00',lineWidth:0,priceLineVisible:false,lastValueVisible:false});
-      arrowLine.setMarkers([{time:f.t||t0,position:isBuy?'belowBar':'aboveBar',color:color,shape:isBuy?'arrowUp':'arrowDown',text:label+'$'+f.p.toFixed(0),size:3}]);
-      markerLines.push(arrowLine);
-    });
+      if(buyMarks.length>0){
+        var bm=mainChart.addLineSeries({color:'#ffffff00',lineWidth:0,priceLineVisible:false,lastValueVisible:false});
+        bm.setMarkers(buyMarks); markerLines.push(bm);
+      }
+      if(sellMarks.length>0){
+        var sm=mainChart.addLineSeries({color:'#ffffff00',lineWidth:0,priceLineVisible:false,lastValueVisible:false});
+        sm.setMarkers(sellMarks); markerLines.push(sm);
+      }
+    }
   }catch(e){
     document.getElementById('err').textContent='Chart error: '+e.message;
     document.getElementById('err').style.display='block';
