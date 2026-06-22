@@ -194,28 +194,42 @@ function renderChart(d){
       gridLines.push(ls);
     });
 
-    // Trade markers (rebuild) - show buy/sell arrows with labels
+    // Trade markers (rebuild) - show buy/sell arrows with price labels
     markerLines.forEach(function(s){try{mainChart.removeSeries(s)}catch(e){}});
     markerLines=[];
-    if(d.fill_markers.length>0){
-      // Add buy markers
-      var buyMarks=d.fill_markers.filter(function(f){return f.side=='BUY'}).map(function(f){
-        var t=f.t||cdata[Math.floor(cdata.length/2)]?.time||t0;
-        return {time:t,position:'belowBar',color:'#00ff88',shape:'arrowUp',text:'B',size:3};
-      });
-      if(buyMarks.length>0){
-        var bm=mainChart.addLineSeries({color:'#ffffff00',lineWidth:0,priceLineVisible:false,lastValueVisible:false});
-        bm.setMarkers(buyMarks); markerLines.push(bm);
+
+    // Buy markers with price labels (below candle)
+    var buyMarks=[];
+    d.fill_markers.forEach(function(f){
+      if(f.side=='BUY'){
+        buyMarks.push({time:f.t||t0,position:'belowBar',color:'#00ff88',shape:'arrowUp',text:'$'+f.p.toFixed(0),size:3});
       }
-      // Add sell markers
-      var sellMarks=d.fill_markers.filter(function(f){return f.side=='SELL'}).map(function(f){
-        var t=f.t||cdata[Math.floor(cdata.length/2)]?.time||t0;
-        return {time:t,position:'aboveBar',color:'#ff4444',shape:'arrowDown',text:'S',size:3};
-      });
-      if(sellMarks.length>0){
-        var sm=mainChart.addLineSeries({color:'#ffffff00',lineWidth:0,priceLineVisible:false,lastValueVisible:false});
-        sm.setMarkers(sellMarks); markerLines.push(sm);
+    });
+    if(buyMarks.length>0){
+      var bm=mainChart.addLineSeries({color:'#ffffff00',lineWidth:0,priceLineVisible:false,lastValueVisible:false});
+      bm.setMarkers(buyMarks); markerLines.push(bm);
+    }
+
+    // Sell markers with price labels (above candle)
+    var sellMarks=[];
+    d.fill_markers.forEach(function(f){
+      if(f.side=='SELL'){
+        sellMarks.push({time:f.t||t0,position:'aboveBar',color:'#ff4444',shape:'arrowDown',text:'$'+f.p.toFixed(0),size:3});
       }
+    });
+    if(sellMarks.length>0){
+      var sm=mainChart.addLineSeries({color:'#ffffff00',lineWidth:0,priceLineVisible:false,lastValueVisible:false});
+      sm.setMarkers(sellMarks); markerLines.push(sm);
+    }
+
+    // Connect buy→sell pairs with dashed lines
+    var buys=d.fill_markers.filter(function(f){return f.side=='BUY';});
+    var sells=d.fill_markers.filter(function(f){return f.side=='SELL';});
+    var pairs=Math.min(buys.length,sells.length);
+    for(var i=0;i<pairs;i++){
+      var line=mainChart.addLineSeries({color:'#ffd70044',lineWidth:1,lineStyle:2,priceLineVisible:false,lastValueVisible:false});
+      line.setData([{time:buys[i].t||t0,value:buys[i].p},{time:sells[i].t||t0,value:sells[i].p}]);
+      markerLines.push(line);
     }
   }catch(e){
     document.getElementById('err').textContent='Chart error: '+e.message;
@@ -234,7 +248,8 @@ def build_api(symbol):
 
     # Fetch candles from Binance
     try:
-        r = requests.get(f"https://api.binance.com/api/v3/klines?symbol={symbol}&interval=5m&limit=100", timeout=5)
+        # Fetch ~25 hours of 5m candles (300 candles)
+        r = requests.get(f"https://api.binance.com/api/v3/klines?symbol={symbol}&interval=5m&limit=300", timeout=5)
         candles = [{"t": c[0], "o": float(c[1]), "h": float(c[2]), "l": float(c[3]), "c": float(c[4]), "v": float(c[5])} for c in r.json()]
         price = candles[-1]["c"]
     except:
@@ -289,7 +304,7 @@ def build_api(symbol):
                           "qty": min(b["qty"], s["qty"]), "pnl": cpnl})
 
     # Fill markers for chart
-    fill_markers = [{"t": f["time"] / 1000, "side": f["side"], "price": f["price"]} for f in fills]
+    fill_markers = [{"t": f["time"] / 1000, "side": f["side"], "price": f["price"], "p": f["price"]} for f in fills]
 
     # Calculate position from fills
     total_buy_qty = sum(f["qty"] for f in fills if f["side"] == "BUY")
