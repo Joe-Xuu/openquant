@@ -357,7 +357,9 @@ class MarketDataEngine:
             for interval in self.intervals:
                 stream_names.append(f"{symbol.lower()}@kline_{interval}")
 
-        ws_url = f"{self.ws_base_url}/{'/'.join(stream_names)}"
+        # Multi-stream URL — strip trailing /ws if present, use /stream?streams= format
+        base = self.ws_base_url.rstrip('/ws').rstrip('/')
+        ws_url = f"{base}/stream?streams={'/'.join(stream_names)}"
         reconnect_delay = self.ws_reconnect_delay
 
         while self._running:

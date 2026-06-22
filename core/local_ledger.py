@@ -286,7 +286,7 @@ CREATE TABLE IF NOT EXISTS trades (
     symbol              TEXT NOT NULL,
     side                TEXT NOT NULL CHECK (side IN ('BUY','SELL')),
     strategy_id         TEXT NOT NULL DEFAULT '',
-    quantity            REAL NOT NULL CHECK (quantity > 0),
+    quantity            REAL NOT NULL CHECK (quantity >= 0),
     quantity_filled     REAL NOT NULL DEFAULT 0.0,
     entry_price_avg     REAL,
     exit_price_avg      REAL,
@@ -488,14 +488,12 @@ class LedgerEngine:
         if db_dir:
             Path(db_dir).mkdir(parents=True, exist_ok=True)
 
-        # Initialize schema on first connection
+        # Initialize schema — connection stays open for lifetime of engine
         conn = self._get_connection()
-        try:
-            conn.executescript(SCHEMA_DDL)
-            self._seed_chart_of_accounts(conn)
-            conn.commit()
-        finally:
-            conn.close()
+        conn.executescript(SCHEMA_DDL)
+        self._seed_chart_of_accounts(conn)
+        conn.commit()
+        # Note: do NOT close this connection — it's the thread-local default
 
     # ------------------------------------------------------------------
     # Connection Management
@@ -516,22 +514,26 @@ class LedgerEngine:
             - detect_types=PARSE_DECLTYPES: Enables native datetime handling
               if we add it later.
         """
-        if not hasattr(self._local, "connection") or self._local.connection is None:
-            conn = sqlite3.connect(
-                self._db_path,
-                check_same_thread=False,
-                detect_types=sqlite3.PARSE_DECLTYPES,
-            )
-            conn.row_factory = sqlite3.Row  # dict-like access
-            conn.execute("PRAGMA foreign_keys=ON")
-            # Re-apply critical PRAGMAs on every new connection. Some PRAGMAs
-            # (like journal_mode) are database-level and persist; others
-            # (like busy_timeout) are connection-level and must be set each time.
-            conn.execute("PRAGMA busy_timeout=5000")
-            conn.execute("PRAGMA journal_mode=WAL")
-            conn.execute("PRAGMA synchronous=NORMAL")
-            self._local.connection = conn
-        return self._local.connection
+        # Check if existing connection is still alive
+        if hasattr(self._local, "connection") and self._local.connection is not None:
+            try:
+                self._local.connection.execute("SELECT 1")
+                return self._local.connection
+            except sqlite3.ProgrammingError:
+                pass  # Connection is closed, create new one below
+
+        conn = sqlite3.connect(
+            self._db_path,
+            check_same_thread=False,
+            detect_types=sqlite3.PARSE_DECLTYPES,
+        )
+        conn.row_factory = sqlite3.Row  # dict-like access
+        conn.execute("PRAGMA foreign_keys=ON")
+        conn.execute("PRAGMA busy_timeout=5000")
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA synchronous=NORMAL")
+        self._local.connection = conn
+        return conn
 
     def close(self):
         """Close the thread-local connection if open."""
@@ -792,6 +794,23 @@ class LedgerEngine:
     # ------------------------------------------------------------------
     # Public API: Trade Lifecycle Recording
     # ------------------------------------------------------------------
+
+    def register_grid_trade(self, trade_id: str, symbol: str) -> str:
+        """
+        Register a grid as a trade container WITHOUT journal entries.
+
+        Grid trades are different: the grid itself is a strategy container,
+        and each fill creates its own trade with proper double-entry.
+        This method just creates the parent record for foreign key integrity.
+        """
+        with self._write_transaction(f"Register grid trade {trade_id}") as conn:
+            conn.execute(
+                """INSERT INTO trades (trade_id, symbol, side, quantity, quantity_filled,
+                   status, entry_time)
+                   VALUES (?, ?, 'BUY', 0.0, 0.0, 'NEW', datetime('now'))""",
+                (trade_id, symbol),
+            )
+        return trade_id
 
     def record_trade_open(
         self,

@@ -225,21 +225,23 @@ class ExchangeClient:
         params["recvWindow"] = self.recv_window
         params["signature"] = self._sign(params)
 
+        # Build query string manually (not via aiohttp params) for exact match with signature
+        query_string = "&".join(f"{k}={v}" for k, v in sorted(params.items()))
+        full_url = f"{self._rest_base}{endpoint}?{query_string}"
         headers = {"X-MBX-APIKEY": self.api_key}
-        url = f"{self._rest_base}{endpoint}"
 
         # Rate limiting
         async with self._rate_limiter:
             for attempt in range(self.max_retries):
                 try:
                     if method == "GET":
-                        async with self._session.get(url, params=params, headers=headers, timeout=15) as resp:
+                        async with self._session.get(full_url, headers=headers, timeout=15) as resp:
                             data = await resp.json()
                     elif method == "POST":
-                        async with self._session.post(url, data=params, headers=headers, timeout=15) as resp:
+                        async with self._session.post(full_url, headers=headers, timeout=15) as resp:
                             data = await resp.json()
                     elif method == "DELETE":
-                        async with self._session.delete(url, params=params, headers=headers, timeout=15) as resp:
+                        async with self._session.delete(full_url, headers=headers, timeout=15) as resp:
                             data = await resp.json()
                     else:
                         raise ValueError(f"Unsupported HTTP method: {method}")

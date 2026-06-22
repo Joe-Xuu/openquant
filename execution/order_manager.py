@@ -26,7 +26,7 @@ import asyncio
 import logging
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Any, Callable, Dict, List, Optional, Set
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
 from execution.exchange_client import ExchangeClient, OrderRequest, OrderResponse
 from strategy.signal import SignalAction, StrategySignal
@@ -83,6 +83,7 @@ class OrderManager:
         ledger_update_fill: Callable,
         ledger_record_trade_open: Callable,
         ledger_record_trade_close: Callable,
+        ledger_register_grid: Callable = None,
         reconcile_interval: float = 30.0,
     ):
         """
@@ -94,6 +95,7 @@ class OrderManager:
             ledger_update_fill: Callback to update order fill in the ledger.
             ledger_record_trade_open: Callback to record trade open.
             ledger_record_trade_close: Callback to record trade close.
+            ledger_register_grid: Callback to register a grid trade container.
             reconcile_interval: Seconds between order reconciliation cycles.
         """
         self._client = exchange_client
@@ -101,6 +103,7 @@ class OrderManager:
         self._ledger_update_fill = ledger_update_fill
         self._ledger_record_trade_open = ledger_record_trade_open
         self._ledger_record_trade_close = ledger_record_trade_close
+        self._ledger_register_grid = ledger_register_grid or ledger_record_trade_open
         self.reconcile_interval = reconcile_interval
 
         # Tracked orders: internal_order_id → TrackedOrder
@@ -191,23 +194,22 @@ class OrderManager:
         tracked_orders = []
         trade_id = metadata.get("grid_id", "")
 
-        # Record the grid as a trade in the ledger (placeholder for the grid)
-        self._ledger_record_trade_open(
-            trade_id=trade_id,
-            symbol=signal.symbol,
-            side="BUY",  # Grids are neutral direction
-            quantity=0.0,  # Total notional will be tracked per fill
-            price=0.0,
-        )
+        # Register grid as a trade container (no journal entries — fills create their own)
+        self._ledger_register_grid(trade_id, signal.symbol)
 
         for level_dict in levels:
             try:
+                # Round to exchange precision
+                price, qty = self._round_to_tick(signal.symbol, level_dict["price"], level_dict["quantity"])
+                if qty <= 0:
+                    continue
+
                 order_req = OrderRequest(
                     symbol=signal.symbol,
                     side=level_dict["side"],
                     order_type="LIMIT",
-                    price=level_dict["price"],
-                    quantity=level_dict["quantity"],
+                    price=price,
+                    quantity=qty,
                     time_in_force="GTC",
                 )
 
@@ -442,6 +444,27 @@ class OrderManager:
                 logger.info(f"Trailing stop updated to {new_stop}")
 
         return []
+
+    # ------------------------------------------------------------------
+    # Exchange Precision
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _round_to_tick(symbol: str, price: float, qty: float) -> tuple:
+        """Round price and quantity to exchange-allowed tick sizes."""
+        # Binance spot tick sizes
+        ticks = {
+            "BTCUSDT": (2, 5),   # price: 0.01 (2dp), qty: 0.00001 (5dp)
+            "ETHUSDT": (2, 4),   # price: 0.01 (2dp), qty: 0.0001 (4dp)
+            "SOLUSDT": (2, 2),   # price: 0.01 (2dp), qty: 0.01 (2dp)
+            "BNBUSDT": (1, 3),   # price: 0.1 (1dp), qty: 0.001 (3dp)
+        }
+        price_dp, qty_dp = ticks.get(symbol.upper(), (2, 5))
+
+        price = max(0.01, round(price, price_dp))
+        qty = max(10 ** -qty_dp, round(qty, qty_dp))
+
+        return price, qty
 
     # ------------------------------------------------------------------
     # Reconciliation

@@ -345,6 +345,12 @@ class RiskGuard:
 
             if signal.is_grid_signal():
                 modified["total_capital"] = metadata.get("total_capital", 0) * scale_factor
+                # Also scale individual level quantities
+                if "levels" in modified:
+                    modified["levels"] = [
+                        {**lvl, "quantity": lvl.get("quantity", 0) * scale_factor}
+                        for lvl in modified["levels"]
+                    ]
             elif signal.is_trend_signal():
                 modified["position_size"] = metadata.get("position_size", 0) * scale_factor
 

@@ -120,12 +120,16 @@ class TradingSystem:
         use_testnet = os.getenv("BINANCE_TESTNET", "true").lower() == "true"
         use_futures = os.getenv("BINANCE_MARKET", "spot").lower() == "futures"
 
+        # REST API: testnet for orders, mainnet for... actually testnet for orders
+        # WebSocket: ALWAYS use mainnet for market data (free, public, reliable)
+        # The testnet WebSocket is frequently unavailable — we get price data
+        # from the real market but execute orders on testnet.
         if use_futures:
             rest_url = "https://testnet.binancefuture.com" if use_testnet else "https://fapi.binance.com"
-            ws_url = "wss://testnet.binancefuture.com/ws" if use_testnet else "wss://fstream.binance.com/ws"
+            ws_url = "wss://fstream.binance.com/ws"
         else:
             rest_url = "https://testnet.binance.vision" if use_testnet else "https://api.binance.com"
-            ws_url = "wss://testnet.binance.vision/ws" if use_testnet else "wss://stream.binance.com:9443/ws"
+            ws_url = "wss://stream.binance.com:9443/ws"
 
         self.data_engine = MarketDataEngine(
             symbols=config.get("trading", {}).get("symbols", ["BTCUSDT"]),
@@ -145,13 +149,17 @@ class TradingSystem:
         regime_cfg = strategy_cfg.get("regime_detection", {})
         mf_cfg = strategy_cfg.get("multi_factor", {})
 
+        # Grid uses 70% of capital so total exposure stays within risk limit (80%)
+        max_exposure_pct = config.get("risk", {}).get("max_exposure_pct", 80.0) / 100.0
+        grid_capital = config.get("trading", {}).get("initial_capital", 10000.0) * 0.70
+
         self.grid_strategy = GridStrategy(
             grid_type=grid_cfg.get("type", "geometric"),
             upper_bound_pct=grid_cfg.get("upper_bound_pct", 5.0),
             lower_bound_pct=grid_cfg.get("lower_bound_pct", 5.0),
             grid_levels=grid_cfg.get("grid_levels", 10),
             profit_per_grid_pct=grid_cfg.get("profit_per_grid_pct", 0.5),
-            total_capital=config.get("trading", {}).get("initial_capital", 10000.0),
+            total_capital=grid_capital,
             rebalance_threshold_pct=grid_cfg.get("rebalance_threshold_pct", 1.0),
         )
 
@@ -175,6 +183,16 @@ class TradingSystem:
 
         # --- Initialize Risk ---
         risk_cfg = config.get("risk", {})
+        # Allow .env overrides for risk parameters
+        for key, env_key in [
+            ("max_drawdown_pct", "MAX_DRAWDOWN_PCT"),
+            ("max_daily_loss_pct", "MAX_DAILY_LOSS_PCT"),
+            ("max_position_size_pct", "MAX_POSITION_SIZE_PCT"),
+        ]:
+            env_val = os.getenv(env_key)
+            if env_val is not None:
+                risk_cfg[key] = float(env_val)
+
         self.risk_guard = RiskGuard(
             config=risk_cfg,
             equity_provider=self._get_equity,
@@ -193,10 +211,10 @@ class TradingSystem:
         else:
             api_key = os.getenv(
                 "BINANCE_TESTNET_API_KEY" if use_testnet else "BINANCE_API_KEY", ""
-            ) or api_cfg.get("testnet_api_key" if use_testnet else "api_key", "")
+            ) or exchange_cfg.get("testnet_api_key" if use_testnet else "api_key", "")
             api_secret = os.getenv(
                 "BINANCE_TESTNET_API_SECRET" if use_testnet else "BINANCE_API_SECRET", ""
-            ) or api_cfg.get("testnet_api_secret" if use_testnet else "api_secret", "")
+            ) or exchange_cfg.get("testnet_api_secret" if use_testnet else "api_secret", "")
 
         if not api_key or api_key.startswith("your_"):
             logger.warning("  API keys not configured! Set them in .env file")
@@ -210,8 +228,8 @@ class TradingSystem:
             api_secret=api_secret,
             testnet=use_testnet,
             market=market_type,
-            recv_window=api_cfg.get("recv_window", 5000),
-            rate_limit_rps=api_cfg.get("rate_limit_rps", 10.0),
+            recv_window=exchange_cfg.get("recv_window", 5000),
+            rate_limit_rps=exchange_cfg.get("rate_limit_rps", 10.0),
         )
 
         self.order_manager = OrderManager(
@@ -220,6 +238,7 @@ class TradingSystem:
             ledger_update_fill=self._ledger_update_fill,
             ledger_record_trade_open=self._ledger_record_trade_open,
             ledger_record_trade_close=self._ledger_record_trade_close,
+            ledger_register_grid=self._ledger_register_grid,
         )
 
         # --- Per-Symbol State ---
@@ -288,6 +307,10 @@ class TradingSystem:
             fill_price=fill_price,
             fee=fee,
         )
+
+    def _ledger_register_grid(self, trade_id, symbol):
+        """Register a grid as a trade container (no journal entries)."""
+        return self.ledger.register_grid_trade(trade_id, symbol)
 
     def _ledger_record_trade_open(self, trade_id, symbol, side, quantity, price, fee=0.0, slippage=0.0):
         """Record trade open in the ledger."""
