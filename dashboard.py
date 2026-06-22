@@ -126,12 +126,15 @@ function fetchData(){
 
 function renderStats(d){
   var pnlClass=d.pnl>=0?'g':'r';
+  var upnlClass=d.unrealized_pnl>=0?'g':'r';
+  var posStr=d.net_qty>0.0001?d.net_qty.toFixed(4)+' (LONG)':d.net_qty<-0.0001?Math.abs(d.net_qty).toFixed(4)+' (SHORT)':'无持仓';
+  var posColor=d.position_side=='LONG'?'g':d.position_side=='SHORT'?'r':'';
   document.getElementById('stats').innerHTML=
     '<div class=card><div class="val '+pnlClass+'">$'+d.equity.toLocaleString()+'</div><div class=lbl>总权益</div></div>'+
-    '<div class=card><div class="val '+pnlClass+'">'+(d.pnl>=0?'+':'')+d.pnl.toFixed(2)+'</div><div class=lbl>总盈亏</div></div>'+
-    '<div class=card><div class=val>'+d.open_orders+'</div><div class=lbl>挂单</div></div>'+
-    '<div class=card><div class=val>'+d.filled_today+'</div><div class=lbl>本次成交</div></div>'+
-    '<div class=card><div class=val>'+d.total_trades+'</div><div class=lbl>历史交易</div></div>';
+    '<div class=card><div class="val '+pnlClass+'">'+(d.pnl>=0?'+':'')+d.pnl.toFixed(2)+'</div><div class=lbl>已实现盈亏</div></div>'+
+    '<div class=card><div class="val '+upnlClass+'">'+(d.unrealized_pnl>=0?'+':'')+d.unrealized_pnl.toFixed(2)+'</div><div class=lbl>未实现盈亏</div></div>'+
+    '<div class=card><div class="val '+posColor+'">'+posStr+'</div><div class=lbl>当前持仓 @ '+d.avg_entry.toFixed(2)+'</div></div>'+
+    '<div class=card><div class=val>'+d.open_orders+'</div><div class=lbl>挂单 / 成交'+d.filled_today+'笔</div></div>';
 }
 
 function renderOrders(d){
@@ -191,17 +194,28 @@ function renderChart(d){
       gridLines.push(ls);
     });
 
-    // Trade markers (rebuild)
+    // Trade markers (rebuild) - show buy/sell arrows with labels
     markerLines.forEach(function(s){try{mainChart.removeSeries(s)}catch(e){}});
     markerLines=[];
     if(d.fill_markers.length>0){
-      var mkdata=d.fill_markers.map(function(f){
+      // Add buy markers
+      var buyMarks=d.fill_markers.filter(function(f){return f.side=='BUY'}).map(function(f){
         var t=f.t||cdata[Math.floor(cdata.length/2)]?.time||t0;
-        return {time:t,position:f.side=='BUY'?'belowBar':'aboveBar',color:f.side=='BUY'?'#00b4d8':'#ff6b00',shape:f.side=='BUY'?'arrowUp':'arrowDown',text:f.side=='BUY'?'B':'S',size:2};
+        return {time:t,position:'belowBar',color:'#00ff88',shape:'arrowUp',text:'B',size:3};
       });
-      var mks=mainChart.addLineSeries({color:'#ffffff00',lineWidth:0,priceLineVisible:false,lastValueVisible:false});
-      mks.setMarkers(mkdata);
-      markerLines.push(mks);
+      if(buyMarks.length>0){
+        var bm=mainChart.addLineSeries({color:'#ffffff00',lineWidth:0,priceLineVisible:false,lastValueVisible:false});
+        bm.setMarkers(buyMarks); markerLines.push(bm);
+      }
+      // Add sell markers
+      var sellMarks=d.fill_markers.filter(function(f){return f.side=='SELL'}).map(function(f){
+        var t=f.t||cdata[Math.floor(cdata.length/2)]?.time||t0;
+        return {time:t,position:'aboveBar',color:'#ff4444',shape:'arrowDown',text:'S',size:3};
+      });
+      if(sellMarks.length>0){
+        var sm=mainChart.addLineSeries({color:'#ffffff00',lineWidth:0,priceLineVisible:false,lastValueVisible:false});
+        sm.setMarkers(sellMarks); markerLines.push(sm);
+      }
     }
   }catch(e){
     document.getElementById('err').textContent='Chart error: '+e.message;
@@ -277,6 +291,23 @@ def build_api(symbol):
     # Fill markers for chart
     fill_markers = [{"t": f["time"] / 1000, "side": f["side"], "price": f["price"]} for f in fills]
 
+    # Calculate position from fills
+    total_buy_qty = sum(f["qty"] for f in fills if f["side"] == "BUY")
+    total_sell_qty = sum(f["qty"] for f in fills if f["side"] == "SELL")
+    net_qty = total_buy_qty - total_sell_qty
+    if net_qty > 0.0001:
+        buys = [f for f in fills if f["side"] == "BUY"]
+        avg_entry = sum(f["price"] * f["qty"] for f in buys) / total_buy_qty if total_buy_qty > 0 else 0
+        unrealized = (price - avg_entry) * net_qty
+        position_side = "LONG"
+    elif net_qty < -0.0001:
+        sells = [f for f in fills if f["side"] == "SELL"]
+        avg_entry = sum(f["price"] * f["qty"] for f in sells) / total_sell_qty if total_sell_qty > 0 else 0
+        unrealized = (avg_entry - price) * abs(net_qty)
+        position_side = "SHORT"
+    else:
+        avg_entry = 0; unrealized = 0; position_side = "FLAT"
+
     # Grid levels from ledger orders
     grid_levels = [{"side": o["side"], "price": o["price"]} for o in orders]
 
@@ -285,6 +316,10 @@ def build_api(symbol):
         "price": price,
         "equity": round(equity, 2),
         "pnl": round(pnl, 2),
+        "unrealized_pnl": round(unrealized, 2),
+        "net_qty": round(net_qty, 6),
+        "avg_entry": round(avg_entry, 2),
+        "position_side": position_side,
         "open_orders": len(orders),
         "filled_today": len(fills),
         "total_trades": stats.get("total_trades", 0),
