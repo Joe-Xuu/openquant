@@ -875,7 +875,10 @@ class GridStrategy:
         Same inputs → same ID. This enables the event bus to detect duplicate
         START_GRID signals after a restart and skip re-placing identical orders.
         """
-        seed = f"{symbol}|{reference_price:.2f}|{upper_bound:.2f}|{lower_bound:.2f}"
+        # Include hour-window for uniqueness across restarts
+        import time as _time
+        window = int(_time.time() / 3600)
+        seed = f"{symbol}|{reference_price:.2f}|{upper_bound:.2f}|{lower_bound:.2f}|{window}"
         return hashlib.sha256(seed.encode()).hexdigest()[:12]
 
     # ------------------------------------------------------------------

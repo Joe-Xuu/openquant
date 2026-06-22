@@ -373,10 +373,10 @@ class RiskGuard:
         current_equity = self._equity_provider()
         positions = self._positions_provider()
 
-        # Current exposure
+        # Current exposure: only count positions for the same symbol
         current_exposure = sum(
             abs(pos.get("quantity", 0)) * pos.get("current_price", pos.get("avg_entry_price", 0))
-            for pos in positions
+            for pos in positions if pos.get("symbol") == signal.symbol
         )
 
         # New exposure from this signal

@@ -206,18 +206,18 @@ function renderChart(d){
       gridLines.push(ls);
     });
 
-    // Trade markers: compact arrows on candles (no horizontal lines)
+    // Trade markers: colored dots on candles like Binance
     markerLines.forEach(function(s){try{mainChart.removeSeries(s)}catch(e){}});
     markerLines=[];
 
     if(d.fill_markers.length>0){
       var buyMarks=[], sellMarks=[];
-      d.fill_markers.forEach(function(f){
+      d.fill_markers.forEach(function(f,idx){
         var t=f.t||t0;
         if(f.side=='BUY'){
-          buyMarks.push({time:t,position:'belowBar',color:'#00ff88',shape:'arrowUp',text:'↗$'+f.p.toFixed(0),size:2});
+          buyMarks.push({time:t,position:'inBar',color:'#00ff88',shape:'circle',size:2});
         }else{
-          sellMarks.push({time:t,position:'aboveBar',color:'#ff4444',shape:'arrowDown',text:'↘$'+f.p.toFixed(0),size:2});
+          sellMarks.push({time:t,position:'inBar',color:'#ff4444',shape:'circle',size:2});
         }
       });
       if(buyMarks.length>0){
