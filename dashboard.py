@@ -180,7 +180,7 @@ function renderTrades(d){
 
 function renderChart(d){
   try{
-    initCharts();
+    ensureCharts();
     var cdata=d.candles.map(function(c){return {time:c.t/1000,open:c.o,high:c.h,low:c.l,close:c.c,volume:c.v};});
 
     // Candlestick — always create fresh
