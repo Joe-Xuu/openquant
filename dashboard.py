@@ -12,7 +12,8 @@ from urllib.parse import urlparse, parse_qs
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from core.local_ledger import get_ledger
 
-LEDGER_PATH = "data/trading_ledger.db"
+# PostgreSQL connection from environment
+LEDGER_DSN = None  # uses env vars PG_HOST/PG_USER/etc
 
 # Show fills from last 24 hours (not just current session)
 FILL_LOOKBACK_MS = 24 * 3600 * 1000
@@ -226,7 +227,7 @@ setInterval(fetchData,5000);
 
 
 def build_api(symbol):
-    ledger = get_ledger(LEDGER_PATH)
+    ledger = get_ledger(LEDGER_DSN)
     conn = ledger._get_connection()
 
     # Fetch candles from Binance

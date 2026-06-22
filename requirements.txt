@@ -11,10 +11,8 @@ numpy>=1.24.0
 pandas-ta>=0.3.14b0
 # ta-lib>=0.4.28  # Uncomment if you have TA-Lib C library installed; otherwise pandas-ta is sufficient
 
-# --- Database ---
-# sqlite3 is built-in; no extra package needed
-# aiosqlite for async SQLite access
-aiosqlite>=0.19.0
+# --- Database (Production: PostgreSQL) ---
+psycopg2-binary>=2.9.0
 
 # --- Binance API Integration ---
 python-binance>=1.0.19

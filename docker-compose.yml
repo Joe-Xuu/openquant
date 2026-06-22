@@ -1,0 +1,37 @@
+# ============================================================================
+# OpenQuant — PostgreSQL Database
+# ============================================================================
+# Start:    docker-compose up -d
+# Stop:     docker-compose down
+# Wipe:     docker-compose down -v
+# Connect:  psql -h localhost -U openquant -d openquant
+# ============================================================================
+
+version: "3.8"
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: openquant-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: openquant
+      POSTGRES_PASSWORD: openquant
+      POSTGRES_DB: openquant
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    command: >
+      -c shared_buffers=256MB
+      -c effective_cache_size=1GB
+      -c wal_level=replica
+      -c max_wal_senders=5
+      -c wal_keep_size=256MB
+      -c synchronous_commit=on
+      -c max_connections=50
+      -c random_page_cost=1.1
+      -c effective_io_concurrency=200
+
+volumes:
+  pgdata:

@@ -124,8 +124,7 @@ class TradingSystem:
         self.running = False
 
         # --- Initialize Core ---
-        db_path = config.get("database", {}).get("path", "data/trading_ledger.db")
-        self.ledger: LedgerEngine = get_ledger(db_path)
+        self.ledger: LedgerEngine = get_ledger()
         self.state_machine = TradingStateMachine()
 
         # --- Initialize Data ---
