@@ -190,15 +190,22 @@ class OrderManager:
     async def _dispatch_grid(
         self, signal: StrategySignal, metadata: Dict[str, Any]
     ) -> List[TrackedOrder]:
-        """Place all grid limit orders."""
+        """Place all grid limit orders — cancels old ones first (rebalance-safe)."""
         levels = metadata.get("levels", [])
         if not levels:
             logger.warning("Grid signal has no levels")
             return []
 
+        # Cancel all existing orders for this symbol before placing new ones
+        # This ensures clean rebalancing without overlapping grids
+        try:
+            await self._client.cancel_all_orders(signal.symbol)
+            logger.info(f"  Cancelled old {signal.symbol} orders for rebalance")
+        except Exception as e:
+            logger.debug(f"  No old orders to cancel: {e}")
+
         tracked_orders = []
         trade_id = metadata.get("grid_id", "")
-
         # Register grid as a trade container (no journal entries — fills create their own)
         self._ledger_register_grid(trade_id, signal.symbol)
 

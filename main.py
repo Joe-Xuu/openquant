@@ -173,7 +173,7 @@ class TradingSystem:
             grid_levels=grid_cfg.get("grid_levels", 10),
             profit_per_grid_pct=grid_cfg.get("profit_per_grid_pct", 0.5),
             total_capital=grid_capital,
-            rebalance_threshold_pct=grid_cfg.get("rebalance_threshold_pct", 1.0),
+            rebalance_threshold_pct=grid_cfg.get("rebalance_threshold_pct", 3.0),
         )
 
         self.trend_strategy = TrendStrategy(
