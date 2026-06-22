@@ -4,6 +4,8 @@ OpenQuant — 实时交易看板 (含K线图) / Live Dashboard with Candlestick 
 http://localhost:8080
 """
 
+import hashlib
+import hmac
 import json, os, sys, time, requests
 from decimal import Decimal
 from http.server import HTTPServer, BaseHTTPRequestHandler
@@ -11,6 +13,7 @@ from datetime import datetime, timezone
 from urllib.parse import urlparse, parse_qs
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from dotenv import load_dotenv; load_dotenv()
 from core.local_ledger import get_ledger
 
 # PostgreSQL connection from environment
@@ -134,16 +137,16 @@ function fetchData(){
 }
 
 function renderStats(d){
+  var eqClass=d.total_pnl>=0?'g':'r';
   var pnlClass=d.pnl>=0?'g':'r';
   var upnlClass=d.unrealized_pnl>=0?'g':'r';
-  var posStr=d.net_qty>0.0001?d.net_qty.toFixed(4)+' (LONG)':d.net_qty<-0.0001?Math.abs(d.net_qty).toFixed(4)+' (SHORT)':'无持仓';
-  var posColor=d.position_side=='LONG'?'g':d.position_side=='SHORT'?'r':'';
+  var posStr=d.net_qty>0.0001?d.net_qty.toFixed(4)+' L':d.net_qty<-0.0001?Math.abs(d.net_qty).toFixed(4)+' S':'无';
   document.getElementById('stats').innerHTML=
-    '<div class=card><div class="val '+pnlClass+'">$'+d.equity.toLocaleString()+'</div><div class=lbl>总权益</div></div>'+
-    '<div class=card><div class="val '+pnlClass+'">'+(d.pnl>=0?'+':'')+d.pnl.toFixed(4)+'</div><div class=lbl>已实现盈亏</div></div>'+
-    '<div class=card><div class="val '+upnlClass+'">'+(d.unrealized_pnl>=0?'+':'')+d.unrealized_pnl.toFixed(2)+'</div><div class=lbl>未实现盈亏</div></div>'+
-    '<div class=card><div class="val '+posColor+'">'+posStr+'</div><div class=lbl>当前持仓 @ '+d.avg_entry.toFixed(2)+'</div></div>'+
-    '<div class=card><div class=val>'+d.open_orders+'</div><div class=lbl>挂单 / 成交'+d.filled_today+'笔</div></div>';
+    '<div class=card><div class="val '+eqClass+'">$'+d.equity.toLocaleString()+'</div><div class=lbl>真实总权益 (交易所)</div></div>'+
+    '<div class=card><div class="val '+eqClass+'">'+(d.total_pnl>=0?'+':'')+d.total_pnl.toFixed(2)+'</div><div class=lbl>总盈亏</div></div>'+
+    '<div class=card><div class="val '+pnlClass+'">'+(d.pnl>=0?'+':'')+d.pnl.toFixed(4)+'</div><div class=lbl>已实现 ('+d.symbol+')</div></div>'+
+    '<div class=card><div class="val '+upnlClass+'">'+(d.unrealized_pnl>=0?'+':'')+d.unrealized_pnl.toFixed(2)+'</div><div class=lbl>未实现 ('+d.symbol+')</div></div>'+
+    '<div class=card><div class=val>'+posStr+' @ '+d.avg_entry.toFixed(2)+'</div><div class=lbl>仓位 / 挂单'+d.open_orders+' · 成交'+d.filled_today+'笔</div></div>';
 }
 
 function renderOrders(d){
@@ -239,8 +242,17 @@ setInterval(fetchData,5000);
 
 def build_api(symbol):
     ledger = get_ledger(LEDGER_DSN)
+    key = os.getenv('BINANCE_TESTNET_API_KEY', '')
+    secret = os.getenv('BINANCE_TESTNET_API_SECRET', '')
 
-    # Fetch candles from Binance
+    def _signed_get(endpoint, extra_params=None):
+        p = {'timestamp': int(time.time() * 1000), 'recvWindow': 5000}
+        if extra_params: p.update(extra_params)
+        q = '&'.join(f'{k}={v}' for k, v in sorted(p.items()))
+        sig = hmac.new(secret.encode(), q.encode(), hashlib.sha256).hexdigest()
+        return requests.get(f"https://testnet.binance.vision{endpoint}?{q}&signature={sig}", headers={'X-MBX-APIKEY': key}, timeout=5)
+
+    # Fetch candles
     try:
         r = requests.get(f"https://api.binance.com/api/v3/klines?symbol={symbol}&interval=5m&limit=300", timeout=5)
         candles = [{"t": c[0], "o": float(c[1]), "h": float(c[2]), "l": float(c[3]), "c": float(c[4]), "v": float(c[5])} for c in r.json()]
@@ -249,99 +261,93 @@ def build_api(symbol):
         candles = [{"t": int(time.time()*1000), "o": 0, "h": 0, "l": 0, "c": 0, "v": 0}]
         price = 0
 
-    # Ledger stats
-    equity = ledger.get_total_equity()
-    balances = ledger.get_all_balances()
-    initial = balances.get("EQUITY-INITIAL", 10000)
-    pnl = equity - initial
-    stats = ledger.get_trade_statistics()
-
-    # Open orders from ledger
-    orders = ledger._query(
-        "SELECT order_id, symbol, side, price, quantity, status FROM orders WHERE status IN ('OPEN','PENDING') AND symbol=%s ORDER BY price DESC", (symbol,)
-    )
-
-    # Exchange fills (only from current session)
-    fills = []
+    # ---- UNIFIED ACCOUNT EQUITY (from exchange, not ledger) ----
     try:
-        from dotenv import load_dotenv; load_dotenv()
-        import hmac, hashlib
-        key = os.getenv('BINANCE_TESTNET_API_KEY', '')
-        secret = os.getenv('BINANCE_TESTNET_API_SECRET', '')
-        if key and secret:
-            p = {'symbol': symbol, 'timestamp': int(time.time() * 1000), 'recvWindow': 5000, 'limit': 50}
-            q = '&'.join(f'{k}={v}' for k, v in sorted(p.items()))
-            sig = hmac.new(secret.encode(), q.encode(), hashlib.sha256).hexdigest()
-            rr = requests.get(f"https://testnet.binance.vision/api/v3/myTrades?{q}&signature={sig}", headers={'X-MBX-APIKEY': key}, timeout=5)
-            for t in rr.json():
-                trade_time = t.get("time", 0)
-                if trade_time < int(time.time() * 1000) - FILL_LOOKBACK_MS:
-                    continue  # Skip old fills from previous sessions
-                fills.append({
-                    "side": "BUY" if t.get("isBuyer") else "SELL",
-                    "price": float(t.get("price", 0)),
-                    "qty": float(t.get("qty", 0)),
-                    "time": trade_time,
-                })
-    except Exception:
+        rr = _signed_get('/api/v3/account')
+        btc_qty = eth_qty = usdt_bal = 0.0
+        for b in rr.json().get('balances', []):
+            free = float(b['free']); locked = float(b['locked']); total = free + locked
+            if b['asset'] == 'BTC': btc_qty = total
+            elif b['asset'] == 'ETH': eth_qty = total
+            elif b['asset'] == 'USDT': usdt_bal = total
+        rp = requests.get('https://api.binance.com/api/v3/ticker/price?symbol=BTCUSDT', timeout=5)
+        btc_px = float(rp.json()['price'])
+        rp = requests.get('https://api.binance.com/api/v3/ticker/price?symbol=ETHUSDT', timeout=5)
+        eth_px = float(rp.json()['price'])
+        total_equity = usdt_bal + btc_qty * btc_px + eth_qty * eth_px
+        unrealized_pnl_total = total_equity - 10000.0  # Initial capital
+    except:
+        total_equity = 10000.0; unrealized_pnl_total = 0.0
+
+    # ---- LIVE GRID LEVELS (from exchange open orders) ----
+    grid_levels = []
+    orders_list = []
+    try:
+        rr = _signed_get('/api/v3/openOrders', {'symbol': symbol})
+        exchange_orders = rr.json() if isinstance(rr.json(), list) else []
+        for o in exchange_orders:
+            grid_levels.append({"side": o['side'], "price": float(o['price'])})
+            orders_list.append({"side": o['side'], "price": float(o['price']),
+                               "qty": float(o['origQty']), "status": o['status']})
+    except:
         pass
 
-    # Completed trades: FIFO match buys→sells to calculate realized P&L
-    completed = []
-    realized_pnl = 0.0
-    buy_queue = [(f["qty"], f["price"]) for f in fills if f["side"] == "BUY"]
-    sell_queue = [(f["qty"], f["price"]) for f in fills if f["side"] == "SELL"]
-    bi = 0; si = 0
-    while bi < len(buy_queue) and si < len(sell_queue):
-        bq, bp = buy_queue[bi]; sq, sp = sell_queue[si]
-        match_qty = min(bq, sq)
-        trade_pnl = (sp - bp) * match_qty
-        realized_pnl += trade_pnl
-        completed.append({"side": "BUY→SELL", "entry": bp, "exit": sp, "qty": match_qty, "pnl": trade_pnl})
-        buy_queue[bi] = (bq - match_qty, bp)
-        sell_queue[si] = (sq - match_qty, sp)
-        if buy_queue[bi][0] < 0.000001: bi += 1
-        if sell_queue[si][0] < 0.000001: si += 1
+    # ---- FILLS (last 24h) and Position (FIFO) ----
+    fills = []
+    try:
+        rr = _signed_get('/api/v3/myTrades', {'symbol': symbol, 'limit': 100})
+        for t in rr.json():
+            if t.get('time', 0) < int(time.time() * 1000) - FILL_LOOKBACK_MS: continue
+            fills.append({
+                "side": "BUY" if t.get('isBuyer') else "SELL",
+                "price": float(t.get('price', 0)), "qty": float(t.get('qty', 0)),
+                "time": t.get('time', 0),
+            })
+    except: pass
 
-    # Fill markers for chart
-    fill_markers = [{"t": f["time"] / 1000, "side": f["side"], "price": f["price"], "p": f["price"]} for f in fills]
+    # FIFO: completed trades + remaining position
+    completed = []; realized_pnl = 0.0
+    buy_q = [(f["qty"], f["price"]) for f in fills if f["side"] == "BUY"]
+    sell_q = [(f["qty"], f["price"]) for f in fills if f["side"] == "SELL"]
+    bi = si = 0
+    while bi < len(buy_q) and si < len(sell_q):
+        bq, bp = buy_q[bi]; sq, sp = sell_q[si]
+        m = min(bq, sq)
+        realized_pnl += (sp - bp) * m
+        completed.append({"side": "BUY→SELL", "entry": bp, "exit": sp, "qty": m, "pnl": (sp-bp)*m})
+        buy_q[bi] = (bq - m, bp); sell_q[si] = (sq - m, sp)
+        if buy_q[bi][0] < 0.000001: bi += 1
+        if sell_q[si][0] < 0.000001: si += 1
 
-    # Calculate position from fills
-    total_buy_qty = sum(f["qty"] for f in fills if f["side"] == "BUY")
-    total_sell_qty = sum(f["qty"] for f in fills if f["side"] == "SELL")
-    net_qty = total_buy_qty - total_sell_qty
-    if net_qty > 0.0001:
-        buys = [f for f in fills if f["side"] == "BUY"]
-        avg_entry = sum(f["price"] * f["qty"] for f in buys) / total_buy_qty if total_buy_qty > 0 else 0
-        unrealized = (price - avg_entry) * net_qty
-        position_side = "LONG"
-    elif net_qty < -0.0001:
-        sells = [f for f in fills if f["side"] == "SELL"]
-        avg_entry = sum(f["price"] * f["qty"] for f in sells) / total_sell_qty if total_sell_qty > 0 else 0
-        unrealized = (avg_entry - price) * abs(net_qty)
-        position_side = "SHORT"
+    # Remaining = open position (only from unmatched buys)
+    remaining_buys = sum(b[0] for b in buy_q[bi:])
+    if remaining_buys > 0.0001:
+        pos_side = "LONG"
+        net_qty = remaining_buys
+        total_val = sum(b[0] * b[1] for b in buy_q[bi:])
+        avg_entry = total_val / remaining_buys if remaining_buys > 0 else 0
+        unrealized = (price - avg_entry) * remaining_buys
     else:
-        avg_entry = 0; unrealized = 0; position_side = "FLAT"
+        pos_side = "FLAT"; net_qty = 0; avg_entry = 0; unrealized = 0
 
-    # Grid levels from ledger orders
-    grid_levels = [{"side": o["side"], "price": o["price"]} for o in orders]
+    fill_markers = [{"t": f["time"] / 1000, "side": f["side"], "price": f["price"], "p": f["price"]} for f in fills]
 
     data = {
         "symbol": symbol,
         "price": price,
-        "equity": round(equity + realized_pnl, 2),
+        "equity": round(total_equity, 2),
         "pnl": round(realized_pnl, 2),
         "unrealized_pnl": round(unrealized, 2),
+        "total_pnl": round(unrealized_pnl_total, 2),
         "net_qty": round(net_qty, 6),
         "avg_entry": round(avg_entry, 2),
-        "position_side": position_side,
-        "open_orders": len(orders),
+        "position_side": pos_side,
+        "open_orders": len(orders_list),
         "filled_today": len(fills),
-        "total_trades": stats.get("total_trades", 0),
         "candles": candles,
-        "orders": [{"side": o["side"], "price": _to_float(o["price"]), "qty": _to_float(o["quantity"]), "status": o["status"]} for o in orders],
-        "fills": [{"side": f["side"], "price": _to_float(f["price"]), "qty": _to_float(f["qty"])} for f in fills],
-        "completed_trades": [{"side": t["side"], "entry": _to_float(t["entry"]), "exit": _to_float(t["exit"]), "qty": _to_float(t["qty"]), "pnl": _to_float(t["pnl"])} for t in completed],
+        "orders": orders_list,
+        "fills": fills,
+        "completed_trades": completed,
         "fill_markers": fill_markers,
         "grid_levels": grid_levels,
     }
