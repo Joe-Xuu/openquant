@@ -69,12 +69,26 @@ from execution.order_manager import OrderManager
 
 Path("logs").mkdir(exist_ok=True)
 
+# Rotating log files: new file every hour, keep 72 backups (3 days)
+from logging.handlers import TimedRotatingFileHandler
+
+file_handler = TimedRotatingFileHandler(
+    filename="logs/trading_system.log",
+    when="H",          # rotate hourly
+    interval=1,        # every 1 hour
+    backupCount=72,    # keep last 72 hours (3 days)
+    encoding="utf-8",
+)
+file_handler.setFormatter(logging.Formatter(
+    "%(asctime)s [%(levelname)-7s] %(name)s: %(message)s"
+))
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)-7s] %(name)s: %(message)s",
     handlers=[
         logging.StreamHandler(sys.stdout),
-        logging.FileHandler("logs/trading_system.log", encoding="utf-8"),
+        file_handler,
     ],
 )
 logger = logging.getLogger("main")
