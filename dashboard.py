@@ -201,29 +201,22 @@ function renderChart(d){
       gridLines.push(ls);
     });
 
-    // Trade markers: large colored dots on candles
+    // Trade markers: use a dedicated scatter-like series with bright colors
     markerLines.forEach(function(s){try{mainChart.removeSeries(s)}catch(e){}});
     markerLines=[];
 
     if(d.fill_markers.length>0){
-      var buyMarks=[], sellMarks=[];
-      d.fill_markers.forEach(function(f,idx){
-        var t=f.t||t0;
-        if(f.side=='BUY'){
-          buyMarks.push({time:t,position:'inBar',color:'#00ff88',shape:'circle',size:3});
-        }else{
-          sellMarks.push({time:t,position:'inBar',color:'#ff4444',shape:'circle',size:3});
-        }
+      d.fill_markers.forEach(function(f){
+        var ls=mainChart.addLineSeries({
+          color:f.side=='BUY'?'#00ff88':'#ff4444',
+          lineWidth:3, lineStyle:0, lineVisible:true,
+          pointMarkersVisible:true,
+          priceLineVisible:false, lastValueVisible:false,
+        });
+        // Single-point line = a dot on the chart
+        ls.setData([{time:f.t,value:f.p}]);
+        markerLines.push(ls);
       });
-      if(buyMarks.length>0){
-        var bm=mainChart.addLineSeries({color:'#ffffff00',lineWidth:0,priceLineVisible:false,lastValueVisible:false});
-        bm.setMarkers(buyMarks); markerLines.push(bm);
-      }
-      if(sellMarks.length>0){
-        var sm=mainChart.addLineSeries({color:'#ffffff00',lineWidth:0,priceLineVisible:false,lastValueVisible:false});
-        sm.setMarkers(sellMarks); markerLines.push(sm);
-      }
-      mainChart.timeScale().fitContent();
     }
   }catch(e){
     document.getElementById('err').textContent='Chart error: '+e.message;
