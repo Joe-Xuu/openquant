@@ -117,21 +117,25 @@ class TradingSystem:
         # --- Initialize Data ---
         data_cfg = config.get("data", {})
         exchange_cfg = config.get("exchange", {})
+        use_testnet = os.getenv("BINANCE_TESTNET", "true").lower() == "true"
+        use_futures = os.getenv("BINANCE_MARKET", "spot").lower() == "futures"
+
+        if use_futures:
+            rest_url = "https://testnet.binancefuture.com" if use_testnet else "https://fapi.binance.com"
+            ws_url = "wss://testnet.binancefuture.com/ws" if use_testnet else "wss://fstream.binance.com/ws"
+        else:
+            rest_url = "https://testnet.binance.vision" if use_testnet else "https://api.binance.com"
+            ws_url = "wss://testnet.binance.vision/ws" if use_testnet else "wss://stream.binance.com:9443/ws"
+
         self.data_engine = MarketDataEngine(
             symbols=config.get("trading", {}).get("symbols", ["BTCUSDT"]),
             intervals=data_cfg.get("kline_intervals", ["1m", "5m", "1h"]),
             primary_interval=data_cfg.get("primary_interval", "5m"),
             max_klines_per_request=data_cfg.get("max_klines_per_request", 500),
             ws_reconnect_delay=data_cfg.get("ws_reconnect_delay_seconds", 5),
-            testnet=exchange_cfg.get("testnet", True),
-            rest_base_url=exchange_cfg.get(
-                "testnet_rest_base_url" if exchange_cfg.get("testnet") else "rest_base_url",
-                "https://testnet.binance.vision",
-            ),
-            ws_base_url=exchange_cfg.get(
-                "testnet_ws_base_url" if exchange_cfg.get("testnet") else "ws_base_url",
-                "wss://testnet.binance.vision/ws",
-            ),
+            testnet=use_testnet,
+            rest_base_url=rest_url,
+            ws_base_url=ws_url,
         )
 
         # --- Initialize Strategy ---
@@ -181,21 +185,31 @@ class TradingSystem:
         # --- Initialize Execution ---
         # Load API credentials: env vars take priority over config file
         use_testnet = os.getenv("BINANCE_TESTNET", "true").lower() == "true"
-        api_key = os.getenv(
-            "BINANCE_TESTNET_API_KEY" if use_testnet else "BINANCE_API_KEY", ""
-        ) or api_cfg.get("testnet_api_key" if use_testnet else "api_key", "")
-        api_secret = os.getenv(
-            "BINANCE_TESTNET_API_SECRET" if use_testnet else "BINANCE_API_SECRET", ""
-        ) or api_cfg.get("testnet_api_secret" if use_testnet else "api_secret", "")
+        use_futures = os.getenv("BINANCE_MARKET", "spot").lower() == "futures"
+
+        if use_futures:
+            api_key = os.getenv("BINANCE_FUTURES_API_KEY", "") or os.getenv("BINANCE_TESTNET_API_KEY", "")
+            api_secret = os.getenv("BINANCE_FUTURES_API_SECRET", "") or os.getenv("BINANCE_TESTNET_API_SECRET", "")
+        else:
+            api_key = os.getenv(
+                "BINANCE_TESTNET_API_KEY" if use_testnet else "BINANCE_API_KEY", ""
+            ) or api_cfg.get("testnet_api_key" if use_testnet else "api_key", "")
+            api_secret = os.getenv(
+                "BINANCE_TESTNET_API_SECRET" if use_testnet else "BINANCE_API_SECRET", ""
+            ) or api_cfg.get("testnet_api_secret" if use_testnet else "api_secret", "")
 
         if not api_key or api_key.startswith("your_"):
             logger.warning("  API keys not configured! Set them in .env file")
             logger.warning("  cp .env.example .env  →  edit .env with your keys")
 
+        market_type = "futures" if use_futures else "spot"
+        logger.info(f"  Market: {market_type} | Testnet: {use_testnet}")
+
         self.exchange_client = ExchangeClient(
             api_key=api_key,
             api_secret=api_secret,
             testnet=use_testnet,
+            market=market_type,
             recv_window=api_cfg.get("recv_window", 5000),
             rate_limit_rps=api_cfg.get("rate_limit_rps", 10.0),
         )

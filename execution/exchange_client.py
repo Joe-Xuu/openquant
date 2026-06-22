@@ -126,6 +126,7 @@ class ExchangeClient:
         api_key: str,
         api_secret: str,
         testnet: bool = True,
+        market: str = "spot",
         recv_window: int = 5000,
         rate_limit_rps: float = 10.0,
         max_retries: int = 3,
@@ -137,6 +138,7 @@ class ExchangeClient:
             api_key: Binance API key.
             api_secret: Binance API secret.
             testnet: Use testnet endpoints if True.
+            market: "spot" or "futures" — determines API base URL and endpoints.
             recv_window: Timestamp tolerance in ms.
             rate_limit_rps: Max requests per second.
             max_retries: Max retries on transient failures.
@@ -144,14 +146,24 @@ class ExchangeClient:
         self.api_key = api_key
         self.api_secret = api_secret
         self.testnet = testnet
+        self.market = market
         self.recv_window = recv_window
         self.rate_limit_rps = rate_limit_rps
         self.max_retries = max_retries
 
-        self._rest_base = (
-            "https://testnet.binance.vision" if testnet
-            else "https://api.binance.com"
-        )
+        # Base URLs for spot vs futures
+        if market == "futures":
+            self._rest_base = (
+                "https://testnet.binancefuture.com" if testnet
+                else "https://fapi.binance.com"
+            )
+            self._api_prefix = "/fapi/v1"
+        else:
+            self._rest_base = (
+                "https://testnet.binance.vision" if testnet
+                else "https://api.binance.com"
+            )
+            self._api_prefix = "/api/v3"
 
         self._session: Optional[aiohttp.ClientSession] = None
         self._rate_limiter = asyncio.Semaphore(int(rate_limit_rps))
@@ -196,7 +208,7 @@ class ExchangeClient:
 
         Args:
             method: HTTP method (GET, POST, DELETE).
-            endpoint: API endpoint (e.g., "/api/v3/order").
+            endpoint: API endpoint (e.g., f"{self._api_prefix}/order").
             params: Query parameters.
 
         Returns:
@@ -299,7 +311,7 @@ class ExchangeClient:
                 + (f" @ {request.price}" if request.price else "")
             )
 
-            response = await self._signed_request("POST", "/api/v3/order", params)
+            response = await self._signed_request("POST", f"{self._api_prefix}/order", params)
 
             return OrderResponse(
                 order_id=request.client_order_id,
@@ -340,12 +352,12 @@ class ExchangeClient:
         if client_order_id:
             params["origClientOrderId"] = client_order_id
 
-        return await self._signed_request("DELETE", "/api/v3/order", params)
+        return await self._signed_request("DELETE", f"{self._api_prefix}/order", params)
 
     async def cancel_all_orders(self, symbol: str) -> List[Dict[str, Any]]:
         """Cancel all open orders for a symbol."""
         params = {"symbol": symbol.upper()}
-        return await self._signed_request("DELETE", "/api/v3/openOrders", params)
+        return await self._signed_request("DELETE", f"{self._api_prefix}/openOrders", params)
 
     async def get_order_status(self, symbol: str, order_id: Optional[str] = None,
                                client_order_id: Optional[str] = None) -> Dict[str, Any]:
@@ -356,14 +368,14 @@ class ExchangeClient:
         if client_order_id:
             params["origClientOrderId"] = client_order_id
 
-        return await self._signed_request("GET", "/api/v3/order", params)
+        return await self._signed_request("GET", f"{self._api_prefix}/order", params)
 
     async def get_open_orders(self, symbol: Optional[str] = None) -> List[Dict[str, Any]]:
         """Get all currently open orders."""
         params = {}
         if symbol:
             params["symbol"] = symbol.upper()
-        return await self._signed_request("GET", "/api/v3/openOrders", params)
+        return await self._signed_request("GET", f"{self._api_prefix}/openOrders", params)
 
     # ------------------------------------------------------------------
     # Account Information
@@ -371,7 +383,7 @@ class ExchangeClient:
 
     async def get_balances(self) -> List[BalanceInfo]:
         """Get current account balances."""
-        response = await self._signed_request("GET", "/api/v3/account")
+        response = await self._signed_request("GET", f"{self._api_prefix}/account")
         balances = []
         for b in response.get("balances", []):
             free = float(b["free"])
@@ -398,7 +410,7 @@ class ExchangeClient:
 
     async def get_ticker_price(self, symbol: str) -> float:
         """Get the current price for a symbol (no auth needed)."""
-        url = f"{self._rest_base}/api/v3/ticker/price"
+        url = f"{self._rest_base}{self._api_prefix}/ticker/price"
         params = {"symbol": symbol.upper()}
         async with self._session.get(url, params=params, timeout=10) as resp:
             data = await resp.json()
@@ -406,7 +418,7 @@ class ExchangeClient:
 
     async def get_exchange_info(self, symbol: Optional[str] = None) -> Dict[str, Any]:
         """Get exchange trading rules and symbol information."""
-        url = f"{self._rest_base}/api/v3/exchangeInfo"
+        url = f"{self._rest_base}{self._api_prefix}/exchangeInfo"
         params = {}
         if symbol:
             params["symbol"] = symbol.upper()
@@ -419,7 +431,7 @@ class ExchangeClient:
 
     async def get_server_time(self) -> int:
         """Get the exchange server time in milliseconds."""
-        url = f"{self._rest_base}/api/v3/time"
+        url = f"{self._rest_base}{self._api_prefix}/time"
         async with self._session.get(url, timeout=5) as resp:
             data = await resp.json()
             return data["serverTime"]
