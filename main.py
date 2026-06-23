@@ -744,10 +744,14 @@ async def main():
     config = load_config()
     system = TradingSystem(config)
 
-    # Graceful shutdown on signals
+    # Graceful shutdown on signals (Unix only; Windows raises NotImplementedError)
     loop = asyncio.get_running_loop()
-    for sig in (signal.SIGINT, signal.SIGTERM):
-        loop.add_signal_handler(sig, lambda: asyncio.create_task(system.stop()))
+    try:
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            loop.add_signal_handler(sig, lambda: asyncio.create_task(system.stop()))
+    except NotImplementedError:
+        # Windows: asyncio signal handlers not supported. Ctrl+C still works.
+        pass
 
     try:
         await system.start()
