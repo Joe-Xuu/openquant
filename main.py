@@ -611,7 +611,10 @@ class TradingSystem:
                 )
 
         # ---- TREND (independently evaluated, only on strong signals) ----
-        if regime_result.is_trending and regime_result.confidence > 0.80:
+        # Startup cooldown: no trend trades for first 30 ticks (~2.5h) to let
+        # indicators stabilize and prevent insane position sizing at launch.
+        trend_cooldown = self._tick_count < 30
+        if regime_result.is_trending and regime_result.confidence > 0.80 and not trend_cooldown:
             trend_state = self._trend_states.get(symbol, TrendState.flat(symbol))
             raw_trend = self.trend_strategy.evaluate(
                 symbol=symbol, current_price=indicators.close,

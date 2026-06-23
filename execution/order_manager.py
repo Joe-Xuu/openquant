@@ -235,6 +235,15 @@ class OrderManager:
                 if qty <= 0:
                     continue
 
+                # Skip dust orders below exchange minimum notional ($1 for DOGE)
+                notional = price * qty
+                if notional < 1.0:
+                    logger.debug(
+                        f"  Skipping dust level: {side} {qty} @ {price} "
+                        f"(notional=${notional:.2f} < $1.00)"
+                    )
+                    continue
+
                 order_req = OrderRequest(
                     symbol=signal.symbol,
                     side=level_dict["side"],

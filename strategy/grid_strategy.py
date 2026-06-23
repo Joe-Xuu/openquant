@@ -417,7 +417,9 @@ class GridStrategy:
             else:
                 if atr_pct_val > 2.0:
                     adaptive_levels = max(2, self.grid_levels - 1)
-            adaptive_levels = max(2, min(8, adaptive_levels))
+            # Cap by capital: each level needs at least ~$1 notional
+            max_by_capital = max(2, int(self.total_capital * 0.45 / 1.5))
+            adaptive_levels = max(2, min(max_by_capital, adaptive_levels))
 
         # --- Dynamic bound adjustment based on volatility ---
         upper_pct = self.upper_bound_pct
