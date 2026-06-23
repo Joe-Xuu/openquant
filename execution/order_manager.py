@@ -206,12 +206,31 @@ class OrderManager:
 
         tracked_orders = []
         trade_id = metadata.get("grid_id", "")
-        # Register grid as a trade container (no journal entries — fills create their own)
         self._ledger_register_grid(trade_id, signal.symbol)
 
+        # ---- Unidirectional deployment: skip sides with no balance ----
+        base_asset = signal.symbol.replace("USDT", "")
+        has_base, has_quote = True, True
+        try:
+            base_bal = await self._client.get_asset_balance(base_asset)
+            quote_bal = await self._client.get_asset_balance("USDT")
+            has_base = base_bal.free > 0
+            has_quote = quote_bal.free > 0
+            if not has_base:
+                logger.info(f"  No {base_asset} — skipping SELL levels")
+            if not has_quote:
+                logger.info(f"  No USDT — skipping BUY levels")
+        except Exception:
+            pass
+
         for level_dict in levels:
+            side = level_dict.get("side", "")
+            if side == "SELL" and not has_base:
+                continue
+            if side == "BUY" and not has_quote:
+                continue
+
             try:
-                # Round to exchange precision
                 price, qty = self._round_to_tick(signal.symbol, level_dict["price"], level_dict["quantity"])
                 if qty <= 0:
                     continue

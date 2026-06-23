@@ -176,6 +176,8 @@ class MarketDataEngine:
         self._ws_connection = None
         self._ws_task: Optional[asyncio.Task] = None
         self._session: Optional[aiohttp.ClientSession] = None
+        self._last_update: Dict[str, float] = {}  # symbol → time of last data
+        self._reconnect_count: int = 0
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -379,11 +381,15 @@ class MarketDataEngine:
             except asyncio.CancelledError:
                 break
             except Exception as e:
-                logger.warning(f"WebSocket disconnected: {e}. Reconnecting in {reconnect_delay}s...")
+                self._reconnect_count += 1
+                logger.warning(
+                    f"WebSocket disconnected (#{self._reconnect_count}): {e}. "
+                    f"Reconnecting in {reconnect_delay:.0f}s..."
+                )
                 await asyncio.sleep(reconnect_delay)
                 reconnect_delay = min(reconnect_delay * 2, 60.0)
 
-        logger.info("WebSocket loop exited")
+        logger.info(f"WebSocket loop exited (reconnects: {self._reconnect_count})")
 
     async def _handle_ws_message(self, msg: Dict[str, Any]) -> None:
         """
@@ -409,6 +415,10 @@ class MarketDataEngine:
             }
         }
         """
+        # Unwrap combined-stream format: {"stream":"...", "data":{...}}
+        if "data" in msg and "stream" in msg:
+            msg = msg["data"]
+
         if msg.get("e") != "kline":
             return
 
@@ -434,6 +444,7 @@ class MarketDataEngine:
         async with self._locks[symbol]:
             buffer = self.buffers[symbol][interval]
             buffer.update_current(bar)
+            self._last_update[symbol] = time.time()
 
     # ------------------------------------------------------------------
     # Public Accessors
@@ -459,7 +470,8 @@ class MarketDataEngine:
             buffer = self.buffers.get(symbol, {}).get(interval)
             if buffer is None:
                 return []
-            return buffer.to_dict_list()
+            candles_snapshot = list(buffer.candles)
+        return [c.to_dict() for c in candles_snapshot]
 
     async def get_latest_price(self, symbol: str) -> float:
         """Get the most recent close price for a symbol."""
@@ -483,6 +495,11 @@ class MarketDataEngine:
     def is_connected(self) -> bool:
         """True if the WebSocket is currently connected."""
         return self._ws_connection is not None and not self._ws_connection.closed
+
+    def get_data_age(self, symbol: str) -> float:
+        """Seconds since last WebSocket data update (inf if never)."""
+        last = self._last_update.get(symbol)
+        return float("inf") if last is None else time.time() - last
 
 
 # Need this for type annotation

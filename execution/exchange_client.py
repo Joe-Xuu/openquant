@@ -168,15 +168,31 @@ class ExchangeClient:
         self._session: Optional[aiohttp.ClientSession] = None
         self._rate_limiter = asyncio.Semaphore(int(rate_limit_rps))
         self._order_locks: Dict[str, asyncio.Lock] = defaultdict(asyncio.Lock)
+        self._time_offset_ms: float = 0.0  # server time – local time (ms)
 
     # ------------------------------------------------------------------
     # Lifecycle
     # ------------------------------------------------------------------
 
     async def start(self) -> None:
-        """Initialize the HTTP session."""
+        """Initialize HTTP session and sync clock with Binance server."""
         self._session = aiohttp.ClientSession()
-        logger.info(f"ExchangeClient started ({'testnet' if self.testnet else 'live'})")
+        await self._sync_server_time()
+        logger.info(f"ExchangeClient started ({'testnet' if self.testnet else 'live'})"
+                     f"{f', offset={self._time_offset_ms:.0f}ms' if abs(self._time_offset_ms) > 100 else ''}")
+
+    async def _sync_server_time(self) -> None:
+        """Fetch Binance server time, compute offset from local clock."""
+        if self._session is None:
+            return
+        try:
+            url = f"{self._rest_base}{self._api_prefix}/time"
+            async with self._session.get(url, timeout=aiohttp.ClientTimeout(total=5)) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    self._time_offset_ms = data["serverTime"] - int(time.time() * 1000)
+        except Exception:
+            pass
 
     async def close(self) -> None:
         """Close the HTTP session."""
@@ -221,41 +237,54 @@ class ExchangeClient:
         if params is None:
             params = {}
 
-        params["timestamp"] = int(time.time() * 1000)
+        params["timestamp"] = int(time.time() * 1000 + self._time_offset_ms)
         params["recvWindow"] = self.recv_window
         params["signature"] = self._sign(params)
 
-        # Build query string manually (not via aiohttp params) for exact match with signature
         query_string = "&".join(f"{k}={v}" for k, v in sorted(params.items()))
         full_url = f"{self._rest_base}{endpoint}?{query_string}"
         headers = {"X-MBX-APIKEY": self.api_key}
 
-        # Rate limiting
         async with self._rate_limiter:
             for attempt in range(self.max_retries):
                 try:
+                    timeout = aiohttp.ClientTimeout(total=10)
                     if method == "GET":
-                        async with self._session.get(full_url, headers=headers, timeout=15) as resp:
+                        async with self._session.get(full_url, headers=headers, timeout=timeout) as resp:
                             data = await resp.json()
                     elif method == "POST":
-                        async with self._session.post(full_url, headers=headers, timeout=15) as resp:
+                        async with self._session.post(full_url, headers=headers, timeout=timeout) as resp:
                             data = await resp.json()
                     elif method == "DELETE":
-                        async with self._session.delete(full_url, headers=headers, timeout=15) as resp:
+                        async with self._session.delete(full_url, headers=headers, timeout=timeout) as resp:
                             data = await resp.json()
                     else:
                         raise ValueError(f"Unsupported HTTP method: {method}")
 
                     if resp.status == 429:
-                        # Rate limited — wait and retry
                         await asyncio.sleep(2 ** attempt)
                         continue
 
                     if resp.status >= 400:
                         error_msg = data.get("msg", str(data))
+                        error_code = data.get("code", 0)
+
+                        # recvWindow / timestamp: re-sync and retry once
+                        if error_code == -1021 or "Timestamp" in error_msg or "recvWindow" in error_msg:
+                            logger.warning(
+                                f"Timestamp rejected (offset={self._time_offset_ms:.0f}ms). "
+                                f"Re-syncing server time..."
+                            )
+                            await self._sync_server_time()
+                            params.pop("signature", None)
+                            params["timestamp"] = int(time.time() * 1000 + self._time_offset_ms)
+                            params["signature"] = self._sign(params)
+                            query_string = "&".join(f"{k}={v}" for k, v in sorted(params.items()))
+                            full_url = f"{self._rest_base}{endpoint}?{query_string}"
+                            continue
+
                         logger.error(f"Binance API error [{resp.status}]: {error_msg}")
                         if resp.status >= 500:
-                            # Server error — retry
                             await asyncio.sleep(2 ** attempt)
                             continue
                         raise BinanceAPIError(resp.status, error_msg, data)

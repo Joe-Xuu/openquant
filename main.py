@@ -471,36 +471,67 @@ class TradingSystem:
             8. Record in ledger
         """
         symbols = self.config.get("trading", {}).get("symbols", ["DOGEUSDT"])
-        self.grid_capital_pct = 0.60  # use 60% of equity for grid
+        self.grid_capital_pct = 0.60
         tick_interval = self._get_tick_interval_seconds()
+        self._last_tick_time = time.time()
+
+        # Watchdog: independent task warns if main loop stalls
+        watchdog_task = asyncio.create_task(self._watchdog(tick_interval))
 
         while self.running:
             try:
                 for symbol in symbols:
-                    await self._process_symbol_tick(symbol)
+                    try:
+                        await asyncio.wait_for(
+                            self._process_symbol_tick(symbol),
+                            timeout=30.0,
+                        )
+                    except asyncio.TimeoutError:
+                        logger.error(f"Tick timed out for {symbol} after 30s — skipping")
+                    except Exception as e:
+                        logger.exception(f"Error in tick for {symbol}: {e}")
 
                 self._tick_count += 1
+                self._last_tick_time = time.time()
 
-                # Periodic tasks
-                if self._tick_count % 10 == 0:
-                    self._log_status()
+                # Log every tick for full visibility
+                self._log_status()
 
                 if self._tick_count % 60 == 0:
                     self.ledger.take_snapshot()
                     self.risk_guard.update_peak_equity()
 
-                await asyncio.sleep(tick_interval)
+                # Split sleep into 1-second chunks (Windows event-loop stability)
+                remaining = tick_interval
+                while remaining > 0 and self.running:
+                    await asyncio.sleep(1.0)
+                    remaining -= 1.0
 
             except asyncio.CancelledError:
                 break
             except Exception as e:
                 logger.exception(f"Error in main loop: {e}")
-                await asyncio.sleep(tick_interval)
+                remaining = tick_interval
+                while remaining > 0 and self.running:
+                    await asyncio.sleep(1.0)
+                    remaining -= 1.0
 
     async def _process_symbol_tick(self, symbol: str):
         """
         Process one tick for one symbol: data → indicators → regime → signal.
         """
+        # 0. Data freshness — warn if WebSocket data is stale, but continue
+        data_age = self.data_engine.get_data_age(symbol)
+        max_stale = self._get_tick_interval_seconds() * 3
+        grace_period = self._get_tick_interval_seconds() * 3
+        runtime = time.time() - self._start_time if self._start_time else 0
+        if runtime > grace_period and data_age > max_stale:
+            age_str = f"{data_age:.0f}s" if data_age != float("inf") else "never"
+            logger.warning(
+                f"WebSocket data stale for {symbol}: {age_str} (limit={max_stale:.0f}s). "
+                f"Proceeding with cached data."
+            )
+
         # 1. Get latest OHLCV data
         ohlcv = await self.data_engine.get_ohlcv(symbol)
         if len(ohlcv) < 30:
@@ -530,64 +561,78 @@ class TradingSystem:
         # Update current regime
         self._current_regime[symbol] = regime_result.regime
 
-        # 4. Generate strategy signal based on regime
-        signal: Optional[StrategySignal] = None
+        # 4. Generate strategy signals — grid ALWAYS, trend INDEPENDENTLY
+        grid_signal: Optional[StrategySignal] = None
+        trend_signal: Optional[StrategySignal] = None
+        is_ranging = regime_result.is_ranging
 
-        # -- ALWAYS run grid first (our best strategy) --
+        # ---- GRID (always running) ----
         current_grid = self._grid_configs.get(symbol)
-        if current_grid is None:
-            ref_price = self.grid_strategy.compute_rebalance_price(ohlcv)
-            current_grid = self.grid_strategy.compute_grid(
-                reference_price=ref_price, symbol=symbol, atr=indicators.atr,
-            )
-            self._grid_configs[symbol] = current_grid
-            signal = self.grid_strategy.generate_signal(current_grid)
-            logger.info(f" Grid deployed for {symbol}: {len(current_grid.levels)} levels @ {ref_price:.2f}")
-            self.state_machine.activate_grid()
 
-        elif self.grid_strategy.check_rebalance(indicators.close, current_grid):
-            ref_price = self.grid_strategy.compute_rebalance_price(ohlcv)
-            new_grid = self.grid_strategy.compute_grid(
-                reference_price=ref_price, symbol=symbol, atr=indicators.atr,
-            )
-            self._grid_configs[symbol] = new_grid
-            signal = self.grid_strategy.generate_signal(new_grid)
-            logger.info(f" Grid rebalanced for {symbol} @ {ref_price:.2f}")
+        # Stop-loss check first
+        if current_grid is not None:
+            if self.grid_strategy.check_stop_loss(indicators.close, current_grid):
+                logger.error(
+                    f"⛔ GRID STOP-LOSS triggered for {symbol}! "
+                    f"Price {indicators.close:.5f} <= {current_grid.stop_loss_price:.5f}"
+                )
+                grid_signal = self.grid_strategy.generate_stop_signal(
+                    current_grid, reason="stop_loss"
+                )
+                self._grid_configs.pop(symbol, None)
+                self.state_machine.emergency_stop()
 
-        # -- Trend strategy DISABLED for now (focusing on grid) --
-        if False and regime_result.is_trending and regime_result.confidence > 0.80:
+        if grid_signal is None:
+            if current_grid is None:
+                ref_price = self.grid_strategy.compute_rebalance_price(ohlcv)
+                current_grid = self.grid_strategy.compute_grid(
+                    reference_price=ref_price, symbol=symbol,
+                    atr=indicators.atr, is_ranging=is_ranging,
+                )
+                self._grid_configs[symbol] = current_grid
+                grid_signal = self.grid_strategy.generate_signal(current_grid)
+                logger.info(
+                    f" Grid deployed: {symbol} {len(current_grid.levels)}lvls "
+                    f"@ {ref_price:.5f} sl={current_grid.stop_loss_price:.5f}"
+                )
+                self.state_machine.activate_grid()
+
+            elif self.grid_strategy.check_rebalance(indicators.close, current_grid):
+                ref_price = self.grid_strategy.compute_rebalance_price(ohlcv)
+                new_grid = self.grid_strategy.compute_grid(
+                    reference_price=ref_price, symbol=symbol,
+                    atr=indicators.atr, is_ranging=is_ranging,
+                )
+                self._grid_configs[symbol] = new_grid
+                grid_signal = self.grid_strategy.generate_signal(new_grid)
+                logger.info(
+                    f" Grid rebalanced: {symbol} @ {ref_price:.5f} "
+                    f"({len(new_grid.levels)}lvls)"
+                )
+
+        # ---- TREND (independently evaluated, only on strong signals) ----
+        if regime_result.is_trending and regime_result.confidence > 0.80:
             trend_state = self._trend_states.get(symbol, TrendState.flat(symbol))
-            trend_signal = self.trend_strategy.evaluate(
+            raw_trend = self.trend_strategy.evaluate(
                 symbol=symbol, current_price=indicators.close,
                 ema_fast_val=indicators.ema_fast, ema_slow_val=indicators.ema_slow,
                 macd_hist=indicators.macd_hist, atr=indicators.atr,
                 current_state=trend_state,
                 capital=self.ledger.get_total_equity(),
             )
-            if trend_signal is not None:
-                signal = trend_signal  # Trend entry/exit takes priority over grid
+            if raw_trend is not None:
+                # Only accept ENTRY when flat, or EXIT when in position.
+                # Ignore "hold" signals that keep the same state.
+                if raw_trend.action == SignalAction.START_TREND and not trend_state.is_active:
+                    trend_signal = raw_trend
+                elif raw_trend.action == SignalAction.STOP_TREND and trend_state.is_active:
+                    trend_signal = raw_trend
 
-        # 5. No signal? Nothing to do this tick
-        if signal is None and regime_result.switched:
-            prev_mode = "trend" if regime_result.is_ranging else "grid"
-            logger.info(f"Regime switch detected — closing {prev_mode} position for {symbol}")
-            if prev_mode == "trend":
-                ts = self._trend_states.get(symbol)
-                if ts and ts.is_active:
-                    signal = StrategySignal(
-                        action=SignalAction.STOP_TREND,
-                        symbol=symbol,
-                        score=1.0,
-                        metadata={"direction": ts.direction.value, "exit_reason": "regime_switch"},
-                    )
-            else:
-                gc = self._grid_configs.get(symbol)
-                if gc:
-                    signal = self.grid_strategy.generate_stop_signal(gc, "regime_switch")
-
-        # 6. Route signal through risk → execution
-        if signal is not None:
-            await self._route_signal(signal)
+        # 5. Route signals — trend takes priority if both fire
+        if trend_signal is not None:
+            await self._route_signal(trend_signal)
+        if grid_signal is not None:
+            await self._route_signal(grid_signal)
 
     async def _route_signal(self, signal: StrategySignal):
         """
@@ -650,6 +695,22 @@ class TradingSystem:
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
+
+    async def _watchdog(self, tick_interval: float) -> None:
+        """Independent watchdog: logs if main loop hasn't ticked for 2× interval."""
+        while self.running:
+            remaining = tick_interval * 2
+            while remaining > 0 and self.running:
+                await asyncio.sleep(1.0)
+                remaining -= 1.0
+            if not self.running:
+                break
+            elapsed = time.time() - self._last_tick_time
+            if elapsed > tick_interval * 2:
+                logger.error(
+                    f"WATCHDOG: Main loop stalled! {elapsed:.0f}s since last tick "
+                    f"(tick_interval={tick_interval}s, tick_count={self._tick_count})"
+                )
 
     def _get_tick_interval_seconds(self) -> float:
         """Convert primary interval string to seconds."""

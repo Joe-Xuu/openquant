@@ -159,9 +159,10 @@ class GridConfig:
     reference_price: float
     upper_bound: float
     lower_bound: float
-    levels: List[GridLevel]
-    profit_per_grid_pct: float
-    total_capital: float
+    stop_loss_price: float = 0.0
+    levels: List[GridLevel] = field(default_factory=list)
+    profit_per_grid_pct: float = 0.5
+    total_capital: float = 10000.0
     status: GridStatus = GridStatus.ACTIVE
     created_at: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
     updated_at: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
@@ -239,6 +240,7 @@ class GridConfig:
             "reference_price": self.reference_price,
             "upper_bound": self.upper_bound,
             "lower_bound": self.lower_bound,
+            "stop_loss_price": self.stop_loss_price,
             "levels": [lvl.to_dict() for lvl in self.levels],
             "profit_per_grid_pct": self.profit_per_grid_pct,
             "total_capital": self.total_capital,
@@ -361,6 +363,10 @@ class GridStrategy:
         self.strategy_id = strategy_id
         self.min_profit_after_fees_pct = min_profit_after_fees_pct
         self.estimated_fee_pct = estimated_fee_pct
+        # Pyramid allocation: closer levels get more capital (decay=0.5)
+        self.pyramid_decay: float = 0.5
+        # Grid stop-loss: emergency-close if price drops this far below lower_bound
+        self.grid_stop_loss_pct: float = 3.0
 
     # ------------------------------------------------------------------
     # Grid Computation
@@ -372,6 +378,7 @@ class GridStrategy:
         symbol: str = "BTCUSDT",
         atr: Optional[float] = None,
         atr_multiplier: float = 2.0,
+        is_ranging: bool = True,
     ) -> GridConfig:
         """
         Compute the complete grid layout around a reference price.
@@ -398,30 +405,50 @@ class GridStrategy:
         if reference_price <= 0:
             raise ValueError(f"reference_price must be positive, got {reference_price}")
 
+        # --- Volatility-adaptive level count ---
+        adaptive_levels = self.grid_levels
+        if atr is not None and atr > 0:
+            atr_pct_val = (atr / reference_price) * 100
+            if is_ranging:
+                if atr_pct_val < 0.5:
+                    adaptive_levels = self.grid_levels + 2
+                elif atr_pct_val < 1.0:
+                    adaptive_levels = self.grid_levels + 1
+            else:
+                if atr_pct_val > 2.0:
+                    adaptive_levels = max(2, self.grid_levels - 1)
+            adaptive_levels = max(2, min(8, adaptive_levels))
+
         # --- Dynamic bound adjustment based on volatility ---
         upper_pct = self.upper_bound_pct
         lower_pct = self.lower_bound_pct
 
         if atr is not None and atr > 0:
-            atr_pct = (atr * atr_multiplier / reference_price) * 100
-            upper_pct = max(upper_pct, atr_pct)
-            lower_pct = max(lower_pct, atr_pct)
+            atr_pct_val2 = (atr * atr_multiplier / reference_price) * 100
+            upper_pct = max(upper_pct, atr_pct_val2)
+            lower_pct = max(lower_pct, atr_pct_val2)
 
         # --- Compute bounds ---
         upper_bound = reference_price * (1.0 + upper_pct / 100.0)
         lower_bound = reference_price * (1.0 - lower_pct / 100.0)
 
-        # --- Compute levels ---
+        # --- Compute levels with adaptive density ---
+        saved_levels = self.grid_levels
+        self.grid_levels = adaptive_levels
         if self.grid_type == GridType.GEOMETRIC:
             levels = self._compute_geometric_levels(reference_price, upper_bound, lower_bound)
         else:
             levels = self._compute_arithmetic_levels(reference_price, upper_bound, lower_bound)
+        self.grid_levels = saved_levels
 
         # --- Validate ---
         self._validate_grid_levels(levels, reference_price, upper_bound, lower_bound)
 
         # --- Generate deterministic grid ID ---
         grid_id = self._compute_grid_id(symbol, reference_price, upper_bound, lower_bound)
+
+        # --- Stop-loss: below the lower bound by stop_loss_pct % ---
+        stop_loss_price = lower_bound * (1.0 - self.grid_stop_loss_pct / 100.0)
 
         return GridConfig(
             grid_id=grid_id,
@@ -430,6 +457,7 @@ class GridStrategy:
             reference_price=reference_price,
             upper_bound=upper_bound,
             lower_bound=lower_bound,
+            stop_loss_price=round(stop_loss_price, 8),
             levels=levels,
             profit_per_grid_pct=self.profit_per_grid_pct,
             total_capital=self.total_capital,
@@ -458,17 +486,20 @@ class GridStrategy:
         """
         levels = []
 
-        # Growth factors: solve for k such that k^N spans the full range
+        # Growth factors
         k_sell = (upper_bound / reference_price) ** (1.0 / self.grid_levels)
         k_buy = (reference_price / lower_bound) ** (1.0 / self.grid_levels)
 
-        # Per-level capital allocation (equal split)
-        capital_per_level = self.total_capital / (2 * self.grid_levels)
+        # Pyramid allocation: closer levels get more capital
+        weights = [self.pyramid_decay ** i for i in range(self.grid_levels)]
+        total_weight = sum(weights)
+        side_capital = self.total_capital * 0.45
 
         # --- Sell levels (above reference) ---
         for i in range(1, self.grid_levels + 1):
             price = reference_price * (k_sell ** i)
-            quantity = capital_per_level / price
+            capital_for_level = side_capital * weights[i - 1] / total_weight
+            quantity = capital_for_level / price
             tp_price = price * (1.0 - self.profit_per_grid_pct / 100.0)
 
             levels.append(GridLevel(
@@ -482,11 +513,12 @@ class GridStrategy:
         # --- Buy levels (below reference) ---
         for i in range(1, self.grid_levels + 1):
             price = reference_price / (k_buy ** i)
-            quantity = capital_per_level / price
+            capital_for_level = side_capital * weights[i - 1] / total_weight
+            quantity = capital_for_level / price
             tp_price = price * (1.0 + self.profit_per_grid_pct / 100.0)
 
             levels.append(GridLevel(
-                level_index=self.grid_levels + i,  # offset to avoid collision with sell indices
+                level_index=self.grid_levels + i,
                 side=LevelSide.BUY,
                 price=round(price, 8),
                 quantity=round(quantity, 8),
@@ -517,12 +549,15 @@ class GridStrategy:
         step_sell = (upper_bound - reference_price) / self.grid_levels
         step_buy = (reference_price - lower_bound) / self.grid_levels
 
-        capital_per_level = self.total_capital / (2 * self.grid_levels)
+        weights = [self.pyramid_decay ** i for i in range(self.grid_levels)]
+        total_weight = sum(weights)
+        side_capital = self.total_capital * 0.45
 
         # --- Sell levels ---
         for i in range(1, self.grid_levels + 1):
             price = reference_price + i * step_sell
-            quantity = capital_per_level / price
+            capital_for_level = side_capital * weights[i - 1] / total_weight
+            quantity = capital_for_level / price
             tp_price = price * (1.0 - self.profit_per_grid_pct / 100.0)
 
             levels.append(GridLevel(
@@ -536,7 +571,8 @@ class GridStrategy:
         # --- Buy levels ---
         for i in range(1, self.grid_levels + 1):
             price = reference_price - i * step_buy
-            quantity = capital_per_level / price
+            capital_for_level = side_capital * weights[i - 1] / total_weight
+            quantity = capital_for_level / price
             tp_price = price * (1.0 + self.profit_per_grid_pct / 100.0)
 
             levels.append(GridLevel(
@@ -684,33 +720,26 @@ class GridStrategy:
 
         return False
 
+    def check_stop_loss(self, current_price: float, grid: GridConfig) -> bool:
+        """Check if grid stop-loss triggered. Price dropped below emergency floor."""
+        if grid.stop_loss_price <= 0:
+            return False
+        return current_price <= grid.stop_loss_price
+
     def compute_rebalance_price(
         self,
         ohlcv: List[Dict[str, float]],
         window: int = 20,
     ) -> float:
         """
-        Compute the optimal reference price for rebalancing.
+        Compute the optimal reference price for the grid.
 
-        Uses a simple moving average of mid-prices over the recent window
-        to avoid placing the new grid at an extreme price.
-
-        In production, this could use VWAP, EMA, or volume profile POC.
-
-        Args:
-            ohlcv: List of dicts with keys 'high', 'low', 'close'.
-                   Most recent last.
-            window: Number of candles to average over.
-
-        Returns:
-            Recommended reference price for the new grid.
+        Uses the latest close price — a TRAILING grid that follows price.
+        This keeps buy levels close to current price for higher fill probability.
         """
         if not ohlcv:
             raise ValueError("ohlcv data is empty")
-
-        recent = ohlcv[-window:] if len(ohlcv) > window else ohlcv
-        mids = [(c["high"] + c["low"] + c["close"]) / 3.0 for c in recent]
-        return sum(mids) / len(mids)
+        return ohlcv[-1]["close"]
 
     # ------------------------------------------------------------------
     # Signal Generation

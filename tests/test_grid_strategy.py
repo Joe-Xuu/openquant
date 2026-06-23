@@ -574,11 +574,10 @@ class TestEdgeCases:
         )
 
     def test_compute_rebalance_price(self, geometric_grid, sample_ohlcv):
-        """Rebalance price should be near the average of recent candles."""
+        """Rebalance price should equal the latest close (tracking grid)."""
         ref = geometric_grid.compute_rebalance_price(sample_ohlcv, window=10)
-        recent_closes = [c["close"] for c in sample_ohlcv[-10:]]
-        expected = sum(recent_closes) / len(recent_closes)
-        assert abs(ref - expected) < 0.01
+        expected = sample_ohlcv[-1]["close"]
+        assert ref == expected
 
     def test_grid_metrics_are_computable(self, btc_grid_config, geometric_grid):
         """Performance estimation should return sensible numbers."""

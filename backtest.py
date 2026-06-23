@@ -284,9 +284,7 @@ class BacktestEngine:
                             self._last_switch_bar = i
                             switched_this_tick = True
                             self._regime_history.append((current_bar["timestamp"], raw_regime.score))
-                            if self._grid_config is not None:
-                                self._cancel_unfilled_levels()
-                                self._grid_config = None
+                            # Grid persists — trend trades overlay on top, never cancel grid
                     else:
                         self._current_regime = raw_regime.regime
                         self._last_switch_bar = i
@@ -366,10 +364,59 @@ class BacktestEngine:
         """Run one tick of the strategy."""
         price = bar["close"]
 
-        if regime.is_trending:
+        if strategy_mode == "grid_only":
+            self._run_grid_strategy(bar, indicators, strategy_mode)
+        elif strategy_mode == "trend_only":
             self._run_trend_strategy(bar, indicators, strategy_mode)
         else:
+            # DUAL ENGINE: grid always runs. Trend only fires on strong ENTRY/EXIT.
             self._run_grid_strategy(bar, indicators, strategy_mode)
+
+            if regime.is_trending and regime.confidence >= self.cfg.confidence_threshold_trend:
+                trend_signal = self._evaluate_trend(bar, indicators)
+                if trend_signal is not None:
+                    if trend_signal.action == SignalAction.START_TREND and self.position_qty == 0:
+                        self._execute_trend_trade(trend_signal, bar, indicators)
+                    elif trend_signal.action == SignalAction.STOP_TREND and self.position_qty > 0:
+                        self._execute_trend_trade(trend_signal, bar, indicators)
+
+    def _evaluate_trend(self, bar: Dict, indicators: IndicatorBundle):
+        """Evaluate trend strategy without modifying state. Returns signal or None."""
+        return self.trend.evaluate(
+            symbol=self.cfg.symbol,
+            current_price=bar["close"],
+            ema_fast_val=indicators.ema_fast,
+            ema_slow_val=indicators.ema_slow,
+            macd_hist=indicators.macd_hist,
+            atr=indicators.atr,
+            current_state=self._trend_state,
+            capital=self._get_equity(),
+        )
+
+    def _execute_trend_trade(self, signal, bar: Dict, indicators: IndicatorBundle):
+        """Execute a trend strategy signal (ENTRY or EXIT only)."""
+        price = bar["close"]
+        if signal.action == SignalAction.START_TREND:
+            direction = TrendDirection(signal.metadata["direction"])
+            target_qty = signal.metadata.get("position_size", 0)
+            if self.position_qty > 0:
+                needs_reverse = (
+                    (direction == TrendDirection.LONG and self.position_direction == "SHORT") or
+                    (direction == TrendDirection.SHORT and self.position_direction == "LONG")
+                )
+                if needs_reverse:
+                    self._close_position(price, bar["timestamp"], "trend_reversal", "regime_switch")
+                    new_side = "BUY" if direction == TrendDirection.LONG else "SELL"
+                    self._open_position(price, bar["timestamp"], new_side, target_qty, "regime_switch")
+            else:
+                side = "BUY" if direction == TrendDirection.LONG else "SELL"
+                self._open_position(price, bar["timestamp"], side, target_qty, "regime_switch")
+            self._trend_state = self.trend.update_state(
+                self._trend_state, signal, price, bar["timestamp"])
+        elif signal.action == SignalAction.STOP_TREND:
+            if self.position_qty > 0:
+                self._close_position(price, bar["timestamp"], "trend_exit", "regime_switch")
+                self._trend_state = TrendState.flat(self.cfg.symbol)
 
     def _run_grid_strategy(self, bar: Dict, indicators: IndicatorBundle, mode: str):
         """Execute grid strategy logic."""
