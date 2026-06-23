@@ -576,33 +576,59 @@ class OrderManager:
                     logger.info(f"  Fill: {symbol} {fill_side} {fill_qty} @ ${fill_price:.2f}")
 
                     # ---- AUTO PLACE TAKE-PROFIT ORDER ----
-                    # When a BUY fills, place a SELL at 0.5% profit.
-                    # Works regardless of whether we found the original order in ledger.
                     if fill_side == "BUY" and fill_qty > 0:
                         tp_price = round(fill_price * 1.005, 2)
-                        # Deduplicate by exchange trade ID
                         trade_id = str(trade.get("id", ""))
                         tp_tag = f"tp_{trade_id}"
-                        already_placed = any(
-                            o.client_order_id and o.client_order_id == tp_tag
-                            for o in self._orders.values()
-                        )
-                        if not already_placed:
-                            try:
-                                tp_req = OrderRequest(
-                                    symbol=symbol, side="SELL", order_type="LIMIT",
-                                    price=tp_price, quantity=round(fill_qty, 5),
-                                    time_in_force="GTC", client_order_id=tp_tag,
-                                )
-                                tp_resp = await self._client.place_order(tp_req)
-                                logger.info(f"  TP placed: SELL {fill_qty:.5f} @ ${tp_price:.2f} (entry ${fill_price:.2f})")
-                                self._orders[tp_tag] = TrackedOrder(
-                                    order_id=tp_tag, exchange_order_id=tp_resp.exchange_order_id,
-                                    symbol=symbol, side="SELL", order_type="LIMIT",
-                                    price=tp_price, quantity=fill_qty, status="OPEN",
-                                )
-                            except Exception as e:
-                                logger.error(f"  Failed to place TP: {e}")
+
+                        # Dedup: never retry the same TP order
+                        if not hasattr(self, '_tp_attempted'):
+                            self._tp_attempted: set = set()
+                        if tp_tag in self._tp_attempted:
+                            continue
+                        self._tp_attempted.add(tp_tag)
+                        if len(self._tp_attempted) > 1000:
+                            self._tp_attempted = set(list(self._tp_attempted)[-500:])
+
+                        # Use actual balance (accounts for fees) floored to lot size
+                        try:
+                            base_asset = symbol.replace("USDT", "")
+                            bal = await self._client.get_asset_balance(base_asset)
+                            available = bal.free
+                            if available <= 0:
+                                logger.debug(f"  No {base_asset} to sell for TP")
+                                continue
+                            info = await self._client.get_exchange_info(symbol)
+                            lot_step = 1.0
+                            for s in info.get("symbols", []):
+                                if s.get("symbol") == symbol.upper():
+                                    for f in s.get("filters", []):
+                                        if f["filterType"] == "LOT_SIZE":
+                                            lot_step = float(f["stepSize"])
+                                            break
+                                    break
+                            sell_qty = (available // lot_step) * lot_step
+                            if sell_qty <= 0:
+                                logger.debug(f"  TP qty {available} below lot step {lot_step}")
+                                continue
+                        except Exception:
+                            sell_qty = fill_qty
+
+                        try:
+                            tp_req = OrderRequest(
+                                symbol=symbol, side="SELL", order_type="LIMIT",
+                                price=tp_price, quantity=sell_qty,
+                                time_in_force="GTC", client_order_id=tp_tag,
+                            )
+                            tp_resp = await self._client.place_order(tp_req)
+                            logger.info(f"  TP placed: SELL {sell_qty} @ ${tp_price:.2f}")
+                            self._orders[tp_tag] = TrackedOrder(
+                                order_id=tp_tag, exchange_order_id=tp_resp.exchange_order_id,
+                                symbol=symbol, side="SELL", order_type="LIMIT",
+                                price=tp_price, quantity=sell_qty, status="OPEN",
+                            )
+                        except Exception as e:
+                            logger.error(f"  Failed to place TP: {e}")
 
             except Exception as e:
                 logger.debug(f"Reconciliation skipped for {symbol}: {e}")
