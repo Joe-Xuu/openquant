@@ -590,8 +590,30 @@ class TradingSystem:
                 self._grid_configs.pop(symbol, None)
                 self.state_machine.emergency_stop()
 
+        # ---- Trend gate: pause new grid buys in strong trends ----
+        # When the market is clearly trending, the grid keeps chasing price
+        # downhill, draining USDT into a falling knife. Pause new grid entries
+        # and let trend strategy handle the directional move. Existing TP
+        # orders are preserved by the order manager's rebalance logic.
+        strong_trend = regime_result.is_trending and regime_result.confidence > 0.80
+        was_trending = getattr(self, '_trend_paused_grid', False)
+        if strong_trend and not was_trending and current_grid is not None:
+            logger.warning(
+                f"⚠ Strong trend detected (conf={regime_result.confidence:.2f}). "
+                f"Pausing new grid buys — trend strategy takes over."
+            )
+            self._trend_paused_grid = True
+        elif not strong_trend and was_trending:
+            logger.info("✓ Trend subsided — resuming grid")
+            self._trend_paused_grid = False
+            current_grid = None  # force fresh deployment
+
         if grid_signal is None:
-            if current_grid is None:
+            if strong_trend and current_grid is not None:
+                # Grid frozen — don't deploy, don't rebalance. Let existing
+                # positions ride with their TP orders on the exchange.
+                pass
+            elif current_grid is None:
                 ref_price = self.grid_strategy.compute_rebalance_price(ohlcv)
                 current_grid = self.grid_strategy.compute_grid(
                     reference_price=ref_price, symbol=symbol,

@@ -56,7 +56,7 @@
             "lower_bound_pct": 3.0,
             "grid_levels": 10,
             "profit_per_grid_pct": 0.5,
-            "rebalance_threshold_pct": 1.0
+            "rebalance_threshold_pct": 3.0
         },
         "trend_following": {
             "ema_fast": 12,
