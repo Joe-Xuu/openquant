@@ -494,6 +494,14 @@ class TradingSystem:
                 self._tick_count += 1
                 self._last_tick_time = time.time()
 
+                # Minutely order summary: clean table every 60s
+                now = time.time()
+                if not hasattr(self, '_last_summary_time'):
+                    self._last_summary_time = 0.0
+                if now - self._last_summary_time >= 60:
+                    self._last_summary_time = now
+                    await self._print_order_summary()
+
                 # Log every tick for full visibility
                 self._log_status()
 
@@ -722,6 +730,60 @@ class TradingSystem:
         value = int(interval[:-1])
         multipliers = {"s": 1, "m": 60, "h": 3600, "d": 86400}
         return value * multipliers.get(unit, 60)
+
+    async def _print_order_summary(self):
+        """Print a clean minutely summary: open orders table + real P&L."""
+        try:
+            # Fetch open orders and account from exchange
+            orders = await self.exchange_client.get_open_orders()
+            balances = await self.exchange_client.get_balances()
+
+            buys = []
+            sells = []
+            for o in orders:
+                if o.get("side") == "BUY":
+                    buys.append((float(o["price"]), float(o["origQty"])))
+                else:
+                    sells.append((float(o["price"]), float(o["origQty"])))
+
+            buys.sort(key=lambda x: x[0], reverse=True)
+            sells.sort(key=lambda x: x[0])
+
+            # Real equity from exchange
+            usdt = sum(b.total for b in balances if b.asset == "USDT")
+            equity = usdt
+            for sym in self.config["trading"]["symbols"]:
+                try:
+                    px = await self.exchange_client.get_ticker_price(sym)
+                except Exception:
+                    px = 0
+                base = sym.replace("USDT", "")
+                qty = sum(b.total for b in balances if b.asset == base)
+                equity += qty * px
+
+            pnl = equity - float(self.config["trading"].get("initial_capital", 12))
+            pnl_pct = pnl / float(self.config["trading"].get("initial_capital", 12)) * 100
+
+            # Build table
+            lines = []
+            lines.append("")
+            lines.append("┌──────────────────────────────────────────────────┐")
+            lines.append("│              ORDER SUMMARY (60s)                 │")
+            lines.append("├─────────────────┬────────────────────────────────┤")
+            lines.append(f"│ {'BUY orders':<15} │ {'SELL orders':<30} │")
+            lines.append("├─────────────────┼────────────────────────────────┤")
+            max_rows = max(len(buys), len(sells), 1)
+            for i in range(max_rows):
+                buy_str = f"{buys[i][1]:.0f} @ {buys[i][0]:.5f}" if i < len(buys) else ""
+                sell_str = f"{sells[i][1]:.0f} @ {sells[i][0]:.5f}" if i < len(sells) else ""
+                lines.append(f"│ {buy_str:<15} │ {sell_str:<30} │")
+            lines.append("├─────────────────┴────────────────────────────────┤")
+            lines.append(f"│ Equity: ${equity:.4f}  |  P&L: {pnl:+.4f} ({pnl_pct:+.2f}%)  │")
+            lines.append("└──────────────────────────────────────────────────┘")
+            for line in lines:
+                logger.info(line)
+        except Exception as e:
+            logger.debug(f"Order summary failed: {e}")
 
     def _log_status(self):
         """Log current system status (periodic heartbeat)."""

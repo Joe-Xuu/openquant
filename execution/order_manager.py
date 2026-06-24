@@ -599,7 +599,7 @@ class OrderManager:
                             filled_quantity=fill_qty,
                             fill_price=fill_price,
                         )
-                    logger.info(f"  Fill: {symbol} {fill_side} {fill_qty} @ ${fill_price:.2f}")
+                    logger.debug(f"  Fill: {symbol} {fill_side} {fill_qty} @ ${fill_price:.2f}")
 
                     # ---- AUTO PLACE TAKE-PROFIT ORDER ----
                     if fill_side == "BUY" and fill_qty > 0:
