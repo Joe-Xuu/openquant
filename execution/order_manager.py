@@ -87,7 +87,7 @@ class OrderManager:
         ledger_record_trade_open: Callable = None,
         ledger_record_trade_close: Callable = None,
         ledger_register_grid: Callable = None,
-        reconcile_interval: float = 30.0,
+        reconcile_interval: float = 5.0,
     ):
         """
         Initialize the order manager.
@@ -196,13 +196,30 @@ class OrderManager:
             logger.warning("Grid signal has no levels")
             return []
 
-        # Cancel all existing orders for this symbol before placing new ones
-        # This ensures clean rebalancing without overlapping grids
+        # Cancel old GRID orders only — preserve TP orders placed by reconciliation.
+        # TP orders have client_order_id starting with "tp_".
         try:
-            await self._client.cancel_all_orders(signal.symbol)
-            logger.info(f"  Cancelled old {signal.symbol} orders for rebalance")
+            open_orders = await self._client.get_open_orders(signal.symbol)
+            cancelled = 0
+            preserved = 0
+            for o in open_orders:
+                cid = o.get("clientOrderId", "")
+                if cid.startswith("tp_"):
+                    preserved += 1
+                    continue  # Never cancel take-profit orders
+                try:
+                    await self._client.cancel_order(
+                        signal.symbol, order_id=str(o.get("orderId", ""))
+                    )
+                    cancelled += 1
+                except Exception:
+                    pass
+            logger.info(
+                f"  Rebalance: cancelled {cancelled} grid orders, "
+                f"preserved {preserved} TP orders"
+            )
         except Exception as e:
-            logger.debug(f"  No old orders to cancel: {e}")
+            logger.debug(f"  Could not query open orders: {e}")
 
         tracked_orders = []
         trade_id = metadata.get("grid_id", "")
