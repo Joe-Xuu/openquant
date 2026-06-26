@@ -225,13 +225,15 @@ class OrderManager:
         trade_id = metadata.get("grid_id", "")
         self._ledger_register_grid(trade_id, signal.symbol)
 
-        # ---- Unidirectional deployment: skip sides with no balance ----
+        # ---- Unidirectional deployment with existing inventory integration ----
         base_asset = signal.symbol.replace("USDT", "")
         has_base, has_quote = True, True
+        base_free = 0.0
         try:
             base_bal = await self._client.get_asset_balance(base_asset)
             quote_bal = await self._client.get_asset_balance("USDT")
-            has_base = base_bal.free > 0
+            base_free = base_bal.free
+            has_base = base_free > 0
             has_quote = quote_bal.free > 0
             if not has_base:
                 logger.info(f"  No {base_asset} — skipping SELL levels")
@@ -240,12 +242,34 @@ class OrderManager:
         except Exception:
             pass
 
-        for level_dict in levels:
+        # Distribute existing DOGE across sell levels (pyramid weights).
+        # Compute total weight for sell levels to allocate inventory.
+        sell_levels_data = [l for l in levels if l.get("side") == "SELL"]
+        buy_levels_data = [l for l in levels if l.get("side") == "BUY"]
+        sell_total_weight = sum(
+            self._pyramid_weight(i, len(sell_levels_data))
+            for i in range(len(sell_levels_data))
+        ) if sell_levels_data else 1.0
+        buy_total_weight = sum(
+            self._pyramid_weight(i, len(buy_levels_data))
+            for i in range(len(buy_levels_data))
+        ) if buy_levels_data else 1.0
+
+        for idx, level_dict in enumerate(levels):
             side = level_dict.get("side", "")
             if side == "SELL" and not has_base:
                 continue
             if side == "BUY" and not has_quote:
                 continue
+
+            # Allocate existing inventory for sells, capital for buys
+            if side == "SELL" and base_free > 0 and sell_levels_data:
+                sell_idx = sell_levels_data.index(level_dict)
+                weight = self._pyramid_weight(sell_idx, len(sell_levels_data))
+                allocated_qty = base_free * weight / sell_total_weight
+                # Override grid-computed quantity with actual available inventory
+                level_dict = dict(level_dict)
+                level_dict["quantity"] = allocated_qty
 
             try:
                 price, qty = self._round_to_tick(signal.symbol, level_dict["price"], level_dict["quantity"])
@@ -508,6 +532,11 @@ class OrderManager:
     # ------------------------------------------------------------------
     # Exchange Precision
     # ------------------------------------------------------------------
+
+    @staticmethod
+    def _pyramid_weight(index: int, total_levels: int, decay: float = 0.5) -> float:
+        """Pyramid weight for level index (0 = closest to reference, highest weight)."""
+        return decay ** index
 
     @staticmethod
     def _round_to_tick(symbol: str, price: float, qty: float) -> tuple:
