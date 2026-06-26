@@ -563,10 +563,13 @@ class OrderManager:
 
     async def _reconciliation_loop(self) -> None:
         """Background task that periodically reconciles order states."""
+        # Initial delay: let the grid deploy first before reconciliation
+        # kicks in, otherwise old fills trigger TP before grid_active is set.
+        await asyncio.sleep(15.0)
         while self._running:
             try:
-                await asyncio.sleep(self.reconcile_interval)
                 await self.reconcile()
+                await asyncio.sleep(self.reconcile_interval)
             except asyncio.CancelledError:
                 break
             except Exception as e:
