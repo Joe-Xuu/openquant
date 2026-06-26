@@ -269,31 +269,29 @@ class TradingSystem:
     # Ledger Callbacks (bridge between execution and core)
     # ------------------------------------------------------------------
 
-    def _get_equity(self) -> float:
-        """Return current total equity — from exchange, fallback to ledger."""
+    async def _get_equity_async(self) -> float:
+        """Return current total equity from exchange (live balances × prices)."""
         try:
-            # Use exchange account for real equity
-            from dotenv import load_dotenv; load_dotenv()
-            import requests, time as _time, hmac as _hmac, hashlib as _hashlib
-            k = os.getenv('BINANCE_TESTNET_API_KEY',''); s = os.getenv('BINANCE_TESTNET_API_SECRET','')
-            if k and s:
-                p = {'timestamp': int(_time.time()*1000), 'recvWindow': 5000}
-                q = '&'.join(f'{x}={y}' for x,y in sorted(p.items()))
-                sig = _hmac.new(s.encode(), q.encode(), _hashlib.sha256).hexdigest()
-                r = requests.get(f'https://testnet.binance.vision/api/v3/account?{q}&signature={sig}', headers={'X-MBX-APIKEY': k}, timeout=5)
-                btc_qty = eth_qty = usdt_bal = 0.0
-                for b in r.json().get('balances', []):
-                    total = float(b['free']) + float(b['locked'])
-                    if b['asset'] == 'BTC': btc_qty = total
-                    elif b['asset'] == 'ETH': eth_qty = total
-                    elif b['asset'] == 'USDT': usdt_bal = total
-                rp = requests.get('https://api.binance.com/api/v3/ticker/price?symbol=BTCUSDT', timeout=3)
-                btc_px = float(rp.json()['price'])
-                rp = requests.get('https://api.binance.com/api/v3/ticker/price?symbol=ETHUSDT', timeout=3)
-                eth_px = float(rp.json()['price'])
-                return usdt_bal + btc_qty * btc_px + eth_qty * eth_px
+            balances = await self.exchange_client.get_balances()
+            symbols = self.config.get("trading", {}).get("symbols", ["DOGEUSDT"])
+            equity = 0.0
+            for b in balances:
+                if b.asset == "USDT":
+                    equity += b.total
+                else:
+                    # Look up price for this asset
+                    sym = f"{b.asset}USDT"
+                    try:
+                        px = await self.exchange_client.get_ticker_price(sym)
+                        equity += b.total * px
+                    except Exception:
+                        pass  # skip assets we can't price
+            return equity if equity > 0 else self.ledger.get_total_equity()
         except Exception:
-            pass
+            return self.ledger.get_total_equity()
+
+    def _get_equity(self) -> float:
+        """Sync wrapper: return equity from ledger (updated by async fetch)."""
         return self.ledger.get_total_equity()
 
     def _get_positions(self) -> List[Dict]:
@@ -514,7 +512,7 @@ class TradingSystem:
                     await self._print_order_summary()
 
                 # Log every tick for full visibility
-                self._log_status()
+                await self._log_status_async()
 
                 if self._tick_count % 60 == 0:
                     self.ledger.take_snapshot()
@@ -818,11 +816,10 @@ class TradingSystem:
         except Exception as e:
             logger.debug(f"Order summary failed: {e}")
 
-    def _log_status(self):
-        """Log current system status (periodic heartbeat)."""
+    async def _log_status_async(self):
+        """Log current system status with live exchange equity."""
         sm = self.state_machine.snapshot()
-        # Read REAL equity from exchange, not stale ledger value
-        equity = self._get_equity()
+        equity = await self._get_equity_async()
         positions = len(self.ledger.get_all_positions())
         risk = self.risk_guard.get_risk_summary()
 
