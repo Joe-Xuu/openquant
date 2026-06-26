@@ -407,18 +407,17 @@ class TradingSystem:
         # Start order manager
         await self.order_manager.start()
 
-        # ---- CRITICAL: Startup reconciliation ----
-        # First, cancel any stale orders from previous sessions to avoid duplicates
-        # Then sync fills that happened while we were offline
-        logger.info("Running startup cleanup & reconciliation...")
+        # Startup cleanup: cancel stale orders. Do NOT reconcile here —
+        # the background reconciliation loop runs every 5s and will
+        # handle fills AFTER the grid is deployed (grid_active=True).
+        logger.info("Running startup cleanup...")
         for symbol in self.config.get("trading", {}).get("symbols", []):
             try:
                 await self.exchange_client.cancel_all_orders(symbol)
                 logger.info(f"  Cleared old orders for {symbol}")
             except Exception as e:
                 logger.debug(f"  No old orders to clear for {symbol}: {e}")
-        await self.order_manager.reconcile()
-        logger.info("Startup reconciliation complete")
+        logger.info("Startup cleanup complete")
 
         # Start data engine (fetches historical + opens WebSocket)
         self.state_machine.transition(StateTransition.DATA_READY)
