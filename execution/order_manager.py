@@ -632,10 +632,10 @@ class OrderManager:
                     logger.debug(f"  Fill: {symbol} {fill_side} {fill_qty} @ ${fill_price:.2f}")
 
                     # ---- AUTO PLACE TAKE-PROFIT ORDER ----
-                    # Only if grid is actively deployed. During startup
-                    # reconciliation, the grid hasn't deployed yet — let
-                    # the grid distribute existing inventory across sell levels.
-                    if fill_side == "BUY" and fill_qty > 0 and self.grid_active:
+                    # Only if grid is NOT active. When grid is running, it handles
+                    # sell orders via its own levels. TP here is a safety net for
+                    # fills that happen while the grid is paused or not yet deployed.
+                    if fill_side == "BUY" and fill_qty > 0 and not self.grid_active:
                         tp_price = round(fill_price * 1.005, 2)
                         trade_id = str(trade.get("id", ""))
                         tp_tag = f"tp_{trade_id}"
