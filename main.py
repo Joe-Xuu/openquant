@@ -383,23 +383,53 @@ class TradingSystem:
         logger.info("=" * 60)
         self._start_time = time.time()
 
-        # Seed ledger with initial capital from EXCHANGE, not config.
-        current_equity = self.ledger.get_total_equity()
-        if current_equity <= 0:
-            try:
-                live_equity = await self.exchange_client.get_asset_balance("USDT")
-                initial_cap = live_equity.total
-                if initial_cap <= 0:
-                    raise ValueError("zero balance")
-                logger.info(f"Using live USDT balance from exchange: ${initial_cap:.2f}")
-            except Exception:
-                initial_cap = self.config.get("trading", {}).get("initial_capital", 10000.0)
-                logger.warning(f"Could not read exchange balance, using config: ${initial_cap:.2f}")
+        # ---- FULL STARTUP SYNC: exchange balances → ledger ----
+        # Every restart, pull real balances from Binance and seed the ledger.
+        # Eliminates stale position data, wrong equity, and ghost trades.
+        try:
+            balances = await self.exchange_client.get_balances()
+            symbols = self.config["trading"]["symbols"]
+            usdt_bal = sum(b.total for b in balances if b.asset == "USDT")
+            total_equity = usdt_bal
 
-            self.ledger.record_initial_capital(initial_cap)
-            # Update all references so downstream code uses the live balance
-            self.config.setdefault("trading", {})["initial_capital"] = initial_cap
-            self.grid_strategy.total_capital = initial_cap * 0.85
+            for sym in symbols:
+                base = sym.replace("USDT", "")
+                try:
+                    px = await self.exchange_client.get_ticker_price(sym)
+                except Exception:
+                    px = 0.0
+                qty = sum(b.total for b in balances if b.asset == base)
+                total_equity += qty * px
+                logger.info(f"  Exchange: {qty:.4f} {base} @ ${px:.5f} = ${qty*px:.2f}")
+
+            logger.info(f"  Exchange: ${usdt_bal:.2f} USDT")
+            logger.info(f"  Total equity from exchange: ${total_equity:.2f}")
+
+            # Reset ledger to match exchange reality
+            import psycopg2
+            conn = psycopg2.connect(self.ledger._dsn)
+            conn.autocommit = True
+            with conn.cursor() as cur:
+                cur.execute("DELETE FROM orders")
+                cur.execute("DELETE FROM trades")
+                cur.execute("DELETE FROM journal_lines")
+                cur.execute("DELETE FROM journal_entries")
+                cur.execute("DELETE FROM positions")
+            conn.close()
+
+            # Seed correct capital
+            self.ledger.record_initial_capital(total_equity)
+            self.config.setdefault("trading", {})["initial_capital"] = total_equity
+            self.grid_strategy.total_capital = total_equity * 0.85
+            logger.info(f"  Ledger synced to exchange: ${total_equity:.2f}")
+
+        except Exception as e:
+            logger.warning(f"  Could not sync with exchange: {e}. Using ledger as-is.")
+            total_equity = self.ledger.get_total_equity()
+            if total_equity <= 0:
+                total_equity = self.config.get("trading", {}).get("initial_capital", 10000.0)
+                self.ledger.record_initial_capital(total_equity)
+                self.grid_strategy.total_capital = total_equity * 0.85
 
         # Start exchange client
         await self.exchange_client.start()
