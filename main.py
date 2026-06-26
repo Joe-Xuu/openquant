@@ -635,7 +635,6 @@ class TradingSystem:
                     f"@ {ref_price:.5f} sl={current_grid.stop_loss_price:.5f}"
                 )
                 self.state_machine.activate_grid()
-                self.order_manager.grid_active = True  # allow reconciliation TP
 
             elif self.grid_strategy.check_rebalance(indicators.close, current_grid):
                 ref_price = self.grid_strategy.compute_rebalance_price(ohlcv)
@@ -712,6 +711,9 @@ class TradingSystem:
                 f"Dispatched signal {signal.signal_id}: "
                 f"{signal.action.value} {signal.symbol} → {len(tracked_orders)} orders"
             )
+            # Grid is truly active only after successful dispatch (not just signal generation)
+            if signal.action == SignalAction.START_GRID and len(tracked_orders) > 0:
+                self.order_manager.grid_active = True
 
             # Update strategy state based on dispatch result
             if signal.action == SignalAction.START_TREND:
