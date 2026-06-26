@@ -373,16 +373,22 @@ class RiskGuard:
         current_equity = self._equity_provider()
         positions = self._positions_provider()
 
-        # Current exposure: only count positions for the same symbol
+        # Current exposure: use avg entry price (not stale mark price from ledger)
         current_exposure = sum(
-            abs(pos.get("quantity", 0)) * pos.get("current_price", pos.get("avg_entry_price", 0))
+            abs(pos.get("quantity", 0)) * pos.get("avg_entry_price", 0)
             for pos in positions if pos.get("symbol") == signal.symbol
         )
 
         # New exposure from this signal
         metadata = signal.metadata
         if signal.is_grid_signal():
-            new_exposure = metadata.get("total_capital", 0)
+            # Only BUY levels create new exposure (use USDT).
+            # SELL levels use existing inventory, not new capital.
+            levels = metadata.get("levels", [])
+            new_exposure = sum(
+                lvl["price"] * lvl["quantity"]
+                for lvl in levels if lvl.get("side") == "BUY"
+            )
         elif signal.is_trend_signal():
             new_exposure = metadata.get("entry_price", 0) * metadata.get("position_size", 0)
         else:

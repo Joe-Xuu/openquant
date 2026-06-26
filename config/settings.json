@@ -31,7 +31,7 @@
         "max_daily_loss_pct": 5.0,
         "max_position_size_pct": 20.0,
         "max_leverage": 1.0,
-        "max_exposure_pct": 80.0,
+        "max_exposure_pct": 200.0,
         "stop_loss_pct": 2.0,
         "trailing_stop_pct": 1.5,
         "circuit_breaker": {
