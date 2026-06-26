@@ -385,12 +385,23 @@ class TradingSystem:
         logger.info("=" * 60)
         self._start_time = time.time()
 
-        # Seed ledger with initial capital if empty
+        # Seed ledger with initial capital from EXCHANGE, not config.
         current_equity = self.ledger.get_total_equity()
         if current_equity <= 0:
-            initial_cap = self.config.get("trading", {}).get("initial_capital", 10000.0)
+            try:
+                live_equity = await self.exchange_client.get_asset_balance("USDT")
+                initial_cap = live_equity.total
+                if initial_cap <= 0:
+                    raise ValueError("zero balance")
+                logger.info(f"Using live USDT balance from exchange: ${initial_cap:.2f}")
+            except Exception:
+                initial_cap = self.config.get("trading", {}).get("initial_capital", 10000.0)
+                logger.warning(f"Could not read exchange balance, using config: ${initial_cap:.2f}")
+
             self.ledger.record_initial_capital(initial_cap)
-            logger.info(f"Seeded ledger with initial capital: ${initial_cap:,.2f}")
+            # Update all references so downstream code uses the live balance
+            self.config.setdefault("trading", {})["initial_capital"] = initial_cap
+            self.grid_strategy.total_capital = initial_cap * 0.85
 
         # Start exchange client
         await self.exchange_client.start()
