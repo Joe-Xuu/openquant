@@ -821,7 +821,8 @@ class TradingSystem:
     def _log_status(self):
         """Log current system status (periodic heartbeat)."""
         sm = self.state_machine.snapshot()
-        equity = self.ledger.get_total_equity()
+        # Read REAL equity from exchange, not stale ledger value
+        equity = self._get_equity()
         positions = len(self.ledger.get_all_positions())
         risk = self.risk_guard.get_risk_summary()
 
