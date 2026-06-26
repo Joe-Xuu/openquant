@@ -635,6 +635,7 @@ class TradingSystem:
                     f"@ {ref_price:.5f} sl={current_grid.stop_loss_price:.5f}"
                 )
                 self.state_machine.activate_grid()
+                self.order_manager.grid_active = True  # allow reconciliation TP
 
             elif self.grid_strategy.check_rebalance(indicators.close, current_grid):
                 ref_price = self.grid_strategy.compute_rebalance_price(ohlcv)

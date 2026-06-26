@@ -110,6 +110,7 @@ class OrderManager:
         self._ledger_record_trade_close = ledger_record_trade_close or (lambda *a, **kw: (0,0))
         self._ledger_register_grid = ledger_register_grid or (lambda tid, sym: tid)
         self.reconcile_interval = reconcile_interval
+        self.grid_active = False  # Set by main.py when grid deploys
 
         # Tracked orders: internal_order_id → TrackedOrder
         self._orders: Dict[str, TrackedOrder] = {}
@@ -631,7 +632,10 @@ class OrderManager:
                     logger.debug(f"  Fill: {symbol} {fill_side} {fill_qty} @ ${fill_price:.2f}")
 
                     # ---- AUTO PLACE TAKE-PROFIT ORDER ----
-                    if fill_side == "BUY" and fill_qty > 0:
+                    # Only if grid is actively deployed. During startup
+                    # reconciliation, the grid hasn't deployed yet — let
+                    # the grid distribute existing inventory across sell levels.
+                    if fill_side == "BUY" and fill_qty > 0 and self.grid_active:
                         tp_price = round(fill_price * 1.005, 2)
                         trade_id = str(trade.get("id", ""))
                         tp_tag = f"tp_{trade_id}"
