@@ -110,7 +110,8 @@ class OrderManager:
         self._ledger_record_trade_close = ledger_record_trade_close or (lambda *a, **kw: (0,0))
         self._ledger_register_grid = ledger_register_grid or (lambda tid, sym: tid)
         self.reconcile_interval = reconcile_interval
-        self.grid_active = False  # Set by main.py when grid deploys
+        self.grid_active = False
+        self.grid_deployed_at: float = 0.0  # timestamp when grid went live
 
         # Tracked orders: internal_order_id → TrackedOrder
         self._orders: Dict[str, TrackedOrder] = {}
@@ -635,10 +636,13 @@ class OrderManager:
                     logger.debug(f"  Fill: {symbol} {fill_side} {fill_qty} @ ${fill_price:.2f}")
 
                     # ---- AUTO PLACE TAKE-PROFIT ORDER ----
-                    # Only if grid is NOT active. When grid is running, it handles
-                    # sell orders via its own levels. TP here is a safety net for
-                    # fills that happen while the grid is paused or not yet deployed.
-                    if fill_side == "BUY" and fill_qty > 0 and not self.grid_active:
+                    # Place TP for fills that happened AFTER grid deployment.
+                    # Skip fills from before deployment — those are stale history
+                    # that the grid's own sell levels already cover (or will cover).
+                    fill_time_ms = trade.get("time", 0)
+                    fill_time = fill_time_ms / 1000.0 if fill_time_ms else 0
+                    after_grid = self.grid_deployed_at > 0 and fill_time > self.grid_deployed_at
+                    if fill_side == "BUY" and fill_qty > 0 and after_grid:
                         tp_price = round(fill_price * 1.005, 2)
                         trade_id = str(trade.get("id", ""))
                         tp_tag = f"tp_{trade_id}"

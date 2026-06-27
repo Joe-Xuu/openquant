@@ -743,6 +743,7 @@ class TradingSystem:
             # Grid is truly active only after successful dispatch (not just signal generation)
             if signal.action == SignalAction.START_GRID and len(tracked_orders) > 0:
                 self.order_manager.grid_active = True
+                self.order_manager.grid_deployed_at = time.time()
 
             # Update strategy state based on dispatch result
             if signal.action == SignalAction.START_TREND:
