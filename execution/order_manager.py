@@ -696,6 +696,59 @@ class OrderManager:
                         except Exception as e:
                             logger.error(f"  Failed to place TP: {e}")
 
+                    # ---- AUTO REPLENISH BUY (grid level cycling) ----
+                    # When a SELL (TP) fills, place a new BUY at the original
+                    # entry price to revive the grid level. This keeps each
+                    # level cycling independently without waiting for rebalance.
+                    if fill_side == "SELL" and fill_qty > 0 and after_grid:
+                        client_oid = str(trade.get("orderId", ""))
+                        rebuy_tag = f"rebuy_{client_oid}"
+
+                        if not hasattr(self, '_rebuy_attempted'):
+                            self._rebuy_attempted: set = set()
+                        if rebuy_tag in self._rebuy_attempted:
+                            continue
+                        self._rebuy_attempted.add(rebuy_tag)
+                        if len(self._rebuy_attempted) > 1000:
+                            self._rebuy_attempted = set(list(self._rebuy_attempted)[-500:])
+
+                        # Compute entry price from TP price
+                        entry_price = round(fill_price / 1.005, 5)
+                        # Use actual USDT balance to determine buy qty, capped at fill_qty
+                        try:
+                            usdt_bal = await self._client.get_asset_balance("USDT")
+                            info = await self._client.get_exchange_info(symbol)
+                            lot_step = 1.0
+                            for s in info.get("symbols", []):
+                                if s.get("symbol") == symbol.upper():
+                                    for f in s.get("filters", []):
+                                        if f["filterType"] == "LOT_SIZE":
+                                            lot_step = float(f["stepSize"])
+                                            break
+                                    break
+                            max_qty = min(fill_qty, usdt_bal.free / entry_price * 0.98)  # 2% margin
+                            rebuy_qty = (max_qty // lot_step) * lot_step
+                            if rebuy_qty <= 0 or rebuy_qty * entry_price < 1.0:
+                                continue
+                        except Exception:
+                            rebuy_qty = fill_qty
+
+                        try:
+                            rebuy_req = OrderRequest(
+                                symbol=symbol, side="BUY", order_type="LIMIT",
+                                price=entry_price, quantity=rebuy_qty,
+                                time_in_force="GTC", client_order_id=rebuy_tag,
+                            )
+                            rebuy_resp = await self._client.place_order(rebuy_req)
+                            logger.info(f"  ↻ Grid cycle: SELL filled → BUY {rebuy_qty} @ ${entry_price:.5f}")
+                            self._orders[rebuy_tag] = TrackedOrder(
+                                order_id=rebuy_tag, exchange_order_id=rebuy_resp.exchange_order_id,
+                                symbol=symbol, side="BUY", order_type="LIMIT",
+                                price=entry_price, quantity=rebuy_qty, status="OPEN",
+                            )
+                        except Exception as e:
+                            logger.debug(f"  Rebuy skipped: {e}")
+
             except Exception as e:
                 logger.debug(f"Reconciliation skipped for {symbol}: {e}")
 
