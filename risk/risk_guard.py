@@ -436,9 +436,9 @@ class RiskGuard:
             entry_price = metadata.get("entry_price", 0)
             position_size = metadata.get("position_size", 0)
             notional = entry_price * position_size
-            if notional < 10.0:
+            if notional < 1.0:
                 return RiskVerdict.block(
-                    f"DUST_ORDER: notional={notional:.2f} < $10 minimum"
+                    f"DUST_ORDER: notional={notional:.2f} < $1.00 minimum"
                 )
 
         return None

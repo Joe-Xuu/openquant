@@ -689,7 +689,7 @@ class TradingSystem:
                 ema_fast_val=indicators.ema_fast, ema_slow_val=indicators.ema_slow,
                 macd_hist=indicators.macd_hist, atr=indicators.atr,
                 current_state=trend_state,
-                capital=self.ledger.get_total_equity(),
+                capital=await self._get_equity_async(),
             )
             if raw_trend is not None:
                 # Only accept ENTRY when flat, or EXIT when in position.
