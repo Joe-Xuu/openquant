@@ -383,9 +383,11 @@ class TradingSystem:
         logger.info("=" * 60)
         self._start_time = time.time()
 
+        # Start exchange client FIRST (needed for sync)
+        await self.exchange_client.start()
+
         # ---- FULL STARTUP SYNC: exchange balances → ledger ----
         # Every restart, pull real balances from Binance and seed the ledger.
-        # Eliminates stale position data, wrong equity, and ghost trades.
         try:
             balances = await self.exchange_client.get_balances()
             symbols = self.config["trading"]["symbols"]
@@ -430,9 +432,6 @@ class TradingSystem:
                 total_equity = self.config.get("trading", {}).get("initial_capital", 10000.0)
                 self.ledger.record_initial_capital(total_equity)
                 self.grid_strategy.total_capital = total_equity * 0.85
-
-        # Start exchange client
-        await self.exchange_client.start()
 
         # Start order manager
         await self.order_manager.start()
