@@ -417,9 +417,18 @@ class GridStrategy:
             else:
                 if atr_pct_val > 2.0:
                     adaptive_levels = max(2, self.grid_levels - 1)
-            # Cap by capital: each level needs at least ~$1 notional
-            max_by_capital = max(2, int(self.total_capital * 0.45 / 1.5))
-            adaptive_levels = max(2, min(max_by_capital, adaptive_levels))
+            # Compute max levels where the smallest pyramid level still gets ≥$1.
+            # side_capital * decay^(N-1) / sum(decay^i) ≥ 1.0
+            # Solving for N: N ≤ 1 + ln(sum/decay * 1.0 / side_capital) / ln(decay)
+            import math as _math
+            side_cap = self.total_capital * 0.45
+            max_n = 2  # minimum
+            for n in range(2, 21):
+                weights = [self.pyramid_decay ** i for i in range(n)]
+                smallest = side_cap * weights[-1] / sum(weights)
+                if smallest >= 1.0:
+                    max_n = n
+            adaptive_levels = max(2, min(max_n, adaptive_levels))
 
         # --- Dynamic bound adjustment based on volatility ---
         upper_pct = self.upper_bound_pct

@@ -420,19 +420,10 @@ class RiskGuard:
         """
         metadata = signal.metadata
 
-        if signal.is_grid_signal():
-            levels = metadata.get("levels", [])
-            for level_dict in levels:
-                price = level_dict.get("price", 0)
-                qty = level_dict.get("quantity", 0)
-                notional = price * qty
-                if notional < 0.5:  # $0.50 minimum (small account compatible)
-                    return RiskVerdict.block(
-                        f"DUST_ORDER: level price={price}, qty={qty}, "
-                        f"notional={notional:.2f} < \$0.50 minimum"
-                    )
-
-        elif signal.is_trend_signal():
+        # Grid dust filtering is handled per-level by order_manager ($1 minimum).
+        # Blocking the entire grid signal because one level is small prevents
+        # all other valid levels from being placed.
+        if signal.is_trend_signal():
             entry_price = metadata.get("entry_price", 0)
             position_size = metadata.get("position_size", 0)
             notional = entry_price * position_size

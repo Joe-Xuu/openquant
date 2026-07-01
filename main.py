@@ -664,7 +664,11 @@ class TradingSystem:
                 )
                 self.state_machine.activate_grid()
 
-            elif self.grid_strategy.check_rebalance(indicators.close, current_grid):
+            # Force periodic rebalance every 144 ticks (~12h) to prevent grid decay
+            elif (self.grid_strategy.check_rebalance(indicators.close, current_grid)
+                  or self._tick_count % 144 == 0):
+                if self._tick_count % 144 == 0 and self._tick_count > 0:
+                    logger.info(f"  Periodic grid rebuild (tick #{self._tick_count})")
                 ref_price = self.grid_strategy.compute_rebalance_price(ohlcv)
                 new_grid = self.grid_strategy.compute_grid(
                     reference_price=ref_price, symbol=symbol,
