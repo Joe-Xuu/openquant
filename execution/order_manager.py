@@ -657,13 +657,19 @@ class OrderManager:
                                 self._consecutive_buys = 0
 
                     # ---- AUTO PLACE TAKE-PROFIT ORDER ----
-                    # Place TP for fills that happened AFTER grid deployment.
-                    # Skip fills from before deployment — those are stale history
-                    # that the grid's own sell levels already cover (or will cover).
+                    # Only for fills that happened AFTER grid deployment.
+                    # 10s buffer: local clock may differ from exchange clock.
                     fill_time_ms = trade.get("time", 0)
                     fill_time = fill_time_ms / 1000.0 if fill_time_ms else 0
-                    after_grid = self.grid_deployed_at > 0 and fill_time > self.grid_deployed_at
-                    if fill_side == "BUY" and fill_qty > 0 and after_grid:
+                    after_grid = (self.grid_deployed_at > 0
+                                  and fill_time > self.grid_deployed_at - 10.0)
+                    if fill_side == "BUY" and fill_qty > 0:
+                        if not after_grid:
+                            logger.debug(
+                                f"  TP skipped (before grid deploy): "
+                                f"fill_time={fill_time:.0f} < deploy_time={self.grid_deployed_at:.0f}"
+                            )
+                            continue
                         tp_price = round(fill_price * 1.005, 2)
                         trade_id = str(trade.get("id", ""))
                         tp_tag = f"tp_{trade_id}"
