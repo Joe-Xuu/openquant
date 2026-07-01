@@ -433,6 +433,12 @@ class TradingSystem:
                 self.ledger.record_initial_capital(total_equity)
                 self.grid_strategy.total_capital = total_equity * 0.85
 
+        # Remember initial equity for hard stop-loss
+        self._initial_equity = await self._get_equity_async()
+        self._equity_stop_pct = float(os.getenv("MAX_DRAWDOWN_PCT", "15"))
+        logger.info(f"  Equity stop-loss: ${self._initial_equity:.2f} × "
+                     f"(1 - {self._equity_stop_pct}%) = ${self._initial_equity * (1 - self._equity_stop_pct/100):.2f}")
+
         # Start order manager
         await self.order_manager.start()
 
@@ -565,6 +571,28 @@ class TradingSystem:
         """
         Process one tick for one symbol: data → indicators → regime → signal.
         """
+        # ---- HARD EQUITY STOP-LOSS ----
+        # If total equity drops below initial × (1 - stop%), halt everything.
+        if hasattr(self, '_initial_equity') and self._initial_equity > 0:
+            try:
+                live_eq = await self._get_equity_async()
+                stop_line = self._initial_equity * (1 - self._equity_stop_pct / 100)
+                if live_eq > 0 and live_eq <= stop_line:
+                    logger.error(
+                        f"🛑 EQUITY STOP-LOSS TRIGGERED! "
+                        f"${live_eq:.2f} <= ${stop_line:.2f} "
+                        f"(-{(1 - live_eq/self._initial_equity)*100:.1f}%)"
+                    )
+                    # Cancel all orders and stop
+                    try:
+                        await self.exchange_client.cancel_all_orders(symbol)
+                    except Exception:
+                        pass
+                    self.running = False
+                    return
+            except Exception:
+                pass
+
         # 0. Data freshness — warn if WebSocket data is stale, but continue
         data_age = self.data_engine.get_data_age(symbol)
         max_stale = self._get_tick_interval_seconds() * 3
@@ -627,6 +655,16 @@ class TradingSystem:
                 self._grid_configs.pop(symbol, None)
                 self.state_machine.emergency_stop()
 
+        # ---- Consecutive buy circuit breaker ----
+        cb_triggered = self.order_manager._consecutive_buys >= self.order_manager._consecutive_buy_limit
+        if cb_triggered and current_grid is not None:
+            logger.warning(
+                f"🛑 CIRCUIT BREAKER: {self.order_manager._consecutive_buys} consecutive buys. "
+                f"Pausing new grid buys — possible one-sided market."
+            )
+        elif not cb_triggered and self.order_manager._consecutive_buys == 0:
+            pass  # circuit breaker released naturally when a sell occurs
+
         # ---- Trend gate: pause new grid buys in strong trends ----
         # When the market is clearly trending, the grid keeps chasing price
         # downhill, draining USDT into a falling knife. Pause new grid entries
@@ -646,10 +684,10 @@ class TradingSystem:
             current_grid = None  # force fresh deployment
 
         if grid_signal is None:
-            if strong_trend and current_grid is not None:
-                # Grid frozen — don't deploy, don't rebalance. Let existing
-                # positions ride with their TP orders on the exchange.
-                pass
+            # Grid frozen by trend OR circuit breaker
+            grid_frozen = (strong_trend or cb_triggered)
+            if grid_frozen and current_grid is not None:
+                pass  # hold existing positions, don't deploy new buys
             elif current_grid is None:
                 ref_price = self.grid_strategy.compute_rebalance_price(ohlcv)
                 current_grid = self.grid_strategy.compute_grid(

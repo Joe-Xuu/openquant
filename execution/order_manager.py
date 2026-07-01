@@ -112,6 +112,8 @@ class OrderManager:
         self.reconcile_interval = reconcile_interval
         self.grid_active = False
         self.grid_deployed_at: float = 0.0  # timestamp when grid went live
+        self._consecutive_buys: int = 0     # buys without a sell in between
+        self._consecutive_buy_limit: int = 5  # pause grid after this many
 
         # Tracked orders: internal_order_id → TrackedOrder
         self._orders: Dict[str, TrackedOrder] = {}
@@ -634,6 +636,17 @@ class OrderManager:
                             fill_price=fill_price,
                         )
                     logger.debug(f"  Fill: {symbol} {fill_side} {fill_qty} @ ${fill_price:.2f}")
+
+                    # Consecutive buy circuit breaker
+                    if fill_side == "BUY":
+                        self._consecutive_buys += 1
+                        if self._consecutive_buys >= self._consecutive_buy_limit:
+                            logger.warning(
+                                f"⚠ {self._consecutive_buys} consecutive buys — "
+                                f"possible one-sided market. Consider pausing."
+                            )
+                    else:
+                        self._consecutive_buys = 0
 
                     # ---- AUTO PLACE TAKE-PROFIT ORDER ----
                     # Place TP for fills that happened AFTER grid deployment.
