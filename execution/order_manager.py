@@ -114,6 +114,7 @@ class OrderManager:
         self.grid_deployed_at: float = 0.0  # timestamp when grid went live
         self._consecutive_buys: int = 0     # buys without a sell in between
         self._consecutive_buy_limit: int = 5  # pause grid after this many
+        self._counted_fills: set = set()    # trade IDs already counted for circuit breaker
 
         # Tracked orders: internal_order_id → TrackedOrder
         self._orders: Dict[str, TrackedOrder] = {}
@@ -637,16 +638,23 @@ class OrderManager:
                         )
                     logger.debug(f"  Fill: {symbol} {fill_side} {fill_qty} @ ${fill_price:.2f}")
 
-                    # Consecutive buy circuit breaker
-                    if fill_side == "BUY":
-                        self._consecutive_buys += 1
-                        if self._consecutive_buys >= self._consecutive_buy_limit:
-                            logger.warning(
-                                f"⚠ {self._consecutive_buys} consecutive buys — "
-                                f"possible one-sided market. Consider pausing."
-                            )
-                    else:
-                        self._consecutive_buys = 0
+                    # Consecutive buy circuit breaker — only count NEW fills
+                    if after_grid:
+                        trade_id = str(trade.get("id", ""))
+                        if trade_id and trade_id not in self._counted_fills:
+                            self._counted_fills.add(trade_id)
+                            # Cap set size
+                            if len(self._counted_fills) > 500:
+                                self._counted_fills = set(list(self._counted_fills)[-250:])
+                            if fill_side == "BUY":
+                                self._consecutive_buys += 1
+                                if self._consecutive_buys >= self._consecutive_buy_limit:
+                                    logger.warning(
+                                        f"⚠ {self._consecutive_buys} consecutive buys "
+                                        f"since grid deploy — possible one-sided market."
+                                    )
+                            else:
+                                self._consecutive_buys = 0
 
                     # ---- AUTO PLACE TAKE-PROFIT ORDER ----
                     # Place TP for fills that happened AFTER grid deployment.
