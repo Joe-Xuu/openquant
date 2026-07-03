@@ -224,15 +224,20 @@ class TrendStrategy:
         macd_negligible = abs(macd_hist) < atr * 0.01
         is_flat = ema_pct_diff < 0.05 and macd_negligible
 
-        # Strong signals: both indicators agree AND market is not flat
-        strong_bullish = ema_bullish and macd_bullish and not is_flat
-        strong_bearish = (not ema_bullish) and (not macd_bullish) and not is_flat
+        # Entry signals: EMA direction is the primary signal. MACD provides
+        # extra confidence but is NOT required. The regime detector's 5-factor
+        # scoring already filters out false trends (confidence > 0.80 required
+        # in main.py). Requiring both EMA AND MACD made entries too rare.
+        strong_bullish = ema_bullish and not is_flat
+        strong_bearish = (not ema_bullish) and not is_flat
+        # Score: higher when both indicators agree (for signal priority)
+        _entry_score = 0.85 if (ema_bullish == macd_bullish) else 0.70
 
         # --- State-dependent logic ---
         if not current_state.is_active:
             return self._evaluate_entry(
                 symbol, current_price, atr, strong_bullish, strong_bearish,
-                ema_fast_val, ema_slow_val, macd_hist, capital,
+                ema_fast_val, ema_slow_val, macd_hist, capital, _entry_score,
             )
         else:
             return self._evaluate_exit_or_adjust(
@@ -251,6 +256,7 @@ class TrendStrategy:
         ema_slow_val: float,
         macd_hist: float,
         capital: float,
+        entry_score: float = 0.70,
     ) -> Optional[StrategySignal]:
         """
         Check entry conditions when flat (no position).
@@ -281,10 +287,8 @@ class TrendStrategy:
         if position_size <= 0:
             return None
 
-        score = 0.85 if (strong_bullish and macd_hist > 0) or (strong_bearish and macd_hist < 0) else 0.70
-
         return (
-            SignalBuilder(SignalAction.START_TREND, symbol, score)
+            SignalBuilder(SignalAction.START_TREND, symbol, entry_score)
             .with_metadata("direction", direction.value)
             .with_metadata("entry_price", price)
             .with_metadata("position_size", round(position_size, 8))
