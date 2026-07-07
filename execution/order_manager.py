@@ -195,33 +195,35 @@ class OrderManager:
     async def _dispatch_grid(
         self, signal: StrategySignal, metadata: Dict[str, Any]
     ) -> List[TrackedOrder]:
-        """Place all grid limit orders — cancels old ones first (rebalance-safe)."""
+        """
+        Deploy grid BUY orders only. SELL orders are placed reactively by
+        reconciliation when a BUY fills — not at deployment time.
+        """
         levels = metadata.get("levels", [])
         if not levels:
             logger.warning("Grid signal has no levels")
             return []
 
-        # Cancel old GRID orders only — preserve TP orders placed by reconciliation.
-        # TP orders have client_order_id starting with "tp_".
+        # Cancel only system grid orders (co_ and rebuy_ prefixes).
+        # Preserve: tp_* (TP orders), manual user orders (no prefix or other prefix).
         try:
             open_orders = await self._client.get_open_orders(signal.symbol)
-            cancelled = 0
-            preserved = 0
+            cancelled, preserved = 0, 0
             for o in open_orders:
                 cid = o.get("clientOrderId", "")
-                if cid.startswith("tp_"):
+                if cid.startswith("co_") or cid.startswith("rebuy_"):
+                    try:
+                        await self._client.cancel_order(
+                            signal.symbol, order_id=str(o.get("orderId", ""))
+                        )
+                        cancelled += 1
+                    except Exception:
+                        pass
+                else:
                     preserved += 1
-                    continue  # Never cancel take-profit orders
-                try:
-                    await self._client.cancel_order(
-                        signal.symbol, order_id=str(o.get("orderId", ""))
-                    )
-                    cancelled += 1
-                except Exception:
-                    pass
             logger.info(
                 f"  Rebalance: cancelled {cancelled} grid orders, "
-                f"preserved {preserved} TP orders"
+                f"preserved {preserved} (TP + manual)"
             )
         except Exception as e:
             logger.debug(f"  Could not query open orders: {e}")
@@ -230,117 +232,70 @@ class OrderManager:
         trade_id = metadata.get("grid_id", "")
         self._ledger_register_grid(trade_id, signal.symbol)
 
-        # ---- Unidirectional deployment with existing inventory integration ----
-        base_asset = signal.symbol.replace("USDT", "")
-        has_base, has_quote = True, True
-        base_free = 0.0
+        # Check USDT balance — only place BUY orders
+        has_quote = True
         try:
-            base_bal = await self._client.get_asset_balance(base_asset)
             quote_bal = await self._client.get_asset_balance("USDT")
-            base_free = base_bal.free
-            has_base = base_free > 0
             has_quote = quote_bal.free > 0
-            if not has_base:
-                logger.info(f"  No {base_asset} — skipping SELL levels")
             if not has_quote:
-                logger.info(f"  No USDT — skipping BUY levels")
+                logger.warning("  No USDT balance — cannot place any grid orders")
+                return []
         except Exception:
             pass
 
-        # Distribute existing DOGE across sell levels (pyramid weights).
-        # Compute total weight for sell levels to allocate inventory.
-        sell_levels_data = [l for l in levels if l.get("side") == "SELL"]
-        buy_levels_data = [l for l in levels if l.get("side") == "BUY"]
-        sell_total_weight = sum(
-            self._pyramid_weight(i, len(sell_levels_data))
-            for i in range(len(sell_levels_data))
-        ) if sell_levels_data else 1.0
-        buy_total_weight = sum(
-            self._pyramid_weight(i, len(buy_levels_data))
-            for i in range(len(buy_levels_data))
-        ) if buy_levels_data else 1.0
-
-        for idx, level_dict in enumerate(levels):
-            side = level_dict.get("side", "")
-            if side == "SELL" and not has_base:
-                continue
-            if side == "BUY" and not has_quote:
-                continue
-
-            # Allocate existing inventory for sells, capital for buys
-            if side == "SELL" and base_free > 0 and sell_levels_data:
-                sell_idx = sell_levels_data.index(level_dict)
-                weight = self._pyramid_weight(sell_idx, len(sell_levels_data))
-                allocated_qty = base_free * weight / sell_total_weight
-                # Override grid-computed quantity with actual available inventory
-                level_dict = dict(level_dict)
-                level_dict["quantity"] = allocated_qty
-
+        buy_levels = [l for l in levels if l.get("side") == "BUY"]
+        for level_dict in buy_levels:
             try:
-                price, qty = self._round_to_tick(signal.symbol, level_dict["price"], level_dict["quantity"])
+                price, qty = self._round_to_tick(
+                    signal.symbol, level_dict["price"], level_dict["quantity"]
+                )
                 if qty <= 0:
                     continue
 
-                # Skip dust orders below exchange minimum notional ($1 for DOGE)
                 notional = price * qty
                 if notional < 1.0:
                     logger.debug(
-                        f"  Skipping dust level: {side} {qty} @ {price} "
+                        f"  Skipping dust level: qty={qty} @ {price} "
                         f"(notional=${notional:.2f} < $1.00)"
                     )
                     continue
 
                 order_req = OrderRequest(
                     symbol=signal.symbol,
-                    side=level_dict["side"],
+                    side="BUY",
                     order_type="LIMIT",
                     price=price,
                     quantity=qty,
                     time_in_force="GTC",
                 )
 
-                # Record in ledger FIRST (before API call)
                 order_id = self._ledger_record_order(
-                    trade_id=trade_id,
-                    symbol=signal.symbol,
-                    side=level_dict["side"],
-                    order_type="LIMIT",
-                    quantity=level_dict["quantity"],
-                    price=level_dict["price"],
+                    trade_id=trade_id, symbol=signal.symbol,
+                    side="BUY", order_type="LIMIT",
+                    quantity=level_dict["quantity"], price=level_dict["price"],
                 )
 
-                # Place order on exchange
                 response = await self._client.place_order(order_req)
-
-                # Update ledger: order is now OPEN on exchange
                 self._ledger_order_open(order_id, response.exchange_order_id)
 
-                # Track the order
                 tracked = TrackedOrder(
                     order_id=order_id,
                     exchange_order_id=response.exchange_order_id,
                     client_order_id=response.client_order_id,
-                    symbol=signal.symbol,
-                    side=level_dict["side"],
-                    order_type="LIMIT",
-                    price=level_dict["price"],
-                    quantity=level_dict["quantity"],
-                    status=response.status,
-                    trade_id=trade_id,
+                    symbol=signal.symbol, side="BUY", order_type="LIMIT",
+                    price=level_dict["price"], quantity=level_dict["quantity"],
+                    status=response.status, trade_id=trade_id,
                     grid_id=metadata.get("grid_id"),
                 )
-
                 self._orders[order_id] = tracked
                 tracked_orders.append(tracked)
-
                 logger.info(
-                    f"Grid order placed: {signal.symbol} {level_dict['side']} "
-                    f"{level_dict['quantity']} @ {level_dict['price']} "
+                    f"Grid BUY placed: {level_dict['quantity']} @ {level_dict['price']} "
                     f"[{response.exchange_order_id}]"
                 )
 
             except Exception as e:
-                logger.error(f"Failed to place grid order: {e}")
+                logger.error(f"Failed to place grid BUY: {e}")
                 continue
 
         return tracked_orders
@@ -539,11 +494,6 @@ class OrderManager:
     # ------------------------------------------------------------------
 
     @staticmethod
-    def _pyramid_weight(index: int, total_levels: int, decay: float = 0.5) -> float:
-        """Pyramid weight for level index (0 = closest to reference, highest weight)."""
-        return decay ** index
-
-    @staticmethod
     def _round_to_tick(symbol: str, price: float, qty: float) -> tuple:
         """Round price and quantity to exchange-allowed tick sizes."""
         # Binance spot tick sizes
@@ -638,6 +588,12 @@ class OrderManager:
                         )
                     logger.debug(f"  Fill: {symbol} {fill_side} {fill_qty} @ ${fill_price:.2f}")
 
+                    # Compute after_grid ONCE, before all downstream checks
+                    fill_time_ms = trade.get("time", 0)
+                    fill_time = fill_time_ms / 1000.0 if fill_time_ms else 0
+                    after_grid = (self.grid_deployed_at > 0
+                                  and fill_time > self.grid_deployed_at - 10.0)
+
                     # Consecutive buy circuit breaker — only count NEW fills
                     if after_grid:
                         trade_id = str(trade.get("id", ""))
@@ -657,12 +613,7 @@ class OrderManager:
                                 self._consecutive_buys = 0
 
                     # ---- AUTO PLACE TAKE-PROFIT ORDER ----
-                    # Only for fills that happened AFTER grid deployment.
-                    # 10s buffer: local clock may differ from exchange clock.
-                    fill_time_ms = trade.get("time", 0)
-                    fill_time = fill_time_ms / 1000.0 if fill_time_ms else 0
-                    after_grid = (self.grid_deployed_at > 0
-                                  and fill_time > self.grid_deployed_at - 10.0)
+                    # ---- AUTO PLACE TAKE-PROFIT ORDER ----
                     if fill_side == "BUY" and fill_qty > 0:
                         if not after_grid:
                             logger.debug(
