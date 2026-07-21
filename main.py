@@ -164,7 +164,7 @@ class TradingSystem:
 
         # Grid uses 70% of capital so total exposure stays within risk limit (80%)
         max_exposure_pct = config.get("risk", {}).get("max_exposure_pct", 80.0) / 100.0
-        grid_capital = config.get("trading", {}).get("initial_capital", 10000.0) * 0.85  # 85% for small account
+        grid_capital = config.get("trading", {}).get("fallback_equity", 1000.0) * 0.85  # only a placeholder; overwritten at startup with real exchange equity
 
         self.grid_strategy = GridStrategy(
             grid_type=grid_cfg.get("type", "geometric"),
@@ -253,6 +253,16 @@ class TradingSystem:
             ledger_record_trade_open=self._ledger_record_trade_open,
             ledger_record_trade_close=self._ledger_record_trade_close,
             ledger_register_grid=self._ledger_register_grid,
+            grid_profit_pct=grid_cfg.get("profit_per_grid_pct", 0.5),
+            # Grid fill persistence callbacks
+            ledger_grid_buy_fill=self._ledger_grid_buy_fill,
+            ledger_grid_sell_placed=self._ledger_grid_sell_placed,
+            ledger_grid_sell_filled=self._ledger_grid_sell_filled,
+            ledger_grid_reset_sell_placed=self._ledger_grid_reset_sell_placed,
+            ledger_get_pending_tp_fills=self._ledger_get_pending_tp_fills,
+            ledger_get_tp_attempted_tags=self._ledger_get_tp_attempted_tags,
+            ledger_get_grid_fill_by_sell_order=self._ledger_get_grid_fill_by_sell_order,
+            ledger_get_order_id_by_exchange=self._ledger_get_order_id_by_exchange,
         )
 
         # --- Per-Symbol State ---
@@ -351,6 +361,44 @@ class TradingSystem:
         """Register a grid as a trade container (no journal entries)."""
         return self.ledger.register_grid_trade(trade_id, symbol)
 
+    # ----- Grid fill persistence callbacks (DB-backed, survive restarts) -----
+
+    def _ledger_grid_buy_fill(self, trade_id, symbol, exchange_order_id, buy_price, buy_qty, buy_time, profit_pct):
+        """Persist a BUY fill to the grid_fills table."""
+        return self.ledger.record_grid_fill(
+            trade_id=trade_id, symbol=symbol, exchange_order_id=exchange_order_id,
+            buy_price=buy_price, buy_qty=buy_qty, buy_time=buy_time,
+            profit_pct=profit_pct,
+        )
+
+    def _ledger_grid_sell_placed(self, trade_id, sell_order_id, sell_client_order_id):
+        """Mark sell (TP) as placed in grid_fills."""
+        self.ledger.grid_fill_set_sell_placed(trade_id, sell_order_id, sell_client_order_id)
+
+    def _ledger_grid_sell_filled(self, trade_id, sell_fill_price, sell_fill_time):
+        """Mark sell (TP) as filled in grid_fills."""
+        self.ledger.grid_fill_set_sell_filled(trade_id, sell_fill_price, sell_fill_time)
+
+    def _ledger_grid_reset_sell_placed(self, trade_id):
+        """Reset sell_placed to FALSE (TP order gone from exchange)."""
+        self.ledger.grid_fill_reset_sell_placed(trade_id)
+
+    def _ledger_get_pending_tp_fills(self, symbol=None):
+        """Query fills where sell_placed=FALSE."""
+        return self.ledger.get_pending_tp_fills(symbol)
+
+    def _ledger_get_tp_attempted_tags(self, symbol=None):
+        """Get all TP tags for seeding cache."""
+        return self.ledger.get_tp_attempted_tags(symbol)
+
+    def _ledger_get_grid_fill_by_sell_order(self, sell_order_id):
+        """Find a grid fill record by its sell order ID."""
+        return self.ledger.get_grid_fill_by_sell_order(sell_order_id)
+
+    def _ledger_get_order_id_by_exchange(self, exchange_order_id):
+        """Look up order_id by exchange_order_id (replaces SQLite hack)."""
+        return self.ledger.get_order_id_by_exchange_id(exchange_order_id)
+
     def _ledger_record_trade_open(self, trade_id, symbol, side, quantity, price, fee=0.0, slippage=0.0):
         """Record trade open in the ledger."""
         self.ledger.record_trade_open(
@@ -407,7 +455,9 @@ class TradingSystem:
             logger.info(f"  Exchange: ${usdt_bal:.2f} USDT")
             logger.info(f"  Total equity from exchange: ${total_equity:.2f}")
 
-            # Reset ledger to match exchange reality
+            # Reset ledger to match exchange reality.
+            # NOTE: grid_fills table is INTENTIONALLY NOT DELETED —
+            # it persists across restarts for TP recovery and audit trail.
             import psycopg2
             conn = psycopg2.connect(self.ledger._dsn)
             conn.autocommit = True
@@ -421,7 +471,7 @@ class TradingSystem:
 
             # Seed correct capital
             self.ledger.record_initial_capital(total_equity)
-            self.config.setdefault("trading", {})["initial_capital"] = total_equity
+            self.config.setdefault("trading", {})["fallback_equity"] = total_equity  # update in-memory config with real balance
             self.grid_strategy.total_capital = total_equity * 0.85
             logger.info(f"  Ledger synced to exchange: ${total_equity:.2f}")
 
@@ -429,7 +479,7 @@ class TradingSystem:
             logger.warning(f"  Could not sync with exchange: {e}. Using ledger as-is.")
             total_equity = self.ledger.get_total_equity()
             if total_equity <= 0:
-                total_equity = self.config.get("trading", {}).get("initial_capital", 10000.0)
+                total_equity = self.config.get("trading", {}).get("fallback_equity", 1000.0)
                 self.ledger.record_initial_capital(total_equity)
                 self.grid_strategy.total_capital = total_equity * 0.85
 
@@ -442,17 +492,53 @@ class TradingSystem:
         # Start order manager
         await self.order_manager.start()
 
-        # Startup cleanup: cancel stale orders. Do NOT reconcile here —
-        # the background reconciliation loop runs every 5s and will
-        # handle fills AFTER the grid is deployed (grid_active=True).
+        # Startup cleanup: only cancel old GRID orders (co_/rebuy_ prefix).
+        # Preserve tp_* stop-loss orders and any manual orders you placed.
         logger.info("Running startup cleanup...")
         for symbol in self.config.get("trading", {}).get("symbols", []):
             try:
-                await self.exchange_client.cancel_all_orders(symbol)
-                logger.info(f"  Cleared old orders for {symbol}")
+                open_orders = await self.exchange_client.get_open_orders(symbol)
+                cancelled, preserved = 0, 0
+                for o in open_orders:
+                    cid = o.get("clientOrderId", "")
+                    if cid.startswith("co_") or cid.startswith("rebuy_"):
+                        try:
+                            await self.exchange_client.cancel_order(
+                                symbol, order_id=str(o.get("orderId", ""))
+                            )
+                            cancelled += 1
+                        except Exception:
+                            pass
+                    else:
+                        preserved += 1
+                logger.info(
+                    f"  Cleaned {symbol}: cancelled {cancelled} grid orders, "
+                    f"preserved {preserved} (TP + manual)"
+                )
             except Exception as e:
                 logger.debug(f"  No old orders to clear for {symbol}: {e}")
         logger.info("Startup cleanup complete")
+
+        # ---- SYNC + RECOVER TP ORDERS ----
+        # First: verify all "placed" TP orders still exist on exchange.
+        # Some may have filled while reconcile was broken, or been cancelled.
+        # Reset stale flags so recovery can re-place them.
+        logger.info("Syncing TP order status with exchange...")
+        try:
+            corrected = await self.order_manager.sync_tp_orders()
+            if corrected:
+                logger.info(f"  Corrected {corrected} stale TP flags")
+        except Exception as e:
+            logger.error(f"TP sync failed: {e}")
+
+        # Second: place TP orders for any fills that need them (sell_placed=FALSE).
+        logger.info("Recovering pending TP fills...")
+        try:
+            recovered = await self.order_manager.recover_pending_tp_fills()
+            if recovered:
+                logger.info(f"  Recovered {recovered} TP orders from previous session")
+        except Exception as e:
+            logger.error(f"TP recovery failed: {e}")
 
         # Start data engine (fetches historical + opens WebSocket)
         self.state_machine.transition(StateTransition.DATA_READY)
@@ -866,8 +952,11 @@ class TradingSystem:
                 qty = sum(b.total for b in balances if b.asset == base)
                 equity += qty * px
 
-            pnl = equity - float(self.config["trading"].get("initial_capital", 12))
-            pnl_pct = pnl / float(self.config["trading"].get("initial_capital", 12)) * 100
+            initial = getattr(self, '_initial_equity', 0.0)
+            if initial <= 0:
+                initial = float(self.config["trading"].get("fallback_equity", 12))
+            pnl = equity - initial
+            pnl_pct = pnl / initial * 100 if initial > 0 else 0.0
 
             # Build table
             lines = []

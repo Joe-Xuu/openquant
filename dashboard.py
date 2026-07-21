@@ -76,6 +76,8 @@ h1{color:#58a6ff;font-size:20px;margin-bottom:4px}
     <div id="fills"></div>
     <div class="section-title">📜 成交历史</div>
     <div id="trades"></div>
+    <div class="section-title">🔧 网格管理 <span style="font-weight:400;font-size:11px;color:#666">(Skip=停止自动挂卖单)</span></div>
+    <div id="gridfills"></div>
     <div class="err" id="err"></div>
   </div>
 </div>
@@ -227,8 +229,45 @@ function renderChart(d){
   }
 }
 
-fetchData();
+function fetchGridFills(){
+  var xhr=new XMLHttpRequest();
+  xhr.open('GET','/api/grid_fills?symbol=DOGEUSDT',true);
+  xhr.onload=function(){
+    if(xhr.status===200){
+      try{
+        var fills=JSON.parse(xhr.responseText);
+        renderGridFills(fills);
+      }catch(e){}
+    }
+  };
+  xhr.send();
+}
+function renderGridFills(fills){
+  var h='<div class=card><table class=tbl><tr><th>时间</th><th>买入价</th><th>量</th><th>卖价</th><th>挂单</th><th>成交</th><th>操作</th></tr>';
+  if(!fills.length){h+='<tr><td colspan=7 style=color:#555>无数据</td></tr>';}
+  fills.forEach(function(f){
+    var bt=f.buy_time?f.buy_time.replace('T',' ').substring(0,19):'';
+    var placed=f.sell_placed?'<span class=buy>已挂</span>':'<span style=color:#888>未挂</span>';
+    var filled=f.sell_filled?'<span class=buy>已成交</span>':(f.sell_placed?'<span class=y>等待</span>':'<span style=color:#888>-</span>');
+    var btn=f.skip?'<button onclick=toggleSkip(\"'+f.trade_id+'\",false) style="background:#3fb950;color:#000;border:none;border-radius:4px;cursor:pointer;padding:2px 8px;font-size:11px">已跳过 ✓</button>':
+                    '<button onclick=toggleSkip(\"'+f.trade_id+'\",true) style="background:#f85149;color:#fff;border:none;border-radius:4px;cursor:pointer;padding:2px 8px;font-size:11px">Skip</button>';
+    if(f.sell_filled){btn='<span style=color:#555>完成</span>';}
+    var rowStyle=f.skip?'style=opacity:0.4;text-decoration:line-through':'';
+    h+='<tr '+rowStyle+'><td style=font-size:10px;color:#888>'+bt+'</td><td>$'+f.buy_price.toFixed(5)+'</td><td>'+f.buy_qty.toFixed(0)+'</td><td>$'+f.sell_price.toFixed(5)+'</td><td>'+placed+'</td><td>'+filled+'</td><td>'+btn+'</td></tr>';
+  });
+  document.getElementById('gridfills').innerHTML=h+'</table></div>';
+}
+function toggleSkip(tradeId,skip){
+  var xhr=new XMLHttpRequest();
+  xhr.open('POST','/api/grid_fills/toggle',true);
+  xhr.setRequestHeader('Content-Type','application/json');
+  xhr.onload=function(){if(xhr.status===200){fetchGridFills();}};
+  xhr.send(JSON.stringify({trade_id:tradeId,skip:skip}));
+}
+
+fetchData(); fetchGridFills();
 setInterval(fetchData,5000);
+setInterval(fetchGridFills,15000);
 </script></body></html>"""
 
 
@@ -390,6 +429,33 @@ def build_api(symbol):
     return _to_float(data)
 
 
+def build_grid_fills_api(symbol):
+    """API: return grid_fills table for the dashboard management panel."""
+    ledger = get_ledger(LEDGER_DSN)
+    rows = ledger.get_all_grid_fills(symbol=symbol, limit=200)
+    result = []
+    for r in rows:
+        result.append({
+            "trade_id": r["trade_id"],
+            "buy_time": str(r["buy_time"]),
+            "buy_price": float(r["buy_price"]),
+            "buy_qty": float(r["buy_qty"]),
+            "sell_price": float(r["sell_price"]),
+            "sell_placed": r["sell_placed"],
+            "sell_filled": r["sell_filled"],
+            "skip": r.get("skip", False),
+        })
+    return result
+
+
+def toggle_grid_fill_skip(trade_id, skip):
+    """Toggle the skip flag for a grid fill."""
+    ledger = get_ledger(LEDGER_DSN)
+    ledger.grid_fill_set_skip(trade_id, skip)
+    ledger.close()
+    return {"ok": True, "trade_id": trade_id, "skip": skip}
+
+
 class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         path = urlparse(self.path).path
@@ -398,11 +464,33 @@ class Handler(BaseHTTPRequestHandler):
                 params = parse_qs(urlparse(self.path).query)
                 symbol = params.get("symbol", ["BTCUSDT"])[0]
                 self._json(build_api(symbol))
+            elif path == "/api/grid_fills":
+                params = parse_qs(urlparse(self.path).query)
+                symbol = params.get("symbol", ["DOGEUSDT"])[0]
+                self._json(build_grid_fills_api(symbol))
             else:
                 self.send_response(200)
                 self.send_header("Content-Type", "text/html; charset=utf-8")
                 self.end_headers()
                 self.wfile.write(HTML.encode())
+        except Exception as e:
+            self.send_response(500)
+            self.end_headers()
+            self.wfile.write(str(e).encode())
+
+    def do_POST(self):
+        path = urlparse(self.path).path
+        try:
+            if path == "/api/grid_fills/toggle":
+                length = int(self.headers.get("Content-Length", 0))
+                body = json.loads(self.rfile.read(length)) if length > 0 else {}
+                trade_id = body.get("trade_id", "")
+                skip = body.get("skip", True)
+                result = toggle_grid_fill_skip(trade_id, skip)
+                self._json(result)
+            else:
+                self.send_response(404)
+                self.end_headers()
         except Exception as e:
             self.send_response(500)
             self.end_headers()

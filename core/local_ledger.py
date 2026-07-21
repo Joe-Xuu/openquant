@@ -186,6 +186,37 @@ CREATE TABLE IF NOT EXISTS balance_snapshots (
 CREATE INDEX IF NOT EXISTS idx_bs_ts ON balance_snapshots(timestamp);
 CREATE INDEX IF NOT EXISTS idx_bs_account ON balance_snapshots(account_code);
 
+CREATE TABLE IF NOT EXISTS grid_fills (
+    fill_id BIGSERIAL PRIMARY KEY,
+    trade_id VARCHAR(64) NOT NULL,
+    symbol VARCHAR(16) NOT NULL,
+    exchange_order_id VARCHAR(64) NOT NULL DEFAULT '',
+    -- BUY side (recorded when fill is detected)
+    buy_time TIMESTAMPTZ NOT NULL,
+    buy_price NUMERIC(20,8) NOT NULL,
+    buy_qty NUMERIC(20,8) NOT NULL,
+    -- SELL (TP) side
+    sell_price NUMERIC(20,8) NOT NULL,         -- pre-computed TP price
+    sell_placed BOOLEAN NOT NULL DEFAULT FALSE, -- 卖是否已挂单
+    sell_filled BOOLEAN NOT NULL DEFAULT FALSE, -- 卖是否已成交
+    sell_order_id VARCHAR(64),                  -- exchange order ID of the TP sell
+    sell_client_order_id VARCHAR(64),           -- "tp_{trade_id}"
+    sell_fill_price NUMERIC(20,8),
+    sell_fill_time TIMESTAMPTZ,
+    -- Metadata
+    profit_pct NUMERIC(8,4) NOT NULL,
+    skip BOOLEAN NOT NULL DEFAULT FALSE,     -- manual override: skip this fill
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_gf_trade_id_unique ON grid_fills(trade_id);
+CREATE INDEX IF NOT EXISTS idx_gf_sell_placed ON grid_fills(sell_placed);
+CREATE INDEX IF NOT EXISTS idx_gf_sell_filled ON grid_fills(sell_filled);
+-- Partial index for recovery: fills needing TP (not placed yet)
+CREATE INDEX IF NOT EXISTS idx_gf_recovery ON grid_fills(symbol)
+    WHERE sell_placed = FALSE;
+CREATE INDEX IF NOT EXISTS idx_gf_sell_order ON grid_fills(sell_order_id) WHERE sell_order_id IS NOT NULL;
+
 CREATE TABLE IF NOT EXISTS ledger_metadata (
     key VARCHAR(128) PRIMARY KEY,
     value TEXT NOT NULL,
@@ -216,6 +247,28 @@ class PositionRecord:
     symbol: str; base_asset: str; quote_asset: str; quantity: float
     avg_entry_price: float; current_mark_price: Optional[float]
     unrealized_pnl: Optional[float]; cost_basis: float
+
+
+@dataclass
+class GridFillRecord:
+    """One grid cycle: BUY fill → TP sell (placed → filled)."""
+    fill_id: int
+    trade_id: str
+    symbol: str
+    exchange_order_id: str
+    buy_time: str
+    buy_price: float
+    buy_qty: float
+    sell_price: float
+    sell_placed: bool
+    sell_filled: bool
+    sell_order_id: Optional[str]
+    sell_client_order_id: Optional[str]
+    sell_fill_price: Optional[float]
+    sell_fill_time: Optional[str]
+    profit_pct: float
+    created_at: str
+    updated_at: str
 
 
 # ---------------------------------------------------------------------------
@@ -535,10 +588,16 @@ class LedgerEngine:
                        response_payload=%s, updated_at=NOW() WHERE order_id=%s""",
                     (exchange_order_id, filled_quantity, _json.dumps(response_payload) if response_payload else None, order_id),
                 )
+                # Update the parent trade's quantity_filled aggregate
                 cur.execute(
-                    """UPDATE trades SET quantity_filled=(SELECT COALESCE(SUM(quantity_filled),0) FROM orders WHERE trade_id=%s AND status='FILLED'),
-                       updated_at=NOW() WHERE trade_id=(SELECT trade_id FROM orders WHERE order_id=%s)""",
-                    (trade_id, order_id),
+                    """UPDATE trades t SET
+                       quantity_filled = COALESCE((
+                           SELECT SUM(o.quantity_filled) FROM orders o
+                           WHERE o.trade_id = t.trade_id AND o.status = 'FILLED'
+                       ), 0),
+                       updated_at = NOW()
+                       WHERE t.trade_id = (SELECT o2.trade_id FROM orders o2 WHERE o2.order_id = %s)""",
+                    (order_id,),
                 )
 
     def record_initial_capital(self, amount: float, currency: str = "USDT") -> str:
@@ -619,6 +678,159 @@ class LedgerEngine:
             except Exception:
                 conn.rollback()
                 raise
+
+    # ------------------------------------------------------------------
+    # Grid Fill Tracking (persistent BUY -> TP -> rebuy cycle)
+    # ------------------------------------------------------------------
+
+    def record_grid_fill(
+        self,
+        trade_id: str,
+        symbol: str,
+        exchange_order_id: str,
+        buy_price: float,
+        buy_qty: float,
+        buy_time: str,
+        profit_pct: float,
+    ) -> bool:
+        """Record a new grid BUY fill. Returns True if inserted (not duplicate)."""
+        sell_price = buy_price * (1.0 + profit_pct / 100.0)
+        with self._write_transaction("grid_fill_insert") as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """INSERT INTO grid_fills
+                       (trade_id, symbol, exchange_order_id,
+                        buy_price, buy_qty, buy_time, sell_price, profit_pct)
+                       VALUES (%s,%s,%s,%s,%s,%s,%s,%s)
+                       ON CONFLICT (trade_id) DO NOTHING""",
+                    (trade_id, symbol, exchange_order_id,
+                     buy_price, buy_qty, buy_time, sell_price, profit_pct),
+                )
+                return cur.rowcount > 0
+
+    def grid_fill_set_sell_placed(self, trade_id: str, sell_order_id: str, sell_client_order_id: str) -> None:
+        """Mark sell (TP) order as placed on exchange."""
+        with self._write_transaction("grid_fill_sell_placed") as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """UPDATE grid_fills SET
+                       sell_order_id=%s, sell_client_order_id=%s,
+                       sell_placed=TRUE, updated_at=NOW()
+                       WHERE trade_id=%s AND sell_placed=FALSE""",
+                    (sell_order_id, sell_client_order_id, trade_id),
+                )
+
+    def grid_fill_set_sell_filled(self, trade_id: str, sell_fill_price: float, sell_fill_time: str) -> None:
+        """Mark sell (TP) order as filled."""
+        with self._write_transaction("grid_fill_sell_filled") as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """UPDATE grid_fills SET
+                       sell_filled=TRUE, sell_fill_price=%s, sell_fill_time=%s,
+                       updated_at=NOW()
+                       WHERE trade_id=%s AND sell_filled=FALSE""",
+                    (sell_fill_price, sell_fill_time, trade_id),
+                )
+
+    def grid_fill_reset_sell_placed(self, trade_id: str) -> None:
+        """Reset sell_placed to FALSE (TP order no longer exists on exchange)."""
+        with self._write_transaction("grid_fill_reset_sell") as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """UPDATE grid_fills SET
+                       sell_placed=FALSE, sell_order_id=NULL, sell_client_order_id=NULL,
+                       updated_at=NOW()
+                       WHERE trade_id=%s""",
+                    (trade_id,),
+                )
+
+    def grid_fill_mark_completed(self, trade_id: str) -> None:
+        """Mark both sell_placed and sell_filled as TRUE (for historical imports)."""
+        with self._write_transaction("grid_fill_completed") as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """UPDATE grid_fills SET
+                       sell_placed=TRUE, sell_filled=TRUE, updated_at=NOW()
+                       WHERE trade_id=%s""",
+                    (trade_id,),
+                )
+
+    def get_pending_tp_fills(self, symbol: str = None) -> List[Dict[str, Any]]:
+        """Get fills where sell (TP) cycle is not yet complete (respects skip flag)."""
+        sql = "SELECT * FROM grid_fills WHERE sell_filled = FALSE AND skip = FALSE"
+        params = []
+        if symbol:
+            sql += " AND symbol=%s"
+            params.append(symbol)
+        sql += " ORDER BY buy_time ASC"
+        return self._query(sql, params)
+
+    def grid_fill_set_skip(self, trade_id: str, skip: bool = True) -> None:
+        """Toggle the skip flag for a grid fill."""
+        with self._write_transaction("grid_fill_skip") as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE grid_fills SET skip=%s, updated_at=NOW() WHERE trade_id=%s",
+                    (skip, trade_id),
+                )
+
+    def get_all_grid_fills(self, symbol: str = None, limit: int = 100) -> List[Dict[str, Any]]:
+        """Get all grid_fills for the dashboard (including skipped)."""
+        sql = "SELECT * FROM grid_fills"
+        params = []
+        if symbol:
+            sql += " WHERE symbol=%s"
+            params.append(symbol)
+        sql += " ORDER BY buy_time DESC LIMIT %s"
+        params.append(limit)
+        return self._query(sql, params)
+
+    def get_tp_attempted_tags(self, symbol: str = None) -> List[str]:
+        """Return ['tp_{trade_id}', ...] for fills where sell was already placed (respects skip)."""
+        sql = "SELECT trade_id FROM grid_fills WHERE sell_placed = TRUE AND skip = FALSE"
+        params = []
+        if symbol:
+            sql += " AND symbol=%s"
+            params.append(symbol)
+        rows = self._query(sql, params)
+        return [f"tp_{r['trade_id']}" for r in rows]
+
+    def get_grid_fill_by_sell_order(self, sell_order_id: str) -> Optional[Dict[str, Any]]:
+        """Find a grid fill by its sell (TP) order's exchange order ID."""
+        rows = self._query(
+            "SELECT * FROM grid_fills WHERE sell_order_id=%s AND sell_placed=TRUE",
+            (sell_order_id,),
+        )
+        return rows[0] if rows else None
+
+    def get_order_id_by_exchange_id(self, exchange_order_id: str) -> Optional[str]:
+        """Look up our internal order_id by exchange_order_id."""
+        row = self._query_one(
+            "SELECT order_id FROM orders WHERE exchange_order_id=%s",
+            (exchange_order_id,),
+        )
+        return row["order_id"] if row else None
+
+    def import_grid_fill_bulk(self, rows: List[Dict[str, Any]]) -> int:
+        """Bulk-import grid fills (for CSV migration). Returns count inserted."""
+        count = 0
+        with self._write_transaction("grid_fill_import") as conn:
+            with conn.cursor() as cur:
+                for r in rows:
+                    cur.execute(
+                        """INSERT INTO grid_fills
+                           (trade_id, symbol, exchange_order_id,
+                            buy_price, buy_qty, buy_time, sell_price, profit_pct,
+                            sell_placed, sell_filled)
+                           VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                           ON CONFLICT (trade_id) DO NOTHING""",
+                        (r["trade_id"], r["symbol"], r.get("exchange_order_id", ""),
+                         r["buy_price"], r["buy_qty"], r["buy_time"], r["sell_price"],
+                         r.get("profit_pct", 0.6),
+                         r.get("sell_placed", False), r.get("sell_filled", False)),
+                    )
+                    count += cur.rowcount
+        return count
 
     # ------------------------------------------------------------------
     # Metadata

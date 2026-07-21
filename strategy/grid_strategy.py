@@ -363,11 +363,14 @@ class GridStrategy:
         self.strategy_id = strategy_id
         self.min_profit_after_fees_pct = min_profit_after_fees_pct
         self.estimated_fee_pct = estimated_fee_pct
-        # Reverse pyramid: farther levels get MORE capital (decay=2.0).
-        # In ranging markets, buying more at lower prices → higher profit on bounce.
-        self.pyramid_decay: float = 2.0
+        # Equal allocation per level (decay=1.0) — industry standard.
+        # Each grid level has the same profit potential. In ranging markets,
+        # all levels oscillate equally; biasing capital toward distant levels
+        # (decay > 1.0) starves near levels and leaves the grid hanging far
+        # from current price, waiting for moves that rarely come.
+        self.pyramid_decay: float = 1.0
         # Grid stop-loss: emergency-close if price drops this far below lower_bound
-        self.grid_stop_loss_pct: float = 3.0
+        self.grid_stop_loss_pct: float = 5.0
 
     # ------------------------------------------------------------------
     # Grid Computation

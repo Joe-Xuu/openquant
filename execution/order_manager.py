@@ -88,6 +88,16 @@ class OrderManager:
         ledger_record_trade_close: Callable = None,
         ledger_register_grid: Callable = None,
         reconcile_interval: float = 5.0,
+        grid_profit_pct: float = 0.5,
+        # Grid fill persistence callbacks (boolean sell_placed/sell_filled)
+        ledger_grid_buy_fill: Callable = None,
+        ledger_grid_sell_placed: Callable = None,
+        ledger_grid_sell_filled: Callable = None,
+        ledger_grid_reset_sell_placed: Callable = None,
+        ledger_get_pending_tp_fills: Callable = None,
+        ledger_get_tp_attempted_tags: Callable = None,
+        ledger_get_grid_fill_by_sell_order: Callable = None,
+        ledger_get_order_id_by_exchange: Callable = None,
     ):
         """
         Initialize the order manager.
@@ -101,6 +111,17 @@ class OrderManager:
             ledger_record_trade_close: Callback to record trade close.
             ledger_register_grid: Callback to register a grid trade container.
             reconcile_interval: Seconds between order reconciliation cycles.
+            grid_profit_pct: Grid profit per round-trip as percentage (e.g. 0.6 = 0.6%).
+                            Must match grid_strategy.profit_per_grid_pct.
+            ledger_grid_buy_fill: Callback to persist a BUY fill to grid_fills table.
+            ledger_grid_tp_placed: Callback to mark TP as placed.
+            ledger_grid_tp_filled: Callback to mark TP as filled.
+            ledger_grid_tp_failed: Callback to mark TP as failed.
+            ledger_grid_rebuy_placed: Callback to record rebuy.
+            ledger_get_pending_tp_fills: Callback to query fills needing TP.
+            ledger_get_tp_attempted_tags: Callback to get attempted TP tags.
+            ledger_get_rebuy_attempted_tags: Callback to get attempted rebuy tags.
+            ledger_get_order_id_by_exchange: Callback to look up order by exchange ID.
         """
         self._client = exchange_client
         self._ledger_record_order = ledger_record_order
@@ -112,9 +133,25 @@ class OrderManager:
         self.reconcile_interval = reconcile_interval
         self.grid_active = False
         self.grid_deployed_at: float = 0.0  # timestamp when grid went live
+        self.grid_profit_pct = grid_profit_pct
+        self._grid_profit_mult = 1.0 + grid_profit_pct / 100.0  # e.g. 1.006 for 0.6%
         self._consecutive_buys: int = 0     # buys without a sell in between
         self._consecutive_buy_limit: int = 5  # pause grid after this many
         self._counted_fills: set = set()    # trade IDs already counted for circuit breaker
+
+        # Grid fill persistence callbacks (DB-backed, survive restarts)
+        self._ledger_grid_buy_fill = ledger_grid_buy_fill or (lambda *a, **kw: False)
+        self._ledger_grid_sell_placed = ledger_grid_sell_placed or (lambda *a, **kw: None)
+        self._ledger_grid_sell_filled = ledger_grid_sell_filled or (lambda *a, **kw: None)
+        self._ledger_grid_reset_sell_placed = ledger_grid_reset_sell_placed or (lambda *a, **kw: None)
+        self._ledger_get_pending_tp_fills = ledger_get_pending_tp_fills or (lambda *a, **kw: [])
+        self._ledger_get_tp_attempted_tags = ledger_get_tp_attempted_tags or (lambda *a, **kw: [])
+        self._ledger_get_grid_fill_by_sell_order = ledger_get_grid_fill_by_sell_order or (lambda *a, **kw: None)
+        self._ledger_get_order_id_by_exchange = ledger_get_order_id_by_exchange or (lambda *a, **kw: None)
+
+        # In-memory dedup caches (seeded from DB on startup)
+        self._tp_attempted: set = set()
+        self._rebuy_attempted: set = set()
 
         # Tracked orders: internal_order_id → TrackedOrder
         self._orders: Dict[str, TrackedOrder] = {}
@@ -131,8 +168,18 @@ class OrderManager:
     async def start(self) -> None:
         """Start the order manager and reconciliation loop."""
         self._running = True
+        await self._seed_tp_cache()
         self._reconcile_task = asyncio.create_task(self._reconciliation_loop())
         logger.info("OrderManager started")
+
+    async def _seed_tp_cache(self) -> None:
+        """Load persistent TP state into in-memory dedup cache."""
+        try:
+            self._tp_attempted = set(self._ledger_get_tp_attempted_tags())
+            if self._tp_attempted:
+                logger.info(f"TP cache seeded: {len(self._tp_attempted)} tags from DB")
+        except Exception as e:
+            logger.warning(f"Could not seed TP cache from DB: {e}")
 
     async def stop(self) -> None:
         """Stop the order manager."""
@@ -144,6 +191,201 @@ class OrderManager:
             except asyncio.CancelledError:
                 pass
         logger.info("OrderManager stopped")
+
+    # ------------------------------------------------------------------
+    # Startup TP Recovery
+    # ------------------------------------------------------------------
+
+    async def sync_tp_orders(self) -> int:
+        """
+        Verify all TP orders marked as 'placed' actually exist on the exchange.
+
+        For each grid_fills row with sell_placed=TRUE, sell_filled=FALSE:
+          - If TP order is FILLED on exchange → mark sell_filled=TRUE
+          - If TP order is GONE (cancelled/expired) → reset sell_placed=FALSE
+          - If TP order is still OPEN → leave as-is
+
+        Returns count of flags corrected.
+        """
+        # Query all "placed but not known filled" fills that have an exchange order ID
+        rows = self._ledger_get_pending_tp_fills()
+        # Filter to only those with sell_placed=TRUE (they have a TP order to check)
+        to_check = [r for r in rows if r.get("sell_placed") and r.get("sell_order_id")]
+        if not to_check:
+            return 0
+
+        corrected = 0
+        for fill in to_check:
+            trade_id = fill["trade_id"]
+            symbol = fill["symbol"]
+            sell_oid = fill["sell_order_id"]
+            try:
+                order = await self._client.get_order_status(symbol, order_id=sell_oid)
+                status = order.get("status", "")
+                if status == "FILLED":
+                    # TP filled but reconcile never detected it
+                    fill_price = float(order.get("price", 0))
+                    fill_time = datetime.fromtimestamp(
+                        order.get("updateTime", 0) / 1000.0, tz=timezone.utc
+                    ).isoformat()
+                    self._ledger_grid_sell_filled(trade_id, fill_price, fill_time)
+                    logger.info(
+                        f"  TP sync: {symbol} sell {sell_oid} was FILLED @ {fill_price:.5f} "
+                        f"(reconcile missed it)"
+                    )
+                    corrected += 1
+                elif status in ("CANCELED", "EXPIRED", "REJECTED"):
+                    # TP order is gone — reset flag so recovery re-places it
+                    self._ledger_grid_reset_sell_placed(trade_id)
+                    logger.warning(
+                        f"  TP sync: {symbol} sell {sell_oid} is {status} — "
+                        f"resetting sell_placed, will re-place TP"
+                    )
+                    corrected += 1
+                # else: NEW, PARTIALLY_FILLED → still open, leave as-is
+            except Exception as e:
+                # Order not found or API error — the order is gone
+                err = str(e)
+                if "Order does not exist" in err or "-2013" in err:
+                    self._ledger_grid_reset_sell_placed(trade_id)
+                    logger.warning(
+                        f"  TP sync: {symbol} sell {sell_oid} no longer exists — "
+                        f"resetting sell_placed"
+                    )
+                    corrected += 1
+                else:
+                    logger.debug(f"  TP sync: could not check {symbol} {sell_oid}: {e}")
+
+        if corrected:
+            logger.info(f"  TP sync complete: corrected {corrected} stale flags")
+        return corrected
+
+    async def recover_pending_tp_fills(self) -> int:
+        """
+        Recover TP orders for BUY fills where sell hasn't been placed.
+
+        Runs at startup, bypassing the after_grid gate. Reads grid_fills
+        rows where sell_placed=FALSE.
+
+        Returns number of TP orders placed (or found existing).
+        """
+        pending = self._ledger_get_pending_tp_fills()
+        if not pending:
+            logger.info("  No pending TP fills to recover")
+            return 0
+
+        recovered = 0
+        for fill in pending:
+            trade_id = fill["trade_id"]
+            symbol = fill["symbol"]
+            sell_price = float(fill["sell_price"])
+            buy_qty = float(fill["buy_qty"])
+            tp_tag = f"tp_{trade_id}"
+
+            if tp_tag in self._tp_attempted:
+                continue
+
+            # Safety: only skip if TP <= buy_price (would lock in a loss).
+            # TP below current market is fine — the limit order fills at
+            # or above TP price, so you get MORE profit, not less.
+            buy_price_float = float(fill.get("buy_price", 0))
+            if sell_price <= buy_price_float:
+                logger.warning(
+                    f"  Recovery TP skipped: TP {sell_price:.5f} <= buy {buy_price_float:.5f} "
+                    f"for {symbol} trade {trade_id}"
+                )
+                self._tp_attempted.add(tp_tag)
+                continue
+
+            # Check available balance and compute sell qty.
+            # Use buy_qty from the record as the cap — each TP sells
+            # only what its corresponding BUY bought, not the entire balance.
+            sell_qty = buy_qty
+            try:
+                base_asset = symbol.replace("USDT", "")
+                bal = await self._client.get_asset_balance(base_asset)
+                available = bal.free
+                if available <= 0:
+                    logger.debug(f"  Recovery: no {base_asset} to sell for trade {trade_id}")
+                    self._tp_attempted.add(tp_tag)
+                    continue
+                info = await self._client.get_exchange_info(symbol)
+                lot_step = 1.0
+                for s in info.get("symbols", []):
+                    if s.get("symbol") == symbol.upper():
+                        for f in s.get("filters", []):
+                            if f["filterType"] == "LOT_SIZE":
+                                lot_step = float(f["stepSize"])
+                                break
+                        break
+                # Cap at both available balance and the original buy_qty
+                capped = min(available, buy_qty)
+                sell_qty = (capped // lot_step) * lot_step
+                if sell_qty <= 0:
+                    logger.debug(f"  Recovery TP qty {capped} below lot step {lot_step}")
+                    self._tp_attempted.add(tp_tag)
+                    continue
+            except Exception:
+                pass  # use buy_qty as-is
+
+            # Round sell_price to exchange tick precision (critical for DOGE 5dp)
+            sell_price, _ = self._round_to_tick(symbol, sell_price, sell_qty)
+
+            # If market has moved above original TP, place just above
+            # current price to capture the extra profit.
+            try:
+                current_px = await self._client.get_ticker_price(symbol)
+                if current_px > sell_price:
+                    adjusted = current_px * 1.001  # 0.1% above market
+                    adjusted, _ = self._round_to_tick(symbol, adjusted, sell_qty)
+                    if adjusted > sell_price:
+                        logger.info(
+                            f"  TP adjusted: {sell_price:.5f} → {adjusted:.5f} "
+                            f"(market @ {current_px:.5f})"
+                        )
+                        sell_price = adjusted
+            except Exception:
+                pass
+
+            try:
+                tp_req = OrderRequest(
+                    symbol=symbol, side="SELL", order_type="LIMIT",
+                    price=sell_price, quantity=sell_qty,
+                    time_in_force="GTC", client_order_id=tp_tag,
+                )
+                tp_resp = await self._client.place_order(tp_req)
+                self._tp_attempted.add(tp_tag)
+                self._ledger_grid_sell_placed(trade_id, tp_resp.exchange_order_id, tp_tag)
+                self._orders[tp_tag] = TrackedOrder(
+                    order_id=tp_tag, exchange_order_id=tp_resp.exchange_order_id,
+                    symbol=symbol, side="SELL", order_type="LIMIT",
+                    price=sell_price, quantity=sell_qty, status="OPEN",
+                )
+                recovered += 1
+                logger.info(
+                    f"  TP RECOVERED: SELL {sell_qty} @ ${sell_price:.5f} for {symbol} "
+                    f"(trade {trade_id})"
+                )
+            except Exception as e:
+                # Check if order already exists on exchange (crashed before DB update)
+                try:
+                    existing = await self._client.get_order(symbol, client_order_id=tp_tag)
+                    if existing and existing.get("status") in ("NEW", "PARTIALLY_FILLED"):
+                        self._ledger_grid_sell_placed(trade_id, str(existing["orderId"]), tp_tag)
+                        self._tp_attempted.add(tp_tag)
+                        recovered += 1
+                        logger.info(
+                            f"  TP RECOVERED (found existing): SELL @ ${sell_price:.5f}"
+                        )
+                        continue
+                except Exception:
+                    pass
+                logger.error(f"  Recovery TP failed for {symbol} trade {trade_id}: {e}")
+                self._tp_attempted.add(tp_tag)
+
+        if recovered:
+            logger.info(f"  TP recovery complete: placed/recovered {recovered} orders")
+        return recovered
 
     # ------------------------------------------------------------------
     # Signal Dispatch
@@ -496,7 +738,7 @@ class OrderManager:
     @staticmethod
     def _round_to_tick(symbol: str, price: float, qty: float) -> tuple:
         """Round price and quantity to exchange-allowed tick sizes."""
-        # Binance spot tick sizes
+        # Binance spot tick sizes (price decimals, qty decimals)
         ticks = {
             "BTCUSDT": (2, 5),     # price: 0.01, qty: 5dp
             "ETHUSDT": (2, 4),
@@ -506,8 +748,14 @@ class OrderManager:
         }
         price_dp, qty_dp = ticks.get(symbol.upper(), (2, 5))
 
-        price = max(0.01, round(price, price_dp))
-        qty = max(10 ** -qty_dp, round(qty, qty_dp))
+        # Round to exchange precision — no arbitrary floor that could
+        # distort prices for sub-$1 coins.
+        price = round(price, price_dp)
+        qty = round(qty, qty_dp)
+
+        # Ensure strictly positive (exchange will reject zero/negative)
+        price = max(1e-8, price)
+        qty = max(1e-8, qty)
 
         return price, qty
 
@@ -520,14 +768,19 @@ class OrderManager:
         # Initial delay: let the grid deploy first before reconciliation
         # kicks in, otherwise old fills trigger TP before grid_active is set.
         await asyncio.sleep(15.0)
+        cycle = 0
         while self._running:
             try:
+                cycle += 1
                 await self.reconcile()
+                # Heartbeat every 60 cycles (~5 min) so we know it's alive
+                if cycle % 60 == 0:
+                    logger.info(f"Reconciliation alive: cycle #{cycle}")
                 await asyncio.sleep(self.reconcile_interval)
             except asyncio.CancelledError:
                 break
             except Exception as e:
-                logger.error(f"Reconciliation error: {e}")
+                logger.error(f"Reconciliation error: {e}", exc_info=True)
 
     async def reconcile(self) -> None:
         """
@@ -563,19 +816,12 @@ class OrderManager:
                             order.filled_quantity = fill_qty
                             break
 
-                    # If not in memory, check ledger for the order
+                    # If not in memory, look up in ledger (PostgreSQL, not SQLite)
                     if order_id is None:
                         try:
-                            import sqlite3
-                            ledger_path = os.environ.get("DB_PATH", "data/trading_ledger.db")
-                            conn = sqlite3.connect(ledger_path)
-                            row = conn.execute(
-                                "SELECT order_id FROM orders WHERE exchange_order_id=?",
-                                (ex_order_id,)
-                            ).fetchone()
-                            conn.close()
-                            if row:
-                                order_id = row[0]
+                            oid = self._ledger_get_order_id_by_exchange(ex_order_id)
+                            if oid:
+                                order_id = oid
                         except Exception:
                             pass
 
@@ -586,7 +832,7 @@ class OrderManager:
                             filled_quantity=fill_qty,
                             fill_price=fill_price,
                         )
-                    logger.debug(f"  Fill: {symbol} {fill_side} {fill_qty} @ ${fill_price:.2f}")
+                    logger.debug(f"  Fill: {symbol} {fill_side} {fill_qty} @ ${fill_price:.5f}")
 
                     # Compute after_grid ONCE, before all downstream checks
                     fill_time_ms = trade.get("time", 0)
@@ -613,7 +859,6 @@ class OrderManager:
                                 self._consecutive_buys = 0
 
                     # ---- AUTO PLACE TAKE-PROFIT ORDER ----
-                    # ---- AUTO PLACE TAKE-PROFIT ORDER ----
                     if fill_side == "BUY" and fill_qty > 0:
                         if not after_grid:
                             logger.debug(
@@ -621,18 +866,44 @@ class OrderManager:
                                 f"fill_time={fill_time:.0f} < deploy_time={self.grid_deployed_at:.0f}"
                             )
                             continue
-                        tp_price = round(fill_price * 1.005, 2)
                         trade_id = str(trade.get("id", ""))
                         tp_tag = f"tp_{trade_id}"
 
                         # Dedup: never retry the same TP order
-                        if not hasattr(self, '_tp_attempted'):
-                            self._tp_attempted: set = set()
                         if tp_tag in self._tp_attempted:
                             continue
-                        self._tp_attempted.add(tp_tag)
+
+                        # Cap set size BEFORE adding new entry
                         if len(self._tp_attempted) > 1000:
                             self._tp_attempted = set(list(self._tp_attempted)[-500:])
+
+                        # Persist BUY fill to DB (idempotent via ON CONFLICT)
+                        buy_time_str = datetime.fromtimestamp(fill_time, tz=timezone.utc).isoformat() if fill_time else datetime.now(timezone.utc).isoformat()
+                        self._ledger_grid_buy_fill(
+                            trade_id=trade_id, symbol=symbol,
+                            exchange_order_id=ex_order_id,
+                            buy_price=fill_price, buy_qty=fill_qty,
+                            buy_time=buy_time_str,
+                            profit_pct=self.grid_profit_pct,
+                        )
+
+                        # Compute TP price using config profit %, with correct
+                        # tick precision (NOT hardcoded 2dp which destroys sub-$1 coins).
+                        raw_tp = fill_price * self._grid_profit_mult
+                        tp_price, _ = self._round_to_tick(symbol, raw_tp, fill_qty)
+
+                        # Safety: if TP price <= fill price, something is wrong
+                        if tp_price <= fill_price:
+                            logger.error(
+                                f"  TP price {tp_price} <= fill {fill_price} — "
+                                f"rounding destroyed the profit margin. Skipping TP."
+                            )
+                            self._tp_attempted.add(tp_tag)
+                            continue
+
+                        # Safety: only skip if TP <= fill_price (would lock in a loss).
+                        # TP below current market is fine — limit order fills at
+                        # or above TP price, giving MORE profit, not less.
 
                         # Use actual balance (accounts for fees) floored to lot size
                         try:
@@ -658,6 +929,18 @@ class OrderManager:
                         except Exception:
                             sell_qty = fill_qty
 
+                        # If market moved above original TP, ride it higher
+                        try:
+                            current_px = await self._client.get_ticker_price(symbol)
+                            if current_px > tp_price:
+                                adjusted = current_px * 1.001
+                                adjusted, _ = self._round_to_tick(symbol, adjusted, sell_qty)
+                                if adjusted > tp_price:
+                                    logger.info(f"  TP adjusted: {tp_price:.5f} → {adjusted:.5f}")
+                                    tp_price = adjusted
+                        except Exception:
+                            pass
+
                         try:
                             tp_req = OrderRequest(
                                 symbol=symbol, side="SELL", order_type="LIMIT",
@@ -665,7 +948,12 @@ class OrderManager:
                                 time_in_force="GTC", client_order_id=tp_tag,
                             )
                             tp_resp = await self._client.place_order(tp_req)
-                            logger.info(f"  TP placed: SELL {sell_qty} @ ${tp_price:.2f}")
+                            # Only mark attempted AFTER successful placement
+                            self._tp_attempted.add(tp_tag)
+                            self._ledger_grid_sell_placed(
+                                trade_id, tp_resp.exchange_order_id, tp_tag,
+                            )
+                            logger.info(f"  TP placed: SELL {sell_qty} @ ${tp_price:.5f}")
                             self._orders[tp_tag] = TrackedOrder(
                                 order_id=tp_tag, exchange_order_id=tp_resp.exchange_order_id,
                                 symbol=symbol, side="SELL", order_type="LIMIT",
@@ -682,16 +970,29 @@ class OrderManager:
                         client_oid = str(trade.get("orderId", ""))
                         rebuy_tag = f"rebuy_{client_oid}"
 
-                        if not hasattr(self, '_rebuy_attempted'):
-                            self._rebuy_attempted: set = set()
+                        # ---- TP FILL DETECTION ----
+                        # Check if this SELL fill matches a known TP order.
+                        gf = None
+                        try:
+                            gf = self._ledger_get_grid_fill_by_sell_order(client_oid)
+                            if gf:
+                                sell_fill_time_str = datetime.fromtimestamp(fill_time, tz=timezone.utc).isoformat() if fill_time else datetime.now(timezone.utc).isoformat()
+                                self._ledger_grid_sell_filled(gf["trade_id"], fill_price, sell_fill_time_str)
+                                logger.debug(f"  SELL FILLED for grid fill trade_id={gf['trade_id']}")
+                        except Exception:
+                            pass
+
                         if rebuy_tag in self._rebuy_attempted:
                             continue
-                        self._rebuy_attempted.add(rebuy_tag)
+
                         if len(self._rebuy_attempted) > 1000:
                             self._rebuy_attempted = set(list(self._rebuy_attempted)[-500:])
 
-                        # Compute entry price from TP price
-                        entry_price = round(fill_price / 1.005, 5)
+                        # Reverse the TP multiplier to get original entry price,
+                        # rounded to exchange tick precision.
+                        raw_entry = fill_price / self._grid_profit_mult
+                        entry_price, _ = self._round_to_tick(symbol, raw_entry, fill_qty)
+
                         # Use actual USDT balance to determine buy qty, capped at fill_qty
                         try:
                             usdt_bal = await self._client.get_asset_balance("USDT")
@@ -718,6 +1019,8 @@ class OrderManager:
                                 time_in_force="GTC", client_order_id=rebuy_tag,
                             )
                             rebuy_resp = await self._client.place_order(rebuy_req)
+                            # Only mark attempted AFTER successful placement
+                            self._rebuy_attempted.add(rebuy_tag)
                             logger.info(f"  ↻ Grid cycle: SELL filled → BUY {rebuy_qty} @ ${entry_price:.5f}")
                             self._orders[rebuy_tag] = TrackedOrder(
                                 order_id=rebuy_tag, exchange_order_id=rebuy_resp.exchange_order_id,
@@ -728,7 +1031,7 @@ class OrderManager:
                             logger.debug(f"  Rebuy skipped: {e}")
 
             except Exception as e:
-                logger.debug(f"Reconciliation skipped for {symbol}: {e}")
+                logger.error(f"Reconciliation failed for {symbol}: {e}", exc_info=True)
 
 
 from collections import defaultdict
