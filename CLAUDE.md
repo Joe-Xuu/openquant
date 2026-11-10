@@ -19,8 +19,8 @@ python backtest.py --symbol DOGEUSDT --capital 12
 # Kill stale processes (Windows)
 taskkill /F /IM python.exe
 
-# Reset database (if accounts table missing entries)
-python -c "import psycopg2; c=psycopg2.connect(host='localhost',port=5432,user='openquant',password='openquant',dbname='openquant'); c.autocommit=True; c.cursor().execute('DROP SCHEMA public CASCADE; CREATE SCHEMA public;')"
+# Reset database (if accounts table missing entries) — password comes from PG_PASSWORD in .env
+python -c "import os, psycopg2; from dotenv import load_dotenv; load_dotenv(); c=psycopg2.connect(host='localhost',port=5432,user='openquant',password=os.environ['PG_PASSWORD'],dbname='openquant'); c.autocommit=True; c.cursor().execute('DROP SCHEMA public CASCADE; CREATE SCHEMA public;')"
 ```
 
 ## Architecture (Hard Rules)

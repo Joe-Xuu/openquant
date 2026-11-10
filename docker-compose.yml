@@ -16,7 +16,7 @@ services:
     restart: unless-stopped
     environment:
       POSTGRES_USER: openquant
-      POSTGRES_PASSWORD: openquant
+      POSTGRES_PASSWORD: ${PG_PASSWORD:?PG_PASSWORD is not set - copy .env.example to .env and fill it in}
       POSTGRES_DB: openquant
     ports:
       - "5432:5432"

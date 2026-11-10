@@ -282,10 +282,15 @@ class LedgerEngine:
         host = kwargs.get("host", os.getenv("PG_HOST", "localhost"))
         port = kwargs.get("port", int(os.getenv("PG_PORT", "5432")))
         user = kwargs.get("user", os.getenv("PG_USER", "openquant"))
-        password = kwargs.get("password", os.getenv("PG_PASSWORD", "openquant"))
+        password = kwargs.get("password", os.getenv("PG_PASSWORD", ""))
         dbname = kwargs.get("dbname", os.getenv("PG_DB", "openquant"))
 
         if dsn is None:
+            if not password:
+                raise ValueError(
+                    "PG_PASSWORD is not set. Copy .env.example to .env and set "
+                    "PG_PASSWORD there (or pass password=... / dsn=... explicitly)."
+                )
             dsn = f"host={host} port={port} user={user} password={password} dbname={dbname}"
 
         self._dsn = dsn
