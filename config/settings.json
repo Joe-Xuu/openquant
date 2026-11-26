@@ -19,8 +19,10 @@
     "trading": {
         "symbols": ["DOGEUSDT"],
         "base_quote_asset": "USDT",
-        "_comment_trading": "fallback_equity is only used when exchange balance fetch fails",
-        "fallback_equity": 12.0,
+        "_comment_trading": "fallback_equity is only used when exchange balance fetch fails; capital is dynamically scaled to live exchange equity",
+        "fallback_equity": 100.0,
+        "grid_capital_pct": 0.70,
+        "trend_capital_pct": 0.25,
         "max_positions_per_symbol": 1,
         "max_total_positions": 5,
         "order_timeout_seconds": 30,
@@ -30,9 +32,9 @@
     "risk": {
         "max_drawdown_pct": 15.0,
         "max_daily_loss_pct": 5.0,
-        "max_position_size_pct": 20.0,
+        "max_position_size_pct": 75.0,
         "max_leverage": 1.0,
-        "max_exposure_pct": 200.0,
+        "max_exposure_pct": 100.0,
         "stop_loss_pct": 2.0,
         "trailing_stop_pct": 1.5,
         "circuit_breaker": {
@@ -43,7 +45,7 @@
     },
 
     "strategy": {
-        "mode": "regime_switching",
+        "mode": "parallel_dual_engine",
         "regime_detection": {
             "lookback_periods": 100,
             "adx_threshold": 25,
@@ -57,7 +59,8 @@
             "lower_bound_pct": 5.0,
             "grid_levels": 8,
             "profit_per_grid_pct": 1.0,
-            "rebalance_threshold_pct": 5.0
+            "rebalance_threshold_pct": 5.0,
+            "stop_loss_pct": 5.0
         },
         "trend_following": {
             "ema_fast": 12,
@@ -65,7 +68,9 @@
             "macd_signal": 9,
             "atr_period": 14,
             "atr_multiplier": 2.0,
-            "trailing_stop_atr_multiplier": 3.0
+            "trailing_stop_atr_multiplier": 3.0,
+            "risk_per_trade_pct": 1.0,
+            "allow_short": false
         },
         "multi_factor": {
             "weights": {
@@ -79,19 +84,19 @@
     },
 
     "data": {
-        "kline_intervals": ["1m", "5m", "15m", "1h"],
+        "kline_intervals": ["5m", "15m", "1h"],
         "primary_interval": "5m",
+        "trend_interval": "15m",
         "max_klines_per_request": 500,
         "ws_reconnect_delay_seconds": 5,
         "indicator_cache_ttl_seconds": 60
     },
 
     "database": {
-        "path": "data/trading_ledger.db",
-        "journal_mode": "WAL",
-        "synchronous": "NORMAL",
-        "busy_timeout_ms": 5000,
-        "cache_size_kb": -64000
+        "host": "localhost",
+        "port": 5432,
+        "user": "openquant",
+        "dbname": "openquant"
     },
 
     "logging": {

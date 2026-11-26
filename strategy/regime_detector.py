@@ -398,12 +398,12 @@ class RegimeDetector:
         atr: float,
     ) -> float:
         """
-        Score price momentum strength.
+        Score price momentum strength (completely price-scale invariant).
 
         Logic:
-            - EMA fast > slow AND MACD histogram expanding → strong momentum (score > 0.7).
-            - EMA cross against each other → weak/no momentum (score < 0.3).
-            - MACD histogram normalized by ATR for cross-asset comparability.
+            - EMA separation as % of slow EMA (dimensionless).
+            - MACD histogram normalized by ATR (dimensionless: both are in price units).
+              Works identically for BTC ($100,000) and DOGE ($0.08).
 
         Returns:
             Score in [0, 1]. Higher = stronger momentum (trending).
@@ -411,27 +411,17 @@ class RegimeDetector:
         if ema_fast <= 0 or ema_slow <= 0:
             return 0.5
 
-        # EMA alignment: 1.0 if fast is convincingly on one side of slow
-        ema_diff_pct = abs(ema_fast - ema_slow) / ema_slow * 100
-        ema_score = min(1.0, ema_diff_pct / 2.0)  # 2% difference → full score
+        # EMA alignment: 1.0 if fast is convincingly separated from slow
+        ema_diff_pct = abs(ema_fast - ema_slow) / ema_slow * 100.0
+        ema_score = min(1.0, ema_diff_pct / 1.5)  # 1.5% separation -> full score
 
-        # MACD histogram strength (normalized by ATR)
-        macd_score = 0.5
-        if atr > 0 and len(ohlcv) >= 2:
-            price = ohlcv[-1]["close"]
-            # Normalize MACD histogram by price and ATR
-            normalized_macd = abs(macd_hist) / (atr * price / 10000)
-            macd_score = min(1.0, normalized_macd / 100.0)
+        # MACD histogram strength normalized by ATR (dimensionless)
+        macd_score = 0.0
+        if atr > 0:
+            normalized_macd = abs(macd_hist) / atr
+            macd_score = min(1.0, normalized_macd / 0.5)  # 0.5 * ATR -> full score
 
-        # Check if recent MACD histogram is expanding
-        if len(ohlcv) >= 4:
-            # Approximate: compare current histogram magnitude to recent
-            recent_range = max(c["high"] for c in ohlcv[-4:]) - min(c["low"] for c in ohlcv[-4:])
-            if recent_range > 0:
-                macd_strength = abs(macd_hist) / recent_range * 10000
-                macd_score = max(macd_score, min(1.0, macd_strength / 50.0))
-
-        # Blend: 50% EMA alignment, 50% MACD strength
+        # Blend: 50% EMA separation, 50% ATR-normalized MACD strength
         score = 0.50 * ema_score + 0.50 * macd_score
         return max(0.0, min(1.0, score))
 
@@ -503,14 +493,14 @@ class RegimeDetector:
         bid_ask_spread_pct: float = 0.05,
     ) -> float:
         """
-        Score market microstructure from candle patterns and spread.
+        Score market microstructure from candle decisiveness, directional
+        consistency, and bid-ask spread.
 
         Logic:
-            - Directional candles with small wicks → trending (efficient price
-              discovery, fewer rejections).
-            - Doji / spinning tops (large wicks, small bodies) → ranging
-              (indecision, mean-reversion behavior).
-            - Tight spread → liquid, trending-capable. Wide spread → ranging.
+            - High body/range ratio → decisive price discovery (trending).
+            - Consecutive candles closing in the same direction → directional
+              persistence (trending), whereas alternating closes → chop (ranging).
+            - Tight spread → liquid, trending-capable.
 
         Returns:
             Score in [0, 1]. Higher = microstructure favors trending.
@@ -519,28 +509,26 @@ class RegimeDetector:
             return 0.5
 
         # Analyze last 3 candles
-        scores = []
+        body_ratios = []
+        directions = []
         for i in range(-min(3, len(ohlcv)), 0):
             candle = ohlcv[i]
-            body = abs(candle["close"] - candle["open"])
-            upper_wick = candle["high"] - max(candle["close"], candle["open"])
-            lower_wick = min(candle["close"], candle["open"]) - candle["low"]
+            delta = candle["close"] - candle["open"]
+            body = abs(delta)
             total_range = candle["high"] - candle["low"]
 
             if total_range <= 0:
-                scores.append(0.5)
+                body_ratios.append(0.5)
+                directions.append(0)
                 continue
 
-            # Body ratio: high body/total_range → decisive move (trending)
-            body_ratio = body / total_range
-            # Wick ratio: low wick/total_range → less rejection (trending)
-            wick_ratio = (upper_wick + lower_wick) / total_range
+            body_ratios.append(body / total_range)
+            directions.append(1 if delta > 0 else (-1 if delta < 0 else 0))
 
-            # Composite: high body, low wicks → trending
-            candle_score = 0.6 * body_ratio + 0.4 * (1.0 - wick_ratio)
-            scores.append(candle_score)
-
-        avg_candle_score = sum(scores) / len(scores)
+        avg_body_ratio = sum(body_ratios) / len(body_ratios)
+        # Directional consistency: 1.0 if all 3 candles same direction, 0.33 if 2 vs 1, 0 if balanced
+        directional_consistency = abs(sum(directions)) / len(directions)
+        avg_candle_score = 0.60 * avg_body_ratio + 0.40 * directional_consistency
 
         # Spread factor: tight spread → trending-friendly
         spread_score = 1.0

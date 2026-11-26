@@ -148,6 +148,7 @@ class TrendStrategy:
         risk_per_trade_pct: float = 1.0,
         min_risk_reward_ratio: float = 1.5,
         strategy_id: str = "trend_v1",
+        allow_short: bool = False,
     ):
         """
         Initialize the trend-following strategy.
@@ -162,6 +163,7 @@ class TrendStrategy:
             risk_per_trade_pct: % of capital to risk per trade (default 1.0%).
             min_risk_reward_ratio: Minimum reward/risk for entry (default 1.5).
             strategy_id: Identifier for signal tagging.
+            allow_short: Enable SHORT entries (False for Spot markets).
         """
         self.ema_fast = ema_fast
         self.ema_slow = ema_slow
@@ -172,6 +174,7 @@ class TrendStrategy:
         self.risk_per_trade_pct = risk_per_trade_pct
         self.min_risk_reward_ratio = min_risk_reward_ratio
         self.strategy_id = strategy_id
+        self.allow_short = allow_short
 
     # ------------------------------------------------------------------
     # Core Signal Evaluation
@@ -262,18 +265,18 @@ class TrendStrategy:
         Check entry conditions when flat (no position).
 
         LONG entry:  strong_bullish (EMA crossover up + MACD > 0)
-        SHORT entry: strong_bearish (EMA crossover down + MACD < 0)
+        SHORT entry: strong_bearish (only when allow_short=True)
         """
         if strong_bullish:
             direction = TrendDirection.LONG
             stop_loss = price - self.atr_multiplier * atr
             trailing_stop = price - self.trailing_stop_atr_multiplier * atr
-        elif strong_bearish:
+        elif strong_bearish and self.allow_short:
             direction = TrendDirection.SHORT
             stop_loss = price + self.atr_multiplier * atr
             trailing_stop = price + self.trailing_stop_atr_multiplier * atr
         else:
-            return None  # No clear direction
+            return None  # No clear direction (or shorting disabled in Spot)
 
         # --- Risk/reward check ---
         stop_distance_pct = abs(price - stop_loss) / price * 100
@@ -290,14 +293,14 @@ class TrendStrategy:
         return (
             SignalBuilder(SignalAction.START_TREND, symbol, entry_score)
             .with_metadata("direction", direction.value)
-            .with_metadata("entry_price", price)
+            .with_metadata("entry_price", round(price, 8))
             .with_metadata("position_size", round(position_size, 8))
-            .with_metadata("stop_loss", round(stop_loss, 2))
-            .with_metadata("trailing_stop", round(trailing_stop, 2))
-            .with_metadata("atr", round(atr, 2))
-            .with_metadata("ema_fast", round(ema_fast_val, 2))
-            .with_metadata("ema_slow", round(ema_slow_val, 2))
-            .with_metadata("macd_hist", round(macd_hist, 2))
+            .with_metadata("stop_loss", round(stop_loss, 8))
+            .with_metadata("trailing_stop", round(trailing_stop, 8))
+            .with_metadata("atr", round(atr, 8))
+            .with_metadata("ema_fast", round(ema_fast_val, 8))
+            .with_metadata("ema_slow", round(ema_slow_val, 8))
+            .with_metadata("macd_hist", round(macd_hist, 8))
             .with_metadata("risk_per_trade_pct", self.risk_per_trade_pct)
             .with_metadata("entry_reason", "ema_cross + macd_confirmation")
             .with_strategy(self.strategy_id)
@@ -322,40 +325,48 @@ class TrendStrategy:
         Check exit/adjust conditions when a position is active.
 
         EXIT conditions (in priority order):
-            1. Price hits stop-loss → immediate exit
-            2. Trend reversal (opposite strong signal) → exit + reverse
-            3. EMA cross against position → exit
+            1. Price hits stop-loss or trailing stop → immediate exit
+            2. Trend reversal (opposite strong signal) → exit (or reverse if allow_short)
+            3. Trailing stop ratchet up/down → MODIFY_POSITION
+            4. EMA cross against position → exit
         """
-        # --- Check stop-loss hit ---
+        # --- Check stop-loss & trailing stop hit ---
         if state.direction == TrendDirection.LONG:
-            if price <= state.stop_loss_price:
-                return self._generate_exit_signal(symbol, state, price, "stop_loss_hit")
+            effective_stop = max(state.stop_loss_price, state.trailing_stop_price)
+            if effective_stop > 0 and price <= effective_stop:
+                reason = "trailing_stop_hit" if state.trailing_stop_price > state.stop_loss_price else "stop_loss_hit"
+                return self._generate_exit_signal(symbol, state, price, reason)
             # Update trailing stop (ratchet up only)
             new_trail = price - self.trailing_stop_atr_multiplier * atr
-            if new_trail > state.trailing_stop_price:
+            if new_trail > state.trailing_stop_price and new_trail > state.stop_loss_price:
                 return self._generate_adjust_stop_signal(
                     symbol, state, price, new_trail, atr
                 )
 
         elif state.direction == TrendDirection.SHORT:
-            if price >= state.stop_loss_price:
-                return self._generate_exit_signal(symbol, state, price, "stop_loss_hit")
+            candidates = [p for p in (state.stop_loss_price, state.trailing_stop_price) if p > 0]
+            effective_stop = min(candidates) if candidates else 0.0
+            if effective_stop > 0 and price >= effective_stop:
+                reason = "trailing_stop_hit" if (
+                    state.trailing_stop_price > 0 and state.trailing_stop_price < state.stop_loss_price
+                ) else "stop_loss_hit"
+                return self._generate_exit_signal(symbol, state, price, reason)
             # Update trailing stop (ratchet down only)
             new_trail = price + self.trailing_stop_atr_multiplier * atr
-            if new_trail < state.trailing_stop_price:
+            if (state.trailing_stop_price <= 0 or new_trail < state.trailing_stop_price) and new_trail < state.stop_loss_price:
                 return self._generate_adjust_stop_signal(
                     symbol, state, price, new_trail, atr
                 )
 
         # --- Check trend reversal ---
         if state.direction == TrendDirection.LONG and strong_bearish:
-            # Exit long and enter short
-            return self._generate_reverse_signal(
-                symbol, state, price, atr, TrendDirection.SHORT,
-                ema_fast_val, ema_slow_val, macd_hist, capital,
-            )
+            if self.allow_short:
+                return self._generate_reverse_signal(
+                    symbol, state, price, atr, TrendDirection.SHORT,
+                    ema_fast_val, ema_slow_val, macd_hist, capital,
+                )
+            return self._generate_exit_signal(symbol, state, price, "trend_reversal")
         elif state.direction == TrendDirection.SHORT and strong_bullish:
-            # Exit short and enter long
             return self._generate_reverse_signal(
                 symbol, state, price, atr, TrendDirection.LONG,
                 ema_fast_val, ema_slow_val, macd_hist, capital,
@@ -390,7 +401,8 @@ class TrendStrategy:
         return (
             SignalBuilder(SignalAction.STOP_TREND, symbol, 1.0)
             .with_metadata("direction", state.direction.value)
-            .with_metadata("exit_price", price)
+            .with_metadata("position_size", round(state.position_size, 8))
+            .with_metadata("exit_price", round(price, 8))
             .with_metadata("exit_reason", reason)
             .with_metadata("pnl_pct", round(pnl_pct, 4))
             .with_strategy(self.strategy_id)
@@ -413,11 +425,7 @@ class TrendStrategy:
         """
         Generate a signal that exits the current position AND enters the
         opposite direction.
-
-        This is rarer than a simple exit — it requires strong conviction
-        in the opposite direction.
         """
-        # Compute exit PnL
         pnl_pct = 0.0
         if state.entry_price > 0:
             if state.direction == TrendDirection.LONG:
@@ -425,7 +433,6 @@ class TrendStrategy:
             else:
                 pnl_pct = (state.entry_price - price) / state.entry_price * 100
 
-        # Compute new entry parameters
         if new_direction == TrendDirection.LONG:
             stop_loss = price - self.atr_multiplier * atr
             trailing_stop = price - self.trailing_stop_atr_multiplier * atr
@@ -439,11 +446,11 @@ class TrendStrategy:
         return (
             SignalBuilder(SignalAction.START_TREND, symbol, 0.90)
             .with_metadata("direction", new_direction.value)
-            .with_metadata("entry_price", price)
+            .with_metadata("entry_price", round(price, 8))
             .with_metadata("position_size", round(new_size, 8))
-            .with_metadata("stop_loss", round(stop_loss, 2))
-            .with_metadata("trailing_stop", round(trailing_stop, 2))
-            .with_metadata("atr", round(atr, 2))
+            .with_metadata("stop_loss", round(stop_loss, 8))
+            .with_metadata("trailing_stop", round(trailing_stop, 8))
+            .with_metadata("atr", round(atr, 8))
             .with_metadata("exit_previous_pnl_pct", round(pnl_pct, 4))
             .with_metadata("entry_reason", "trend_reversal")
             .with_strategy(self.strategy_id)
@@ -464,10 +471,11 @@ class TrendStrategy:
             SignalBuilder(SignalAction.MODIFY_POSITION, symbol, 0.9)
             .with_metadata("action_type", "update_trailing_stop")
             .with_metadata("direction", state.direction.value)
-            .with_metadata("old_trailing_stop", round(state.trailing_stop_price, 2))
-            .with_metadata("new_trailing_stop", round(new_trailing_stop, 2))
-            .with_metadata("current_price", price)
-            .with_metadata("atr", round(atr, 2))
+            .with_metadata("position_size", round(state.position_size, 8))
+            .with_metadata("old_trailing_stop", round(state.trailing_stop_price, 8))
+            .with_metadata("new_trailing_stop", round(new_trailing_stop, 8))
+            .with_metadata("current_price", round(price, 8))
+            .with_metadata("atr", round(atr, 8))
             .with_strategy(self.strategy_id)
             .with_ttl(15.0)
             .build()

@@ -1,20 +1,25 @@
 """
 ================================================================================
-BACKTEST ENGINE — Full-Pipeline Historical Simulation
+BACKTEST ENGINE — Conservative, Event-Driven Binance Spot Simulator
 ================================================================================
 
-Simulates the complete trading system on historical data:
-    OHLCV → Indicators → Regime Detection → Grid/Trend Strategy
-    → Simulated Execution → Performance Metrics
+Simulates the exact production pipeline on historical data with ZERO look-ahead
+bias and strict accounting conservation:
+    OHLCV → Indicators (5m + resampled trend_interval) → RegimeDetector
+    → GridStrategy + TrendStrategy → RiskGuard → SymbolInfo Precision
+    → Conservative Order Matching (next-bar fills only) → Performance Report
 
-Tests three strategies side-by-side:
-    1. GRID-ONLY: Always use grid trading (baseline for ranging markets)
-    2. TREND-ONLY: Always use trend following (baseline for trending markets)
-    3. REGIME-SWITCH: Dynamically switch based on five-factor scoring
+KEY GUARANTEES:
+    1. No same-candle look-ahead: orders placed on bar t fill no earlier than
+       bar t+1; a grid BUY filled on bar t cannot TP-sell on bar t.
+    2. Inventory & capital conservation: Grid lots and Trend positions are
+       tracked in separate ledgers; Spot mode never sells unowned inventory.
+    3. Real RiskGuard + SymbolInfo tick/lot/min_notional enforcement.
+    4. Accurate signed Calmar, drawdown duration, and holding-time metrics.
 
 USAGE:
-    python backtest.py
-    python backtest.py --symbol BTCUSDT --capital 10000
+    python backtest.py --symbol DOGEUSDT --capital 100 --trend-interval 15m
+    python backtest.py --symbol BTCUSDT --capital 1000
 ================================================================================
 """
 
@@ -25,19 +30,19 @@ import json
 import math
 import os
 import sys
-import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
-# Add project root to path
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from data.indicators import compute_all, IndicatorBundle
-from strategy.signal import SignalAction, StrategySignal
-from strategy.grid_strategy import GridConfig, GridLevel, GridStatus, GridStrategy, LevelSide, LevelStatus
-from strategy.trend_strategy import TrendDirection, TrendState, TrendStrategy
+from execution.exchange_client import SymbolInfo
+from risk.risk_guard import RiskGuard, Verdict
+from strategy.grid_strategy import GridConfig, GridStrategy
 from strategy.regime_detector import MarketRegime, RegimeDetector, RegimeResult
+from strategy.signal import SignalAction, StrategySignal
+from strategy.trend_strategy import TrendDirection, TrendState, TrendStrategy
 
 
 # ============================================================================
@@ -46,21 +51,31 @@ from strategy.regime_detector import MarketRegime, RegimeDetector, RegimeResult
 
 @dataclass
 class BacktestConfig:
-    """Backtest parameters."""
-    symbol: str = "BTCUSDT"
+    """Backtest parameters aligned with live Binance Spot settings."""
+    symbol: str = "DOGEUSDT"
     interval: str = "5m"
-    initial_capital: float = 10000.0
-    fee_pct: float = 0.1  # 0.1% per trade
-    slippage_pct: float = 0.05  # 0.05% slippage
-    max_position_pct: float = 25.0  # max single position as % of equity
-    warmup_candles: int = 200
-    confidence_threshold_trend: float = 0.92  # min confidence to switch to trend
-    min_strategy_bars: int = 96  # min bars (~8h) before allowing strategy switch  # candles needed for indicator warmup
-    lookback_candles: int = 500  # max candles for indicator calculation (O(n) optimization)
+    trend_interval: str = "15m"  # "5m", "15m", "1h"
+    initial_capital: float = 100.0
+    grid_capital_pct: float = 0.70
+    trend_capital_pct: float = 0.25
+    fee_pct: float = 0.10        # 0.10% per side (Binance Spot standard)
+    slippage_pct: float = 0.05   # 0.05% on market orders
+    max_position_pct: float = 75.0
+    max_exposure_pct: float = 100.0
+    max_drawdown_pct: float = 15.0
+    max_daily_loss_pct: float = 5.0
+    warmup_candles: int = 100
+    confidence_threshold_trend: float = 0.80
+    lookback_candles: int = 300
     grid_upper_pct: float = 5.0
     grid_lower_pct: float = 5.0
-    grid_levels: int = 10
-    grid_profit_pct: float = 0.5  # 0.5% profit per grid level
+    grid_levels: int = 8
+    grid_profit_pct: float = 1.0
+    grid_rebalance_pct: float = 5.0
+    grid_stop_loss_pct: float = 5.0
+    allow_short: bool = False    # Spot default: long-only
+    consecutive_buy_limit: int = 5
+    enforce_risk_guard: bool = True
 
     @property
     def fee_decimal(self) -> float:
@@ -72,17 +87,17 @@ class BacktestConfig:
 
 
 # ============================================================================
-# Trade Records
+# Trade & Position Records
 # ============================================================================
 
 @dataclass
 class Trade:
-    """A single completed trade."""
+    """A single completed round-trip trade."""
     entry_time: str
     exit_time: str
     symbol: str
     side: str
-    strategy: str  # "grid", "trend", "regime_switch"
+    strategy: str
     entry_price: float
     exit_price: float
     quantity: float
@@ -94,7 +109,7 @@ class Trade:
 
 @dataclass
 class EquityPoint:
-    """One point on the equity curve."""
+    """One mark-to-market point on the equity curve."""
     timestamp: str
     equity: float
     position_value: float
@@ -103,8 +118,42 @@ class EquityPoint:
     regime_score: float = 0.0
 
 
+@dataclass
+class GridBuyOrder:
+    """An open limit BUY order resting on the book."""
+    price: float
+    quantity: float
+    tp_price: float
+    armed_bar: int
+
+
+@dataclass
+class GridLot:
+    """A filled grid BUY lot waiting for its TP SELL to execute."""
+    entry_price: float
+    quantity: float
+    tp_price: float
+    entry_fee: float
+    entry_time: str
+    entry_bar: int
+
+
+@dataclass
+class TrendPosition:
+    """Active directional trend position (strictly isolated from grid lots)."""
+    direction: str  # "LONG" or "SHORT"
+    quantity: float
+    entry_price: float
+    entry_fee: float
+    stop_loss: float
+    trailing_stop: float
+    entry_time: str
+    entry_bar: int
+    margin_locked: float = 0.0
+
+
 # ============================================================================
-# Performance Metrics
+# Performance Report
 # ============================================================================
 
 @dataclass
@@ -139,39 +188,80 @@ class PerformanceReport:
             "symbol": self.symbol,
             "strategy": self.strategy,
             "initial_capital": self.initial_capital,
-            "final_equity": round(self.final_equity, 2),
+            "final_equity": round(self.final_equity, 4),
             "total_return_pct": round(self.total_return_pct, 2),
             "total_trades": self.total_trades,
             "winning_trades": self.winning_trades,
             "losing_trades": self.losing_trades,
             "win_rate_pct": round(self.win_rate_pct, 2),
-            "total_pnl": round(self.total_pnl, 2),
-            "avg_win": round(self.avg_win, 2),
-            "avg_loss": round(self.avg_loss, 2),
-            "profit_factor": round(self.profit_factor, 2),
+            "total_pnl": round(self.total_pnl, 4),
+            "avg_win": round(self.avg_win, 4),
+            "avg_loss": round(self.avg_loss, 4),
+            "profit_factor": round(self.profit_factor, 2) if math.isfinite(self.profit_factor) else None,
             "max_drawdown_pct": round(self.max_drawdown_pct, 2),
+            "max_drawdown_duration_hours": round(self.max_drawdown_duration_hours, 1),
             "sharpe_ratio": round(self.sharpe_ratio, 2),
             "sortino_ratio": round(self.sortino_ratio, 2),
             "calmar_ratio": round(self.calmar_ratio, 2),
-            "avg_trades_per_day": round(self.avg_trades_per_day, 1),
+            "avg_trades_per_day": round(self.avg_trades_per_day, 2),
+            "avg_holding_hours": round(self.avg_holding_hours, 2),
             "regime_switches": self.regime_switches,
             "pct_time_grid": round(self.pct_time_grid, 1),
             "pct_time_trend": round(self.pct_time_trend, 1),
         }
 
     def summary(self) -> str:
+        pf_str = f"{self.profit_factor:.2f}" if math.isfinite(self.profit_factor) else "inf"
         lines = [
-            f"  Return: {self.total_return_pct:+.2f}%  |  Sharpe: {self.sharpe_ratio:.2f}",
-            f"  Trades: {self.total_trades}  |  Win Rate: {self.win_rate_pct:.1f}%",
-            f"  Profit Factor: {self.profit_factor:.2f}  |  Max DD: {self.max_drawdown_pct:.1f}%",
+            f"  Return: {self.total_return_pct:+.2f}%  |  Final: ${self.final_equity:.2f}  |  Sharpe: {self.sharpe_ratio:.2f}",
+            f"  Trades: {self.total_trades}  |  Win Rate: {self.win_rate_pct:.1f}%  |  Avg Hold: {self.avg_holding_hours:.1f}h",
+            f"  Profit Factor: {pf_str}  |  Max DD: {self.max_drawdown_pct:.2f}% ({self.max_drawdown_duration_hours:.0f}h)",
             f"  Calmar: {self.calmar_ratio:.2f}  |  Sortino: {self.sortino_ratio:.2f}",
         ]
         if self.regime_switches > 0:
             lines.append(
                 f"  Regime: {self.regime_switches} switches, "
-                f"Grid {self.pct_time_grid:.0f}% / Trend {self.pct_time_trend:.0f}%"
+                f"Ranging {self.pct_time_grid:.0f}% / Trending {self.pct_time_trend:.0f}%"
             )
         return "\n".join(lines)
+
+
+# ============================================================================
+# OHLCV Resampling Helper (Zero Look-Ahead)
+# ============================================================================
+
+def _interval_to_minutes(interval: str) -> int:
+    unit = interval[-1].lower()
+    val = int(interval[:-1])
+    if unit == "m":
+        return val
+    if unit == "h":
+        return val * 60
+    if unit == "d":
+        return val * 1440
+    return 5
+
+
+def resample_ohlcv(ohlcv: List[Dict[str, Any]], factor: int) -> List[Dict[str, Any]]:
+    """Aggregate every `factor` consecutive bars into higher-timeframe candles."""
+    if factor <= 1 or not ohlcv:
+        return ohlcv
+    out: List[Dict[str, Any]] = []
+    n = len(ohlcv)
+    for start in range(0, n, factor):
+        chunk = ohlcv[start:start + factor]
+        if len(chunk) < factor:
+            # Include forming candle at the end for latest mark without future data
+            pass
+        out.append({
+            "open": chunk[0]["open"],
+            "high": max(c["high"] for c in chunk),
+            "low": min(c["low"] for c in chunk),
+            "close": chunk[-1]["close"],
+            "volume": sum(c.get("volume", 0.0) for c in chunk),
+            "timestamp": chunk[-1]["timestamp"],
+        })
+    return out
 
 
 # ============================================================================
@@ -180,659 +270,721 @@ class PerformanceReport:
 
 class BacktestEngine:
     """
-    Full-pipeline backtest simulator.
-
-    Walks through historical candles one-by-one, running the complete
-    strategy pipeline and tracking performance.
+    Conservative event-driven backtest engine sharing production strategy,
+    regime, risk, and exchange precision components.
     """
 
-    def __init__(self, config: BacktestConfig):
+    def __init__(self, config: BacktestConfig, symbol_info: Optional[SymbolInfo] = None):
         self.cfg = config
-        self.cash = config.initial_capital
-        self.position_qty = 0.0          # absolute quantity (always positive)
-        self.position_entry_price = 0.0   # average entry price
-        self.position_direction = "FLAT"  # "LONG", "SHORT", or "FLAT"
-        self.short_margin_locked = 0.0    # collateral locked for short position
-        self.trades: List[Trade] = []
-        self.equity_curve: List[EquityPoint] = []
-        self._trade_id_counter = 0
+        self.symbol_info = symbol_info or SymbolInfo.default_for(config.symbol)
+        self._resample_factor = max(
+            1,
+            _interval_to_minutes(config.trend_interval) // max(1, _interval_to_minutes(config.interval)),
+        )
 
-        # Strategy engines
+        # Strategy engines (same classes as live main.py)
         self.grid = GridStrategy(
             grid_type="geometric",
             upper_bound_pct=config.grid_upper_pct,
             lower_bound_pct=config.grid_lower_pct,
             grid_levels=config.grid_levels,
             profit_per_grid_pct=config.grid_profit_pct,
-            total_capital=config.initial_capital,
+            total_capital=config.initial_capital * config.grid_capital_pct,
+            rebalance_threshold_pct=config.grid_rebalance_pct,
         )
+        self.grid.grid_stop_loss_pct = config.grid_stop_loss_pct
+
         self.trend = TrendStrategy(
-            ema_fast=12, ema_slow=26, macd_signal_period=9,
-            atr_period=14, atr_multiplier=2.0,
+            ema_fast=12,
+            ema_slow=26,
+            macd_signal_period=9,
+            atr_period=14,
+            atr_multiplier=2.0,
             trailing_stop_atr_multiplier=3.0,
             risk_per_trade_pct=1.0,
+            allow_short=config.allow_short,
         )
+
         self.regime_detector = RegimeDetector(
-            adx_threshold=25, volatility_window=20,
-            volatility_percentile_low=25, volatility_percentile_high=75,
+            adx_threshold=25.0,
+            volatility_window=20,
+            volatility_percentile_low=25.0,
+            volatility_percentile_high=75.0,
             lookback_periods=100,
         )
 
-        # Per-run state
-        self._current_regime = MarketRegime.RANGING
-        self._trend_state = TrendState.flat(config.symbol)
-        self._last_switch_bar = 0
-        self._grid_config: Optional[GridConfig] = None
-        self._active_grid_levels: Dict[int, Dict] = {}  # level_index → {side, price, qty, tp}
-        self._filled_grid_levels: Dict[int, Dict] = {}  # filled buy/sell waiting for TP
-        self._regime_history: List[Tuple[str, float]] = []
-
-    # ------------------------------------------------------------------
-    # Main Entry Point
-    # ------------------------------------------------------------------
-
-    def run(self, ohlcv: List[Dict], strategy_mode: str = "regime_switch") -> PerformanceReport:
-        """
-        Run backtest over historical OHLCV data.
-
-        Args:
-            ohlcv: List of OHLCV dicts (oldest first).
-            strategy_mode: "grid_only", "trend_only", or "regime_switch".
-
-        Returns:
-            PerformanceReport with full statistics.
-        """
         self._reset_state()
 
-        L = self.cfg.lookback_candles
+    def _reset_state(self) -> None:
+        self.cash: float = self.cfg.initial_capital
+        self._last_close: float = 0.0
+        self.grid_buy_orders: List[GridBuyOrder] = []
+        self.grid_lots: List[GridLot] = []
+        self.trend_pos: Optional[TrendPosition] = None
+        self.trades: List[Trade] = []
+        self.equity_curve: List[EquityPoint] = []
 
-        for i in range(self.cfg.warmup_candles, len(ohlcv)):
-            start = max(0, i - L)
-            window = ohlcv[start:i + 1]
-            current_bar = ohlcv[i]
+        self._current_regime = MarketRegime.RANGING
+        self._trend_state = TrendState.flat(self.cfg.symbol)
+        self._grid_config: Optional[GridConfig] = None
+        self._consecutive_buys: int = 0
+        self._trend_paused_grid: bool = False
+        self._regime_switches: int = 0
 
-            # Compute indicators
-            indicators = compute_all(self.cfg.symbol, window)
+        self.risk_guard = RiskGuard(
+            config={
+                "max_drawdown_pct": self.cfg.max_drawdown_pct,
+                "max_daily_loss_pct": self.cfg.max_daily_loss_pct,
+                "max_position_size_pct": self.cfg.max_position_pct,
+                "max_exposure_pct": self.cfg.max_exposure_pct,
+                "min_order_notional": float(self.symbol_info.min_notional),
+            },
+            equity_provider=self._mark_to_market_equity,
+            positions_provider=self._risk_positions,
+            trade_history_provider=lambda s: [],
+        )
 
-            # Determine regime
-            if strategy_mode == "grid_only":
-                regime_result = self._force_grid_regime(indicators)
-            elif strategy_mode == "trend_only":
-                regime_result = self._force_trend_regime(indicators)
+    # ------------------------------------------------------------------
+    # Accounting (Strict Conservation)
+    # ------------------------------------------------------------------
+
+    def _mark_to_market_equity(self, mark_price: Optional[float] = None) -> float:
+        px = mark_price if mark_price is not None else self._last_close
+        grid_val = sum(lot.quantity * px for lot in self.grid_lots)
+        trend_val = 0.0
+        if self.trend_pos is not None:
+            if self.trend_pos.direction == "LONG":
+                trend_val = self.trend_pos.quantity * px
             else:
-                raw_regime = self.regime_detector.detect(
+                # Short: margin_locked + unrealized PnL
+                unrealized = (self.trend_pos.entry_price - px) * self.trend_pos.quantity
+                trend_val = self.trend_pos.margin_locked + unrealized
+        return self.cash + grid_val + trend_val
+
+    def _risk_positions(self) -> List[Dict[str, Any]]:
+        positions: List[Dict[str, Any]] = []
+        grid_qty = sum(l.quantity for l in self.grid_lots)
+        if grid_qty > 0:
+            avg = sum(l.quantity * l.entry_price for l in self.grid_lots) / grid_qty
+            positions.append({
+                "symbol": self.cfg.symbol,
+                "quantity": grid_qty,
+                "avg_entry_price": avg,
+                "current_price": self._last_close or avg,
+            })
+        if self.trend_pos is not None:
+            positions.append({
+                "symbol": self.cfg.symbol,
+                "quantity": self.trend_pos.quantity,
+                "avg_entry_price": self.trend_pos.entry_price,
+                "current_price": self._last_close or self.trend_pos.entry_price,
+            })
+        return positions
+
+    # ------------------------------------------------------------------
+    # Main Simulation Loop
+    # ------------------------------------------------------------------
+
+    def run(self, ohlcv: List[Dict[str, Any]], strategy_mode: str = "dual_engine") -> PerformanceReport:
+        """
+        Run backtest over historical OHLCV bars (oldest first).
+
+        Args:
+            ohlcv: List of OHLCV dicts.
+            strategy_mode: "grid_only", "trend_only", or "dual_engine" (also accepts "regime_switch").
+        """
+        self._reset_state()
+        if strategy_mode == "regime_switch":
+            strategy_mode = "dual_engine"
+
+        L = self.cfg.lookback_candles
+        n = len(ohlcv)
+        if n <= self.cfg.warmup_candles:
+            return self._calculate_performance(strategy_mode)
+
+        for i in range(self.cfg.warmup_candles, n):
+            bar = ohlcv[i]
+            self._last_close = bar["close"]
+
+            # 1. Process resting orders & intrabar stops on bar i (orders armed on bar < i)
+            self._match_grid_orders(bar, bar_idx=i, mode=strategy_mode)
+            self._check_trend_intrabar_stop(bar, bar_idx=i, mode=strategy_mode)
+
+            # 2. Compute indicators on window ending at bar i (zero future data)
+            start = max(0, i - L + 1)
+            window = ohlcv[start:i + 1]
+            indicators = compute_all(self.cfg.symbol, window)
+            if indicators.atr <= 0 or indicators.close <= 0:
+                self._record_equity(bar, self._current_regime, 0.5)
+                continue
+
+            # 3. Regime detection
+            if strategy_mode == "grid_only":
+                regime_result = RegimeResult(
+                    regime=MarketRegime.RANGING, score=0.0,
+                    factor_scores=None, confidence=1.0, switched=False,
+                )
+            elif strategy_mode == "trend_only":
+                regime_result = RegimeResult(
+                    regime=MarketRegime.TRENDING, score=1.0,
+                    factor_scores=None, confidence=1.0, switched=False,
+                )
+            else:
+                regime_result = self.regime_detector.detect(
                     ohlcv=window,
                     current_regime=self._current_regime,
-                    adx=indicators.adx, plus_di=indicators.plus_di,
+                    adx=indicators.adx,
+                    plus_di=indicators.plus_di,
                     minus_di=indicators.minus_di,
-                    ema_fast=indicators.ema_fast, ema_slow=indicators.ema_slow,
-                    macd_hist=indicators.macd_hist, atr=indicators.atr,
+                    ema_fast=indicators.ema_fast,
+                    ema_slow=indicators.ema_slow,
+                    macd_hist=indicators.macd_hist,
+                    atr=indicators.atr,
                     volume=indicators.volume,
                 )
-                raw_score = raw_regime.score
-                raw_confidence = raw_regime.confidence
+                if regime_result.switched:
+                    self._regime_switches += 1
+                self._current_regime = regime_result.regime
 
-                # ---- Strategy lock & confidence filter ----
-                bars_since_switch = i - self._last_switch_bar
-                locked = bars_since_switch < self.cfg.min_strategy_bars
+            # 4. Evaluate strategies at bar i close (new orders rest for bar i+1+)
+            self._process_bar_strategies(
+                bar=bar,
+                bar_idx=i,
+                window=window,
+                indicators=indicators,
+                regime=regime_result,
+                strategy_mode=strategy_mode,
+            )
 
-                switched_this_tick = False
-                if raw_regime.switched and not locked:
-                    if raw_regime.regime == MarketRegime.TRENDING:
-                        if raw_regime.confidence >= self.cfg.confidence_threshold_trend:
-                            self._current_regime = raw_regime.regime
-                            self._last_switch_bar = i
-                            switched_this_tick = True
-                            self._regime_history.append((current_bar["timestamp"], raw_regime.score))
-                            # Grid persists — trend trades overlay on top, never cancel grid
-                    else:
-                        self._current_regime = raw_regime.regime
-                        self._last_switch_bar = i
-                        switched_this_tick = True
-                        self._regime_history.append((current_bar["timestamp"], raw_regime.score))
+            # 5. Mark-to-market equity
+            self._record_equity(bar, regime_result.regime, regime_result.score)
 
-                regime_result = RegimeResult(
-                    regime=self._current_regime,
-                    score=raw_score,
-                    factor_scores=None,
-                    confidence=raw_confidence,
-                    switched=switched_this_tick,
-                )
-
-            # Simulate fills on grid levels
-            self._check_grid_fills(current_bar)
-
-            # Generate and execute signals
-            self._process_tick(current_bar, indicators, regime_result, strategy_mode)
-
-            # Mark-to-market equity
-            self._record_equity(current_bar, indicators, regime_result)
-
-        # Close any remaining position at end of backtest
-        if self.position_qty > 0:
-            last_price = ohlcv[-1]["close"]
-            self._close_position(last_price, ohlcv[-1]["timestamp"], "end_of_backtest",
-                               strategy_mode)
-        # Unlock any remaining margin
-        if self.short_margin_locked > 0:
-            self.cash += self.short_margin_locked
-            self.short_margin_locked = 0.0
+        # End-of-backtest liquidation at final close
+        final_bar = ohlcv[-1]
+        self._last_close = final_bar["close"]
+        self._liquidate_all(final_bar["close"], final_bar["timestamp"], "end_of_backtest", strategy_mode)
+        if self.equity_curve:
+            eq = self._mark_to_market_equity(final_bar["close"])
+            self.equity_curve[-1].equity = eq
+            self.equity_curve[-1].cash = self.cash
+            self.equity_curve[-1].position_value = 0.0
 
         return self._calculate_performance(strategy_mode)
 
-    def _reset_state(self):
-        """Reset all state for a new run."""
-        self.cash = self.cfg.initial_capital
-        self.position_qty = 0.0
-        self.position_entry_price = 0.0
-        self.position_direction = "FLAT"
-        self.short_margin_locked = 0.0
-        self.trades = []
-        self.equity_curve = []
-        self._current_regime = MarketRegime.RANGING
-        self._trend_state = TrendState.flat(self.cfg.symbol)
-        self._last_switch_bar = 0
-        self._grid_config = None
-        self._active_grid_levels = {}
-        self._filled_grid_levels = {}
-        self._regime_history = []
-
     # ------------------------------------------------------------------
-    # Regime Overrides
+    # Conservative Order Matching (Next-Bar Fills Only)
     # ------------------------------------------------------------------
 
-    def _force_grid_regime(self, indicators: IndicatorBundle) -> RegimeResult:
-        return RegimeResult(
-            regime=MarketRegime.RANGING, score=0.0,
-            factor_scores=None, confidence=1.0, switched=False,
-        )
-
-    def _force_trend_regime(self, indicators: IndicatorBundle) -> RegimeResult:
-        return RegimeResult(
-            regime=MarketRegime.TRENDING, score=1.0,
-            factor_scores=None, confidence=1.0, switched=False,
-        )
-
-    # ------------------------------------------------------------------
-    # Per-Tick Processing
-    # ------------------------------------------------------------------
-
-    def _process_tick(
-        self, bar: Dict, indicators: IndicatorBundle,
-        regime: RegimeResult, strategy_mode: str,
-    ):
-        """Run one tick of the strategy."""
-        price = bar["close"]
-
-        if strategy_mode == "grid_only":
-            self._run_grid_strategy(bar, indicators, strategy_mode)
-        elif strategy_mode == "trend_only":
-            self._run_trend_strategy(bar, indicators, strategy_mode)
-        else:
-            # DUAL ENGINE: grid always runs. Trend only fires on strong ENTRY/EXIT.
-            self._run_grid_strategy(bar, indicators, strategy_mode)
-
-            if regime.is_trending and regime.confidence >= self.cfg.confidence_threshold_trend:
-                trend_signal = self._evaluate_trend(bar, indicators)
-                if trend_signal is not None:
-                    if trend_signal.action == SignalAction.START_TREND and self.position_qty == 0:
-                        self._execute_trend_trade(trend_signal, bar, indicators)
-                    elif trend_signal.action == SignalAction.STOP_TREND and self.position_qty > 0:
-                        self._execute_trend_trade(trend_signal, bar, indicators)
-
-    def _evaluate_trend(self, bar: Dict, indicators: IndicatorBundle):
-        """Evaluate trend strategy without modifying state. Returns signal or None."""
-        return self.trend.evaluate(
-            symbol=self.cfg.symbol,
-            current_price=bar["close"],
-            ema_fast_val=indicators.ema_fast,
-            ema_slow_val=indicators.ema_slow,
-            macd_hist=indicators.macd_hist,
-            atr=indicators.atr,
-            current_state=self._trend_state,
-            capital=self._get_equity(),
-        )
-
-    def _execute_trend_trade(self, signal, bar: Dict, indicators: IndicatorBundle):
-        """Execute a trend strategy signal (ENTRY or EXIT only)."""
-        price = bar["close"]
-        if signal.action == SignalAction.START_TREND:
-            direction = TrendDirection(signal.metadata["direction"])
-            target_qty = signal.metadata.get("position_size", 0)
-            if self.position_qty > 0:
-                needs_reverse = (
-                    (direction == TrendDirection.LONG and self.position_direction == "SHORT") or
-                    (direction == TrendDirection.SHORT and self.position_direction == "LONG")
-                )
-                if needs_reverse:
-                    self._close_position(price, bar["timestamp"], "trend_reversal", "regime_switch")
-                    new_side = "BUY" if direction == TrendDirection.LONG else "SELL"
-                    self._open_position(price, bar["timestamp"], new_side, target_qty, "regime_switch")
-            else:
-                side = "BUY" if direction == TrendDirection.LONG else "SELL"
-                self._open_position(price, bar["timestamp"], side, target_qty, "regime_switch")
-            self._trend_state = self.trend.update_state(
-                self._trend_state, signal, price, bar["timestamp"])
-        elif signal.action == SignalAction.STOP_TREND:
-            if self.position_qty > 0:
-                self._close_position(price, bar["timestamp"], "trend_exit", "regime_switch")
-                self._trend_state = TrendState.flat(self.cfg.symbol)
-
-    def _run_grid_strategy(self, bar: Dict, indicators: IndicatorBundle, mode: str):
-        """Execute grid strategy logic."""
-        price = bar["close"]
-
-        # Initialize grid if needed
-        if self._grid_config is None:
-            ref_price = self.grid.compute_rebalance_price(
-                [bar], window=1,
-            ) if price > 0 else price
-            self._grid_config = self.grid.compute_grid(
-                reference_price=ref_price,
-                symbol=self.cfg.symbol,
-                atr=indicators.atr,
-            )
-            self._arm_grid_levels()
-
-        # Check rebalance
-        elif self.grid.check_rebalance(price, self._grid_config):
-            # Cancel unfilled levels, keep filled ones tracking
-            self._cancel_unfilled_levels()
-            ref_price = price
-            self._grid_config = self.grid.compute_grid(
-                reference_price=ref_price,
-                symbol=self.cfg.symbol,
-                atr=indicators.atr,
-            )
-            self._arm_grid_levels()
-
-    def _run_trend_strategy(self, bar: Dict, indicators: IndicatorBundle, mode: str):
-        """Execute trend strategy logic."""
-        price = bar["close"]
-
-        # If we have an active grid, close it
-        if self._grid_config is not None:
-            self._cancel_unfilled_levels()
-            self._grid_config = None
-
-        signal = self.trend.evaluate(
-            symbol=self.cfg.symbol,
-            current_price=price,
-            ema_fast_val=indicators.ema_fast,
-            ema_slow_val=indicators.ema_slow,
-            macd_hist=indicators.macd_hist,
-            atr=indicators.atr,
-            current_state=self._trend_state,
-            capital=self._get_equity(),
-        )
-
-        if signal is None:
-            return
-
-        if signal.action == SignalAction.START_TREND:
-            direction = TrendDirection(signal.metadata["direction"])
-            target_qty = signal.metadata.get("position_size", 0)
-
-            if self.position_qty > 0:
-                # Already in a position — act if reversing (LONG→SHORT or SHORT→LONG)
-                needs_reverse = (
-                    (direction == TrendDirection.LONG and self.position_direction == "SHORT") or
-                    (direction == TrendDirection.SHORT and self.position_direction == "LONG")
-                )
-                if needs_reverse:
-                    self._close_position(price, bar["timestamp"], "trend_reversal", mode)
-                    new_side = "BUY" if direction == TrendDirection.LONG else "SELL"
-                    self._open_position(price, bar["timestamp"], new_side, target_qty, mode)
-                # Same direction → ignore (already in position)
-            else:
-                side = "BUY" if direction == TrendDirection.LONG else "SELL"
-                self._open_position(price, bar["timestamp"], side, target_qty, mode)
-
-            self._trend_state = self.trend.update_state(
-                self._trend_state, signal, price, bar["timestamp"],
-            )
-
-        elif signal.action == SignalAction.STOP_TREND:
-            if self.position_qty > 0:
-                self._close_position(price, bar["timestamp"],
-                                    signal.metadata.get("exit_reason", "signal"), mode)
-            self._trend_state = TrendState.flat(self.cfg.symbol)
-
-    # ------------------------------------------------------------------
-    # Grid Fill Simulation
-    # ------------------------------------------------------------------
-
-    def _arm_grid_levels(self):
-        """Place all grid limit orders (simulated)."""
-        if self._grid_config is None:
-            return
-        self._active_grid_levels = {}
-        for lvl in self._grid_config.levels:
-            self._active_grid_levels[lvl.level_index] = {
-                "side": lvl.side.value,
-                "price": lvl.price,
-                "quantity": lvl.quantity,
-                "tp_price": lvl.take_profit_price,
-            }
-
-    def _cancel_unfilled_levels(self):
-        """Cancel all unfilled grid orders."""
-        self._active_grid_levels = {}
-
-    def _check_grid_fills(self, bar: Dict):
-        """Check if any active grid levels were hit this candle."""
-        # Grid is long-only — don't interfere with short positions
-        if self.position_direction == "SHORT":
-            return
+    def _match_grid_orders(self, bar: Dict[str, Any], bar_idx: int, mode: str) -> None:
+        """
+        Match resting grid orders conservatively:
+          1) First check TP SELLs on lots entered on bar < bar_idx.
+          2) Then check resting BUY orders armed on bar < bar_idx.
+        A lot bought on bar_idx CANNOT sell on the same bar_idx.
+        """
         high, low = bar["high"], bar["low"]
+        ts = bar["timestamp"]
 
-        filled_indices = []
-        for idx, level in list(self._active_grid_levels.items()):
-            if level["side"] == "BUY" and low <= level["price"] <= high:
-                # Buy order filled
-                fill_price = level["price"]
-                cost = fill_price * level["quantity"]
+        # Step 1: Check TP sells on existing lots (entered on earlier bars)
+        remaining_lots: List[GridLot] = []
+        new_rebuys: List[GridBuyOrder] = []
+        for lot in self.grid_lots:
+            if lot.entry_bar < bar_idx and high >= lot.tp_price:
+                tp_px = lot.tp_price
+                revenue = tp_px * lot.quantity
+                exit_fee = revenue * self.cfg.fee_decimal
+                self.cash += revenue - exit_fee
+                pnl = (tp_px - lot.entry_price) * lot.quantity - lot.entry_fee - exit_fee
+                pnl_pct = (pnl / (lot.entry_price * lot.quantity)) * 100.0 if lot.entry_price > 0 else 0.0
+                self.trades.append(Trade(
+                    entry_time=lot.entry_time,
+                    exit_time=ts,
+                    symbol=self.cfg.symbol,
+                    side="SELL",
+                    strategy=f"{mode}:grid",
+                    entry_price=lot.entry_price,
+                    exit_price=tp_px,
+                    quantity=lot.quantity,
+                    pnl=pnl,
+                    pnl_pct=pnl_pct,
+                    fee=lot.entry_fee + exit_fee,
+                    exit_reason="grid_tp",
+                ))
+                self._consecutive_buys = 0
+                # Re-arm BUY at original entry price for bar_idx+1+ (grid cycling)
+                new_rebuys.append(GridBuyOrder(
+                    price=lot.entry_price,
+                    quantity=lot.quantity,
+                    tp_price=lot.tp_price,
+                    armed_bar=bar_idx,
+                ))
+            else:
+                remaining_lots.append(lot)
+        self.grid_lots = remaining_lots
+
+        # Step 2: Check resting BUY orders (armed on earlier bars)
+        remaining_buys: List[GridBuyOrder] = []
+        for order in self.grid_buy_orders:
+            if order.armed_bar < bar_idx and low <= order.price <= high:
+                cost = order.price * order.quantity
                 fee = cost * self.cfg.fee_decimal
                 if self.cash >= cost + fee:
                     self.cash -= cost + fee
-                    self.position_qty += level["quantity"]
-                    # Update avg entry price
-                    if self.position_qty > 0:
-                        old_value = (self.position_qty - level["quantity"]) * self.position_entry_price
-                        new_value = old_value + cost
-                        self.position_entry_price = new_value / self.position_qty
-                    self._filled_grid_levels[idx] = {
-                        "side": "BUY",
-                        "entry_price": fill_price,
-                        "quantity": level["quantity"],
-                        "tp_price": level["tp_price"],
-                    }
-                    filled_indices.append(idx)
-
-            elif level["side"] == "SELL" and low <= level["price"] <= high:
-                # Sell order filled (using existing position)
-                if self.position_qty >= level["quantity"]:
-                    fill_price = level["price"]
-                    revenue = fill_price * level["quantity"]
-                    fee = revenue * self.cfg.fee_decimal
-                    self.cash += revenue - fee
-                    self.position_qty -= level["quantity"]
-                    # Record trade
-                    pnl = (fill_price - self.position_entry_price) * level["quantity"] - fee
-                    pnl_pct = (fill_price / self.position_entry_price - 1) * 100
-                    self.trades.append(Trade(
-                        entry_time=bar["timestamp"], exit_time=bar["timestamp"],
-                        symbol=self.cfg.symbol, side="SELL", strategy=self._current_mode_name,
-                        entry_price=self.position_entry_price, exit_price=fill_price,
-                        quantity=level["quantity"], pnl=pnl, pnl_pct=pnl_pct, fee=fee,
-                        exit_reason="grid_tp",
+                    self.grid_lots.append(GridLot(
+                        entry_price=order.price,
+                        quantity=order.quantity,
+                        tp_price=order.tp_price,
+                        entry_fee=fee,
+                        entry_time=ts,
+                        entry_bar=bar_idx,
                     ))
-                    if self.position_qty < 0.001:
-                        self.position_qty = 0
-                        self.position_entry_price = 0
-                    filled_indices.append(idx)
+                    self._consecutive_buys += 1
+                    continue
+            remaining_buys.append(order)
 
-        for idx in filled_indices:
-            del self._active_grid_levels[idx]
+        self.grid_buy_orders = remaining_buys + new_rebuys
 
-        # Check TP on filled levels
-        filled_tp_indices = []
-        for idx, fill in list(self._filled_grid_levels.items()):
-            if fill["side"] == "BUY" and high >= fill["tp_price"]:
-                # TP hit — sell
-                tp_price = fill["tp_price"]
-                revenue = tp_price * fill["quantity"]
-                fee = revenue * self.cfg.fee_decimal
-                pnl = (tp_price - fill["entry_price"]) * fill["quantity"] - fee
-                pnl_pct = (tp_price / fill["entry_price"] - 1) * 100
-                self.cash += revenue - fee
-                self.position_qty -= fill["quantity"]
-                if self.position_qty < 0.001:
-                    self.position_qty = 0
-                    self.position_entry_price = 0
-                self.trades.append(Trade(
-                    entry_time=bar["timestamp"], exit_time=bar["timestamp"],
-                    symbol=self.cfg.symbol, side="SELL", strategy=self._current_mode_name,
-                    entry_price=fill["entry_price"], exit_price=tp_price,
-                    quantity=fill["quantity"], pnl=pnl, pnl_pct=pnl_pct, fee=fee,
-                    exit_reason="grid_tp",
-                ))
-                filled_tp_indices.append(idx)
-
-        for idx in filled_tp_indices:
-            del self._filled_grid_levels[idx]
-
-    # ------------------------------------------------------------------
-    # Position Management
-    # ------------------------------------------------------------------
-
-    def _open_position(self, price: float, timestamp: str, side: str, quantity: float, mode: str):
-        """
-        Open a new position. Handles both LONG and SHORT.
-
-        LONG:  Buy asset with cash. Cash decreases, position is positive.
-               P&L = exit_price - entry_price.
-
-        SHORT: Sell borrowed asset, receive cash, lock margin (110% of notional).
-               Cash increases on open, but margin is locked.
-               P&L = entry_price - exit_price.
-        """
-        if quantity <= 0 or price <= 0:
+    def _check_trend_intrabar_stop(self, bar: Dict[str, Any], bar_idx: int, mode: str) -> None:
+        """Check if exchange-side stop-loss / trailing stop was hit intrabar."""
+        if self.trend_pos is None or self.trend_pos.entry_bar >= bar_idx:
             return
-
-        # Cap position size: max_position_pct% of current equity
-        equity = self._get_equity()
-        max_notional = equity * (self.cfg.max_position_pct / 100.0)
-        notional = price * quantity
-        if notional > max_notional:
-            quantity = max_notional / price
-            notional = max_notional
-        fee = notional * self.cfg.fee_decimal
-        slippage = notional * self.cfg.slippage_decimal
-
-        if side.upper() == "BUY":
-            # ---- LONG: buy with cash ----
-            total_cost = notional + fee + slippage
-            if total_cost > self.cash:
-                quantity = self.cash / (price * (1 + self.cfg.fee_decimal + self.cfg.slippage_decimal))
-                notional = price * quantity
-                fee = notional * self.cfg.fee_decimal
-                slippage = notional * self.cfg.slippage_decimal
-                total_cost = notional + fee + slippage
-
-            self.cash -= total_cost
-            self.position_qty = quantity
-            self.position_direction = "LONG"
-            self.position_entry_price = price
-            self.short_margin_locked = 0.0
-
+        pos = self.trend_pos
+        if pos.direction == "LONG":
+            eff_stop = max(pos.stop_loss, pos.trailing_stop)
+            if eff_stop > 0 and bar["low"] <= eff_stop:
+                exit_px = min(bar["open"], eff_stop)  # gap-down conservative fill
+                reason = "trailing_stop_hit" if pos.trailing_stop > pos.stop_loss else "stop_loss_hit"
+                self._close_trend_position(exit_px, bar["timestamp"], reason, mode)
         else:
-            # ---- SHORT: sell borrowed asset, lock margin ----
-            # Margin requirement: 110% of notional (conservative)
-            margin_required = notional * 1.10
-            available = self.cash
-            if margin_required > available:
-                # Scale down
-                quantity = available / (price * 1.10 * (1 + self.cfg.fee_decimal + self.cfg.slippage_decimal))
-                notional = price * quantity
-                fee = notional * self.cfg.fee_decimal
-                slippage = notional * self.cfg.slippage_decimal
+            candidates = [p for p in (pos.stop_loss, pos.trailing_stop) if p > 0]
+            eff_stop = min(candidates) if candidates else 0.0
+            if eff_stop > 0 and bar["high"] >= eff_stop:
+                exit_px = max(bar["open"], eff_stop)
+                reason = "trailing_stop_hit" if (
+                    pos.trailing_stop > 0 and pos.trailing_stop < pos.stop_loss
+                ) else "stop_loss_hit"
+                self._close_trend_position(exit_px, bar["timestamp"], reason, mode)
 
-            # Receive cash from sale, lock margin
-            self.cash += notional  # receive sale proceeds
-            self.cash -= fee + slippage  # pay fees
-            self.short_margin_locked = notional * 1.10  # lock margin
-            self.position_qty = quantity
-            self.position_direction = "SHORT"
-            self.position_entry_price = price
+    # ------------------------------------------------------------------
+    # Strategy Evaluation (Mirrors main.py)
+    # ------------------------------------------------------------------
 
-    def _close_position(self, price: float, timestamp: str, reason: str, mode: str):
-        """
-        Close current position. Handles both LONG and SHORT.
+    def _process_bar_strategies(
+        self,
+        bar: Dict[str, Any],
+        bar_idx: int,
+        window: List[Dict[str, Any]],
+        indicators: IndicatorBundle,
+        regime: RegimeResult,
+        strategy_mode: str,
+    ) -> None:
+        live_eq = self._mark_to_market_equity(bar["close"])
+        self.grid.total_capital = max(1.0, live_eq * self.cfg.grid_capital_pct)
 
-        LONG close:  Sell asset → receive cash. P&L = exit - entry.
-        SHORT close: Buy back asset → return it, unlock margin. P&L = entry - exit.
-        """
-        if self.position_qty <= 0:
+        # ---- GRID ----
+        if strategy_mode in ("grid_only", "dual_engine"):
+            self._eval_grid(bar, bar_idx, window, indicators, regime, strategy_mode)
+
+        # ---- TREND ----
+        if strategy_mode in ("trend_only", "dual_engine"):
+            self._eval_trend(bar, bar_idx, window, indicators, regime, strategy_mode, live_eq)
+
+    def _eval_grid(
+        self,
+        bar: Dict[str, Any],
+        bar_idx: int,
+        window: List[Dict[str, Any]],
+        indicators: IndicatorBundle,
+        regime: RegimeResult,
+        mode: str,
+    ) -> None:
+        close = bar["close"]
+
+        # Grid stop-loss check
+        if self._grid_config is not None and self.grid.check_stop_loss(close, self._grid_config):
+            self.grid_buy_orders.clear()
+            self._liquidate_grid_lots(close, bar["timestamp"], "grid_stop_loss", mode)
+            self._grid_config = None
             return
-        notional = price * self.position_qty
-        fee = notional * self.cfg.fee_decimal
-        slippage = notional * self.cfg.slippage_decimal
 
-        if self.position_direction == "LONG":
-            # Sell the asset
-            net_revenue = notional - fee - slippage
-            pnl = net_revenue - (self.position_entry_price * self.position_qty)
-            pnl_pct = (price / self.position_entry_price - 1) * 100
+        strong_trend = (
+            mode == "dual_engine"
+            and regime.is_trending
+            and regime.confidence > self.cfg.confidence_threshold_trend
+        )
+        cb_triggered = self._consecutive_buys >= self.cfg.consecutive_buy_limit
+
+        if strong_trend and not self._trend_paused_grid and self._grid_config is not None:
+            self._trend_paused_grid = True
+        elif not strong_trend and self._trend_paused_grid:
+            self._trend_paused_grid = False
+            self._grid_config = None
+
+        if (strong_trend or cb_triggered) and self._grid_config is not None:
+            return
+
+        needs_deploy = self._grid_config is None
+        needs_rebalance = (
+            self._grid_config is not None
+            and (self.grid.check_rebalance(close, self._grid_config) or bar_idx % 144 == 0)
+        )
+
+        if needs_deploy or needs_rebalance:
+            ref_price = self.grid.compute_rebalance_price(window)
+            new_grid = self.grid.compute_grid(
+                reference_price=ref_price,
+                symbol=self.cfg.symbol,
+                atr=indicators.atr,
+                is_ranging=regime.is_ranging,
+                min_notional=float(self.symbol_info.min_notional),
+            )
+            signal = self.grid.generate_signal(new_grid)
+            meta = dict(signal.metadata)
+
+            if self.cfg.enforce_risk_guard:
+                verdict = self.risk_guard.check_signal(signal)
+                if verdict.is_blocked:
+                    return
+                if verdict.verdict == Verdict.MODIFIED and verdict.modified_params:
+                    meta.update(verdict.modified_params)
+
+            # Cancel unfilled BUY orders (preserve filled grid_lots waiting for TP)
+            self.grid_buy_orders = []
+            for lvl in meta.get("levels", []):
+                if lvl.get("side") != "BUY":
+                    continue
+                px = self.symbol_info.round_price(lvl["price"])
+                qty = self.symbol_info.floor_qty(lvl["quantity"])
+                tp = self.symbol_info.round_price(lvl["take_profit_price"])
+                if self.symbol_info.is_valid_order(px, qty) and tp > px:
+                    self.grid_buy_orders.append(
+                        GridBuyOrder(price=px, quantity=qty, tp_price=tp, armed_bar=bar_idx)
+                    )
+            self._grid_config = new_grid
+
+    def _eval_trend(
+        self,
+        bar: Dict[str, Any],
+        bar_idx: int,
+        window: List[Dict[str, Any]],
+        indicators: IndicatorBundle,
+        regime: RegimeResult,
+        mode: str,
+        live_eq: float,
+    ) -> None:
+        # Active trend positions are ALWAYS monitored for exits/trailing stops!
+        should_eval = self._trend_state.is_active or (
+            mode == "trend_only"
+            or (regime.is_trending and regime.confidence >= self.cfg.confidence_threshold_trend)
+        )
+        if not should_eval:
+            return
+
+        # Compute indicators on decoupled trend_interval (zero look-ahead)
+        if self._resample_factor > 1:
+            t_window = resample_ohlcv(window, self._resample_factor)
+            if len(t_window) < 28:
+                return
+            t_ind = compute_all(self.cfg.symbol, t_window)
+        else:
+            t_ind = indicators
+
+        if t_ind.atr <= 0 or t_ind.close <= 0:
+            return
+
+        trend_cap = live_eq * (1.0 if mode == "trend_only" else self.cfg.trend_capital_pct)
+        sig = self.trend.evaluate(
+            symbol=self.cfg.symbol,
+            current_price=bar["close"],
+            ema_fast_val=t_ind.ema_fast,
+            ema_slow_val=t_ind.ema_slow,
+            macd_hist=t_ind.macd_hist,
+            atr=t_ind.atr,
+            current_state=self._trend_state,
+            capital=trend_cap,
+        )
+        if sig is None:
+            return
+
+        meta = dict(sig.metadata)
+        if self.cfg.enforce_risk_guard:
+            verdict = self.risk_guard.check_signal(sig)
+            if verdict.is_blocked:
+                return
+            if verdict.verdict == Verdict.MODIFIED and verdict.modified_params:
+                meta.update(verdict.modified_params)
+
+        if sig.action == SignalAction.START_TREND and not self._trend_state.is_active:
+            direction = meta["direction"]
+            qty = self.symbol_info.floor_qty(meta.get("position_size", 0.0))
+            px = bar["close"]
+            if self.symbol_info.is_valid_order(px, qty):
+                opened = self._open_trend_position(
+                    direction=direction,
+                    price=px,
+                    qty=qty,
+                    stop_loss=meta.get("stop_loss", 0.0),
+                    trailing_stop=meta.get("trailing_stop", 0.0),
+                    timestamp=bar["timestamp"],
+                    bar_idx=bar_idx,
+                )
+                if opened:
+                    self._trend_state = self.trend.update_state(
+                        self._trend_state, sig, px, bar["timestamp"]
+                    )
+                    self._trend_state.position_size = self.trend_pos.quantity
+
+        elif sig.action == SignalAction.MODIFY_POSITION and self.trend_pos is not None:
+            new_trail = meta.get("new_trailing_stop", 0.0)
+            if new_trail > 0:
+                self.trend_pos.trailing_stop = new_trail
+                self._trend_state = self.trend.update_state(
+                    self._trend_state, sig, bar["close"], bar["timestamp"]
+                )
+
+        elif sig.action == SignalAction.STOP_TREND and self.trend_pos is not None:
+            self._close_trend_position(
+                bar["close"], bar["timestamp"], meta.get("exit_reason", "signal"), mode
+            )
+
+    # ------------------------------------------------------------------
+    # Trend Position Execution (Proper Cash & Margin Accounting)
+    # ------------------------------------------------------------------
+
+    def _open_trend_position(
+        self,
+        direction: str,
+        price: float,
+        qty: float,
+        stop_loss: float,
+        trailing_stop: float,
+        timestamp: str,
+        bar_idx: int,
+    ) -> bool:
+        if qty <= 0 or price <= 0:
+            return False
+
+        if direction == "LONG":
+            fill_px = price * (1.0 + self.cfg.slippage_decimal)
+            max_affordable = self.cash / (fill_px * (1.0 + self.cfg.fee_decimal))
+            qty = self.symbol_info.floor_qty(min(qty, max_affordable))
+            if not self.symbol_info.is_valid_order(fill_px, qty):
+                return False
+            notional = fill_px * qty
+            fee = notional * self.cfg.fee_decimal
+            self.cash -= notional + fee
+            self.trend_pos = TrendPosition(
+                direction="LONG",
+                quantity=qty,
+                entry_price=fill_px,
+                entry_fee=fee,
+                stop_loss=stop_loss,
+                trailing_stop=trailing_stop,
+                entry_time=timestamp,
+                entry_bar=bar_idx,
+            )
+            return True
+
+        elif direction == "SHORT" and self.cfg.allow_short:
+            fill_px = price * (1.0 - self.cfg.slippage_decimal)
+            # Deduct 100% notional margin + fee from cash (1x short, zero free money!)
+            max_affordable = self.cash / (fill_px * (1.0 + self.cfg.fee_decimal))
+            qty = self.symbol_info.floor_qty(min(qty, max_affordable))
+            if not self.symbol_info.is_valid_order(fill_px, qty):
+                return False
+            notional = fill_px * qty
+            fee = notional * self.cfg.fee_decimal
+            self.cash -= notional + fee  # lock margin + pay entry fee
+            self.trend_pos = TrendPosition(
+                direction="SHORT",
+                quantity=qty,
+                entry_price=fill_px,
+                entry_fee=fee,
+                stop_loss=stop_loss,
+                trailing_stop=trailing_stop,
+                entry_time=timestamp,
+                entry_bar=bar_idx,
+                margin_locked=notional,
+            )
+            return True
+
+        return False
+
+    def _close_trend_position(self, price: float, timestamp: str, reason: str, mode: str) -> None:
+        if self.trend_pos is None:
+            return
+        pos = self.trend_pos
+        if pos.direction == "LONG":
+            fill_px = price * (1.0 - self.cfg.slippage_decimal)
+            revenue = fill_px * pos.quantity
+            exit_fee = revenue * self.cfg.fee_decimal
+            self.cash += revenue - exit_fee
+            pnl = (fill_px - pos.entry_price) * pos.quantity - pos.entry_fee - exit_fee
+            pnl_pct = (pnl / (pos.entry_price * pos.quantity)) * 100.0 if pos.entry_price > 0 else 0.0
             trade_side = "SELL"
-
-            self.cash += net_revenue
-
         else:
-            # SHORT: Buy back to cover
-            buyback_cost = notional + fee + slippage
-            pnl = (self.position_entry_price * self.position_qty) - notional - fee - slippage
-            pnl_pct = (self.position_entry_price / price - 1) * 100 if price > 0 else 0
+            fill_px = price * (1.0 + self.cfg.slippage_decimal)
+            buyback = fill_px * pos.quantity
+            exit_fee = buyback * self.cfg.fee_decimal
+            gross_pnl = (pos.entry_price - fill_px) * pos.quantity
+            # Return locked margin + gross PnL - exit fee
+            self.cash += pos.margin_locked + gross_pnl - exit_fee
+            pnl = gross_pnl - pos.entry_fee - exit_fee
+            pnl_pct = (pnl / (pos.entry_price * pos.quantity)) * 100.0 if pos.entry_price > 0 else 0.0
             trade_side = "BUY"
 
-            self.cash -= buyback_cost
-            self.cash += self.short_margin_locked  # Unlock margin
-
         self.trades.append(Trade(
-            entry_time="", exit_time=timestamp,
+            entry_time=pos.entry_time,
+            exit_time=timestamp,
             symbol=self.cfg.symbol,
             side=trade_side,
-            strategy=mode,
-            entry_price=self.position_entry_price,
-            exit_price=price,
-            quantity=self.position_qty,
+            strategy=f"{mode}:trend",
+            entry_price=pos.entry_price,
+            exit_price=fill_px,
+            quantity=pos.quantity,
             pnl=pnl,
             pnl_pct=pnl_pct,
-            fee=fee,
+            fee=pos.entry_fee + exit_fee,
             exit_reason=reason,
         ))
+        self.risk_guard.register_trade_result(pnl)
+        self.trend_pos = None
+        self._trend_state = TrendState.flat(self.cfg.symbol)
 
-        self.position_qty = 0.0
-        self.position_entry_price = 0.0
-        self.position_direction = "FLAT"
-        self.short_margin_locked = 0.0
+    def _liquidate_grid_lots(self, price: float, timestamp: str, reason: str, mode: str) -> None:
+        fill_px = price * (1.0 - self.cfg.slippage_decimal)
+        for lot in self.grid_lots:
+            revenue = fill_px * lot.quantity
+            exit_fee = revenue * self.cfg.fee_decimal
+            self.cash += revenue - exit_fee
+            pnl = (fill_px - lot.entry_price) * lot.quantity - lot.entry_fee - exit_fee
+            pnl_pct = (pnl / (lot.entry_price * lot.quantity)) * 100.0 if lot.entry_price > 0 else 0.0
+            self.trades.append(Trade(
+                entry_time=lot.entry_time,
+                exit_time=timestamp,
+                symbol=self.cfg.symbol,
+                side="SELL",
+                strategy=f"{mode}:grid",
+                entry_price=lot.entry_price,
+                exit_price=fill_px,
+                quantity=lot.quantity,
+                pnl=pnl,
+                pnl_pct=pnl_pct,
+                fee=lot.entry_fee + exit_fee,
+                exit_reason=reason,
+            ))
+        self.grid_lots.clear()
 
-    # ------------------------------------------------------------------
-    # Equity Tracking
-    # ------------------------------------------------------------------
+    def _liquidate_all(self, price: float, timestamp: str, reason: str, mode: str) -> None:
+        self.grid_buy_orders.clear()
+        self._liquidate_grid_lots(price, timestamp, reason, mode)
+        self._close_trend_position(price, timestamp, reason, mode)
 
-    @property
-    def _current_mode_name(self) -> str:
-        """Helper for trade tagging."""
-        return "backtest"
-
-    def _get_equity(self) -> float:
-        """
-        Current total equity.
-        LONG: equity = cash + position_value
-        SHORT: equity = cash + short_margin_locked - position_liability
-               (unrealized P&L is built into this)
-        """
-        pos_value = self.position_qty * self.position_entry_price
-        if self.position_direction == "SHORT":
-            return self.cash + self.short_margin_locked - pos_value
-        else:
-            return self.cash + pos_value
-
-    def _record_equity(self, bar: Dict, indicators: IndicatorBundle, regime: RegimeResult):
-        """Record equity point with correct short position valuation."""
-        pos_value = self.position_qty * bar["close"]
-        if self.position_direction == "SHORT":
-            # For shorts: equity rises as price drops
-            equity = self.cash + self.short_margin_locked - pos_value
-        else:
-            equity = self.cash + pos_value
-
+    def _record_equity(self, bar: Dict[str, Any], regime: MarketRegime, score: float) -> None:
+        eq = self._mark_to_market_equity(bar["close"])
         self.equity_curve.append(EquityPoint(
             timestamp=bar["timestamp"],
-            equity=equity,
-            position_value=pos_value,
+            equity=eq,
+            position_value=eq - self.cash,
             cash=self.cash,
-            regime=regime.regime.value,
-            regime_score=regime.score,
+            regime=regime.value,
+            regime_score=score,
         ))
 
     # ------------------------------------------------------------------
-    # Performance Calculation
+    # Performance Metrics (Corrected)
     # ------------------------------------------------------------------
 
     def _calculate_performance(self, strategy_name: str) -> PerformanceReport:
-        """Compute all performance metrics from trade history and equity curve."""
         initial = self.cfg.initial_capital
         final = self.equity_curve[-1].equity if self.equity_curve else initial
+        total_return = (final / initial - 1.0) * 100.0
 
-        # Basic stats
-        total_return = (final / initial - 1) * 100
         wins = [t for t in self.trades if t.pnl > 0]
         losses = [t for t in self.trades if t.pnl <= 0]
         total_pnl = sum(t.pnl for t in self.trades)
-        win_rate = len(wins) / len(self.trades) * 100 if self.trades else 0
-        avg_win = sum(t.pnl for t in wins) / len(wins) if wins else 0
-        avg_loss = sum(t.pnl for t in losses) / len(losses) if losses else 0
+        win_rate = len(wins) / len(self.trades) * 100.0 if self.trades else 0.0
+        avg_win = sum(t.pnl for t in wins) / len(wins) if wins else 0.0
+        avg_loss = sum(t.pnl for t in losses) / len(losses) if losses else 0.0
         gross_profit = sum(t.pnl for t in wins)
         gross_loss = abs(sum(t.pnl for t in losses))
-        profit_factor = gross_profit / gross_loss if gross_loss > 0 else float("inf")
+        profit_factor = gross_profit / gross_loss if gross_loss > 0 else (float("inf") if gross_profit > 0 else 0.0)
 
-        # Sharpe ratio (from equity curve returns)
+        # Bar-to-bar returns for Sharpe & Sortino
+        periods_per_year = (365 * 24 * 60) / max(1, _interval_to_minutes(self.cfg.interval))
         returns = []
         for i in range(1, len(self.equity_curve)):
             prev_eq = self.equity_curve[i - 1].equity
             if prev_eq > 0:
-                returns.append((self.equity_curve[i].equity / prev_eq) - 1)
-        if returns and len(returns) > 1:
+                returns.append((self.equity_curve[i].equity / prev_eq) - 1.0)
+
+        if len(returns) > 1:
             mean_ret = sum(returns) / len(returns)
-            std_ret = (sum((r - mean_ret) ** 2 for r in returns) / (len(returns) - 1)) ** 0.5
-            # Annualize: 5-min candles → 12*24*365 = 105120 periods/year
-            sharpe = (mean_ret / std_ret * (105120 ** 0.5)) if std_ret > 0 else 0.0
-            # Sortino: only downside deviation
+            var = sum((r - mean_ret) ** 2 for r in returns) / (len(returns) - 1)
+            std_ret = var ** 0.5
+            sharpe = (mean_ret / std_ret * (periods_per_year ** 0.5)) if std_ret > 0 else 0.0
+
             downside = [r for r in returns if r < 0]
-            if downside and len(downside) > 1:
-                mean_down = sum(downside) / len(downside)
-                std_down = (sum((r - mean_down) ** 2 for r in downside) / (len(downside) - 1)) ** 0.5
-                sortino = (mean_ret / std_down * (105120 ** 0.5)) if std_down > 0 else 0.0
+            if len(downside) > 1:
+                down_var = sum(r ** 2 for r in downside) / len(downside)
+                std_down = down_var ** 0.5
+                sortino = (mean_ret / std_down * (periods_per_year ** 0.5)) if std_down > 0 else 0.0
             else:
                 sortino = 0.0
         else:
             sharpe, sortino = 0.0, 0.0
 
-        # Max drawdown
+        # Max drawdown & duration (hours)
         peak = initial
         max_dd = 0.0
-        dd_start = None
-        max_dd_duration = 0.0
+        dd_start_ts: Optional[datetime] = None
+        max_dd_duration_hours = 0.0
         for pt in self.equity_curve:
-            if pt.equity > peak:
+            pt_ts = datetime.fromisoformat(pt.timestamp)
+            if pt.equity >= peak:
                 peak = pt.equity
-                dd_start = None
-            dd = (peak - pt.equity) / peak * 100
-            if dd > max_dd:
-                max_dd = dd
-            if dd > 0 and dd_start is None:
-                dd_start = pt.timestamp
+                dd_start_ts = None
+            else:
+                dd = (peak - pt.equity) / peak * 100.0
+                if dd > max_dd:
+                    max_dd = dd
+                if dd_start_ts is None:
+                    dd_start_ts = pt_ts
+                dur_h = (pt_ts - dd_start_ts).total_seconds() / 3600.0
+                if dur_h > max_dd_duration_hours:
+                    max_dd_duration_hours = dur_h
 
-        # Calmar ratio
-        calmar = abs(total_return) / max_dd if max_dd > 0 else 0.0
+        # Signed Calmar ratio (negative return -> negative Calmar!)
+        calmar = (total_return / max_dd) if max_dd > 0 else 0.0
 
-        # Trade frequency & holding time
-        if self.trades:
+        # Trade frequency & average holding hours
+        avg_trades_per_day = 0.0
+        avg_holding_hours = 0.0
+        if self.equity_curve and len(self.equity_curve) >= 2:
             first_ts = datetime.fromisoformat(self.equity_curve[0].timestamp)
             last_ts = datetime.fromisoformat(self.equity_curve[-1].timestamp)
-            days = (last_ts - first_ts).total_seconds() / 86400
-            avg_trades_per_day = len(self.trades) / days if days > 0 else 0
-        else:
-            avg_trades_per_day = 0
+            days = (last_ts - first_ts).total_seconds() / 86400.0
+            if days > 0:
+                avg_trades_per_day = len(self.trades) / days
 
-        # Regime stats
+        hold_hours = []
+        for t in self.trades:
+            if t.entry_time and t.exit_time:
+                try:
+                    dt = (
+                        datetime.fromisoformat(t.exit_time) - datetime.fromisoformat(t.entry_time)
+                    ).total_seconds() / 3600.0
+                    hold_hours.append(max(0.0, dt))
+                except Exception:
+                    pass
+        if hold_hours:
+            avg_holding_hours = sum(hold_hours) / len(hold_hours)
+
         grid_ticks = sum(1 for pt in self.equity_curve if pt.regime == "RANGING")
         trend_ticks = sum(1 for pt in self.equity_curve if pt.regime == "TRENDING")
         total_ticks = len(self.equity_curve)
-        pct_grid = grid_ticks / total_ticks * 100 if total_ticks > 0 else 0
-        pct_trend = trend_ticks / total_ticks * 100 if total_ticks > 0 else 0
+        pct_grid = grid_ticks / total_ticks * 100.0 if total_ticks > 0 else 0.0
+        pct_trend = trend_ticks / total_ticks * 100.0 if total_ticks > 0 else 0.0
 
         return PerformanceReport(
             symbol=self.cfg.symbol,
@@ -849,48 +1001,44 @@ class BacktestEngine:
             avg_loss=avg_loss,
             profit_factor=profit_factor,
             max_drawdown_pct=max_dd,
-            max_drawdown_duration_hours=max_dd_duration,
+            max_drawdown_duration_hours=max_dd_duration_hours,
             sharpe_ratio=sharpe,
             sortino_ratio=sortino,
             calmar_ratio=calmar,
             avg_trades_per_day=avg_trades_per_day,
-            avg_holding_hours=0,
-            regime_switches=len([1 for i in range(1, len(self._regime_history))
-                                 if self._regime_history[i][0] != self._regime_history[i-1][0]]),
+            avg_holding_hours=avg_holding_hours,
+            regime_switches=self._regime_switches,
             pct_time_grid=pct_grid,
             pct_time_trend=pct_trend,
         )
 
 
 # ============================================================================
-# Main Runner
+# CLI Runner
 # ============================================================================
 
-def load_ohlcv(filepath: str) -> List[Dict]:
-    """Load OHLCV data from JSON file."""
-    with open(filepath, "r") as f:
-        data = json.load(f)
-    return data
+def load_ohlcv(filepath: str) -> List[Dict[str, Any]]:
+    with open(filepath, "r", encoding="utf-8") as f:
+        return json.load(f)
 
 
-def run_comparison(symbols: List[str], capital: float = 10000.0, data_file: str = "data/sampled_10k.json"):
-    """Run full comparison across symbols and strategies using sampled data."""
-    strategies = ["grid_only", "trend_only", "regime_switch"]
+def run_comparison(
+    symbols: List[str],
+    capital: float = 100.0,
+    trend_interval: str = "15m",
+    data_file: str = "data/sampled_10k.json",
+) -> Dict[str, Dict[str, PerformanceReport]]:
+    strategies = ["grid_only", "trend_only", "dual_engine"]
     all_reports: Dict[str, Dict[str, PerformanceReport]] = {}
 
-    # Load combined sampled data
-    if os.path.exists(data_file):
-        with open(data_file, "r") as f:
+    all_ohlcv: Dict[str, List[Dict[str, Any]]] = {}
+    for sym in symbols:
+        fp = f"data/{sym}_5m.json"
+        if os.path.exists(fp):
+            all_ohlcv[sym] = load_ohlcv(fp)
+    if not all_ohlcv and os.path.exists(data_file):
+        with open(data_file, "r", encoding="utf-8") as f:
             all_ohlcv = json.load(f)
-        print(f"Using sampled data: {data_file} "
-              f"({sum(len(v) for v in all_ohlcv.values())} total candles)")
-    else:
-        # Fallback: load individual files
-        all_ohlcv = {}
-        for symbol in symbols:
-            fp = f"data/{symbol}_5m.json"
-            if os.path.exists(fp):
-                all_ohlcv[symbol] = load_ohlcv(fp)
 
     for symbol in symbols:
         if symbol not in all_ohlcv:
@@ -898,81 +1046,35 @@ def run_comparison(symbols: List[str], capital: float = 10000.0, data_file: str 
             continue
 
         ohlcv = all_ohlcv[symbol]
-        print(f"  Loaded {len(ohlcv)} candles")
-        print(f"  Range: {ohlcv[0]['timestamp'][:10]} → {ohlcv[-1]['timestamp'][:10]}")
-        print(f"  Price: ${ohlcv[0]['close']:.2f} → ${ohlcv[-1]['close']:.2f}")
-        pct_change = (ohlcv[-1]['close'] / ohlcv[0]['close'] - 1) * 100
-        print(f"  B&H: {pct_change:+.2f}%")
+        pct_change = (ohlcv[-1]["close"] / ohlcv[0]["close"] - 1.0) * 100.0
+        print(f"\n{'='*70}")
+        print(f"  {symbol} | {len(ohlcv)} bars | Capital: ${capital:.2f} | Trend TF: {trend_interval}")
+        print(f"  Range: {ohlcv[0]['timestamp'][:10]} → {ohlcv[-1]['timestamp'][:10]} | B&H: {pct_change:+.2f}%")
+        print(f"{'='*70}")
 
-        symbol_reports = {}
+        symbol_reports: Dict[str, PerformanceReport] = {}
         for strategy in strategies:
-            cfg = BacktestConfig(symbol=symbol, initial_capital=capital)
+            cfg = BacktestConfig(
+                symbol=symbol,
+                initial_capital=capital,
+                trend_interval=trend_interval,
+            )
             engine = BacktestEngine(cfg)
             report = engine.run(ohlcv, strategy_mode=strategy)
             symbol_reports[strategy] = report
-            strategy_label = {"grid_only": "GRID ONLY", "trend_only": "TREND ONLY",
-                            "regime_switch": "REGIME SWITCH"}[strategy]
-            print(f"\n  [{strategy_label}]")
+            print(f"\n  [{strategy.upper()}]")
             print(report.summary())
 
         all_reports[symbol] = symbol_reports
-
-    # =========================================================================
-    # Final Comparison Table
-    # =========================================================================
-    print(f"\n\n{'='*90}")
-    print("  FINAL COMPARISON")
-    print(f"{'='*90}")
-
-    for metric_name, fmt in [
-        ("total_return_pct", "Return %"),
-        ("sharpe_ratio", "Sharpe"),
-        ("max_drawdown_pct", "Max DD %"),
-        ("win_rate_pct", "Win Rate %"),
-        ("profit_factor", "Profit Factor"),
-        ("calmar_ratio", "Calmar"),
-        ("total_trades", "Trades"),
-    ]:
-        print(f"\n  --- {fmt} ---")
-        header = f"  {'Symbol':<12}"
-        for s in strategies:
-            header += f"  {s.replace('_',' ').title():>16}"
-        print(header)
-        print("  " + "-" * 60)
-        for symbol in symbols:
-            if symbol not in all_reports:
-                continue
-            row = f"  {symbol:<12}"
-            for strategy in strategies:
-                val = getattr(all_reports[symbol][strategy], metric_name)
-                if isinstance(val, float):
-                    row += f"  {val:>16.2f}"
-                else:
-                    row += f"  {str(val):>16}"
-            print(row)
-
-    # Winner determination
-    print(f"\n  --- WINNER ---")
-    print(f"  {'Symbol':<12}  {'Best Strategy':<20}  {'Return':>10}  {'Sharpe':>8}")
-    print("  " + "-" * 55)
-    for symbol in symbols:
-        if symbol not in all_reports:
-            continue
-        best = max(strategies, key=lambda s: all_reports[symbol][s].sharpe_ratio)
-        r = all_reports[symbol][best]
-        print(f"  {symbol:<12}  {best.replace('_',' ').title():<20}  "
-              f"{r.total_return_pct:>+9.2f}%  {r.sharpe_ratio:>8.2f}")
 
     return all_reports
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="OpenQuant Backtest Engine")
-    parser.add_argument("--symbol", type=str, default=None,
-                       help="Single symbol to backtest (default: all)")
-    parser.add_argument("--capital", type=float, default=10000.0,
-                       help="Initial capital in USDT")
+    parser = argparse.ArgumentParser(description="OpenQuant Conservative Spot Backtest Engine")
+    parser.add_argument("--symbol", type=str, default="DOGEUSDT", help="Symbol to backtest")
+    parser.add_argument("--capital", type=float, default=100.0, help="Initial capital in USDT")
+    parser.add_argument("--trend-interval", type=str, default="15m", help="Trend timeframe (5m, 15m, 1h)")
     args = parser.parse_args()
 
-    symbols = [args.symbol] if args.symbol else ["BTCUSDT", "ETHUSDT", "SOLUSDT"]
-    run_comparison(symbols, capital=args.capital)
+    run_comparison([args.symbol], capital=args.capital, trend_interval=args.trend_interval)
