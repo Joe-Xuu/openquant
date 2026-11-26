@@ -311,6 +311,7 @@ class GridStrategy:
         strategy_id: str = "grid_v1",
         min_profit_after_fees_pct: float = 0.1,
         estimated_fee_pct: float = 0.1,
+        spot_mode: bool = False,
     ):
         """
         Initialize the grid strategy engine.
@@ -330,8 +331,9 @@ class GridStrategy:
                                      reference, trigger a grid recomputation.
             strategy_id: Identifier for signal tagging.
             min_profit_after_fees_pct: Minimum net profit after estimated fees.
-                                       If a level can't achieve this, raise error.
             estimated_fee_pct: Estimated round-trip fee (e.g., 0.1% for 2 * 0.05%).
+            spot_mode: If True (Binance Spot long-only), allocate 90% of total_capital
+                       to the BUY ladder instead of splitting 45%/45% with unused SELLs.
         """
         if grid_type not in ("arithmetic", "geometric"):
             raise ValueError(f"grid_type must be 'arithmetic' or 'geometric', got '{grid_type}'")
@@ -364,14 +366,15 @@ class GridStrategy:
         self.strategy_id = strategy_id
         self.min_profit_after_fees_pct = min_profit_after_fees_pct
         self.estimated_fee_pct = estimated_fee_pct
-        # Equal allocation per level (decay=1.0) — industry standard.
-        # Each grid level has the same profit potential. In ranging markets,
-        # all levels oscillate equally; biasing capital toward distant levels
-        # (decay > 1.0) starves near levels and leaves the grid hanging far
-        # from current price, waiting for moves that rarely come.
+        self.spot_mode = spot_mode
         self.pyramid_decay: float = 1.0
         # Grid stop-loss: emergency-close if price drops this far below lower_bound
         self.grid_stop_loss_pct: float = 5.0
+
+    @property
+    def _buy_side_capital(self) -> float:
+        """Quote capital allocated to BUY levels (90% in Spot, 45% in two-sided mode)."""
+        return self.total_capital * (0.90 if self.spot_mode else 0.45)
 
     # ------------------------------------------------------------------
     # Grid Computation
@@ -414,7 +417,7 @@ class GridStrategy:
                     adaptive_levels = max(2, self.grid_levels - 1)
             # Compute max levels where the smallest level still gets >= min_notional * 1.05
             min_level_cap = max(1.0, min_notional * 1.05)
-            side_cap = self.total_capital * 0.45
+            side_cap = self._buy_side_capital
             max_n = 1
             for n in range(1, 21):
                 weights = [self.pyramid_decay ** i for i in range(n)]
@@ -487,12 +490,13 @@ class GridStrategy:
         # Allocation per side
         weights = [self.pyramid_decay ** i for i in range(n)]
         total_weight = sum(weights)
-        side_capital = self.total_capital * 0.45
+        sell_side_capital = self.total_capital * 0.45
+        buy_side_capital = self._buy_side_capital
 
         # --- Sell levels (above reference) ---
         for i in range(1, n + 1):
             price = reference_price * (k_sell ** i)
-            capital_for_level = side_capital * weights[i - 1] / total_weight
+            capital_for_level = sell_side_capital * weights[i - 1] / total_weight
             quantity = capital_for_level / price
             tp_price = price * (1.0 - self.profit_per_grid_pct / 100.0)
 
@@ -507,7 +511,7 @@ class GridStrategy:
         # --- Buy levels (below reference) ---
         for i in range(1, n + 1):
             price = reference_price / (k_buy ** i)
-            capital_for_level = side_capital * weights[i - 1] / total_weight
+            capital_for_level = buy_side_capital * weights[i - 1] / total_weight
             quantity = capital_for_level / price
             tp_price = price * (1.0 + self.profit_per_grid_pct / 100.0)
 
@@ -537,12 +541,13 @@ class GridStrategy:
 
         weights = [self.pyramid_decay ** i for i in range(n)]
         total_weight = sum(weights)
-        side_capital = self.total_capital * 0.45
+        sell_side_capital = self.total_capital * 0.45
+        buy_side_capital = self._buy_side_capital
 
         # --- Sell levels ---
         for i in range(1, n + 1):
             price = reference_price + i * step_sell
-            capital_for_level = side_capital * weights[i - 1] / total_weight
+            capital_for_level = sell_side_capital * weights[i - 1] / total_weight
             quantity = capital_for_level / price
             tp_price = price * (1.0 - self.profit_per_grid_pct / 100.0)
 
@@ -557,7 +562,7 @@ class GridStrategy:
         # --- Buy levels ---
         for i in range(1, n + 1):
             price = reference_price - i * step_buy
-            capital_for_level = side_capital * weights[i - 1] / total_weight
+            capital_for_level = buy_side_capital * weights[i - 1] / total_weight
             quantity = capital_for_level / price
             tp_price = price * (1.0 + self.profit_per_grid_pct / 100.0)
 

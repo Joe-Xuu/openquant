@@ -120,6 +120,7 @@ class RiskGuard:
         equity_provider: Callable[[], float],
         positions_provider: Callable[[], List[Dict[str, Any]]],
         trade_history_provider: Callable[[str], List[Dict[str, Any]]],
+        clock: Optional[Callable[[], datetime]] = None,
     ):
         """
         Initialize the risk guard.
@@ -128,9 +129,9 @@ class RiskGuard:
             config: Risk configuration dict (from settings.json → "risk").
             equity_provider: Callable that returns current total equity.
             positions_provider: Callable that returns list of open positions.
-            trade_history_provider: Callable that returns recent trades (for
-                                    drawdown/circuit breaker calculation).
-                                    Args: symbol (or "ALL").
+            trade_history_provider: Callable that returns recent trades.
+            clock: Optional UTC clock provider (defaults to datetime.now(timezone.utc);
+                   injected with bar timestamp in backtests).
         """
         self.max_drawdown_pct = config.get("max_drawdown_pct", 15.0)
         self.max_daily_loss_pct = config.get("max_daily_loss_pct", 5.0)
@@ -146,10 +147,11 @@ class RiskGuard:
         self.cb_volatility_multiplier = cb_config.get("volatility_spike_multiplier", 3.0)
         self.cb_cooldown_minutes = cb_config.get("cooldown_minutes", 30)
 
-        # Dependency injection: ledger access
+        # Dependency injection: ledger access & clock
         self._equity_provider = equity_provider
         self._positions_provider = positions_provider
         self._trade_history_provider = trade_history_provider
+        self._clock = clock or (lambda: datetime.now(timezone.utc))
 
         # State tracking
         self._circuit_breaker = CircuitBreakerState(
@@ -161,7 +163,7 @@ class RiskGuard:
         self._initial_capital: float = initial_eq
         self._daily_start_equity: float = initial_eq
         self._today_pnl: float = 0.0
-        self._today_date: str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        self._today_date: str = self._clock().strftime("%Y-%m-%d")
 
     def sync_baseline(self, equity: float) -> None:
         """
@@ -249,16 +251,6 @@ class RiskGuard:
     # ------------------------------------------------------------------
 
     def _check_circuit_breaker(self) -> Optional[RiskVerdict]:
-        """
-        Check if the circuit breaker is tripped.
-
-        The circuit breaker pauses trading when:
-            - N consecutive losing trades (configurable, default 5).
-            - Extreme volatility spike detected.
-
-        When tripped, all new positions are blocked for cooldown_minutes.
-        CLOSE_ALL / STOP_* signals still pass through.
-        """
         cb = self._circuit_breaker
 
         if not cb.triggered:
@@ -268,7 +260,7 @@ class RiskGuard:
         if cb.triggered_at:
             triggered_dt = datetime.fromisoformat(cb.triggered_at)
             cooldown_seconds = cb.cooldown_minutes * 60
-            elapsed = (datetime.now(timezone.utc) - triggered_dt).total_seconds()
+            elapsed = (self._clock() - triggered_dt).total_seconds()
             if elapsed >= cooldown_seconds:
                 # Reset circuit breaker
                 cb.triggered = False
@@ -292,7 +284,7 @@ class RiskGuard:
         Resets daily baseline at midnight UTC.
         """
         current_equity = self._equity_provider()
-        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        today = self._clock().strftime("%Y-%m-%d")
         if today != self._today_date:
             self._today_date = today
             self._today_pnl = 0.0
@@ -511,16 +503,9 @@ class RiskGuard:
         if cb.consecutive_losses >= cb.max_consecutive_losses:
             cb.triggered = True
             cb.trigger_reason = f"{cb.consecutive_losses} consecutive losses"
-            cb.triggered_at = datetime.now(timezone.utc).isoformat()
+            cb.triggered_at = self._clock().isoformat()
 
     def register_volatility_spike(self, current_vol: float, historical_vol: float) -> None:
-        """
-        Check for volatility spikes and trip circuit breaker if detected.
-
-        Args:
-            current_vol: Current volatility (e.g., ATR/price %).
-            historical_vol: Average historical volatility.
-        """
         if historical_vol <= 0:
             return
 
@@ -531,7 +516,7 @@ class RiskGuard:
                 f"Volatility spike: {ratio:.1f}× average (current={current_vol:.4f}, "
                 f"avg={historical_vol:.4f})"
             )
-            self._circuit_breaker.triggered_at = datetime.now(timezone.utc).isoformat()
+            self._circuit_breaker.triggered_at = self._clock().isoformat()
 
     def update_peak_equity(self) -> None:
         """Update the peak equity tracker (called periodically)."""

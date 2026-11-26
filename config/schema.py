@@ -38,8 +38,8 @@ class TradingConfig(BaseModel):
     symbols: List[str] = Field(default_factory=lambda: ["DOGEUSDT"], min_length=1)
     base_quote_asset: str = "USDT"
     fallback_equity: float = Field(default=100.0, gt=0.0)
-    grid_capital_pct: float = Field(default=0.70, gt=0.0, le=1.0)
-    trend_capital_pct: float = Field(default=0.25, ge=0.0, le=1.0)
+    grid_capital_pct: float = Field(default=0.45, gt=0.0, le=1.0)
+    trend_capital_pct: float = Field(default=0.50, ge=0.0, le=1.0)
     max_positions_per_symbol: int = Field(default=1, ge=1)
     max_total_positions: int = Field(default=5, ge=1)
     order_timeout_seconds: int = Field(default=30, ge=5)
@@ -81,14 +81,30 @@ class RegimeDetectionConfig(BaseModel):
     volatility_percentile_high: float = Field(default=75.0, ge=0.0, le=100.0)
 
 
+class MacroFilterConfig(BaseModel):
+    enabled: bool = True
+    interval: str = "1h"
+    ema_fast: int = Field(default=50, ge=5)
+    ema_slow: int = Field(default=200, ge=20)
+    pause_grid_in_bear: bool = True
+    close_grid_in_bear: bool = True
+
+    @model_validator(mode="after")
+    def validate_macro_emas(self) -> MacroFilterConfig:
+        if self.ema_fast >= self.ema_slow:
+            raise ValueError(f"macro ema_fast ({self.ema_fast}) must be < ema_slow ({self.ema_slow})")
+        return self
+
+
 class GridTradingConfig(BaseModel):
     type: Literal["geometric", "arithmetic"] = "geometric"
-    upper_bound_pct: float = Field(default=5.0, gt=0.0)
-    lower_bound_pct: float = Field(default=5.0, gt=0.0)
-    grid_levels: int = Field(default=8, ge=1, le=50)
-    profit_per_grid_pct: float = Field(default=1.0, gt=0.2)
+    upper_bound_pct: float = Field(default=6.0, gt=0.0)
+    lower_bound_pct: float = Field(default=6.0, gt=0.0)
+    grid_levels: int = Field(default=5, ge=1, le=50)
+    profit_per_grid_pct: float = Field(default=1.8, gt=0.2)
     rebalance_threshold_pct: float = Field(default=5.0, gt=0.0)
-    stop_loss_pct: float = Field(default=5.0, gt=0.0)
+    stop_loss_pct: float = Field(default=8.0, gt=0.0)
+    spot_mode: bool = True
 
 
 class TrendFollowingConfig(BaseModel):
@@ -96,9 +112,12 @@ class TrendFollowingConfig(BaseModel):
     ema_slow: int = Field(default=26, ge=3)
     macd_signal: int = Field(default=9, ge=2)
     atr_period: int = Field(default=14, ge=2)
-    atr_multiplier: float = Field(default=2.0, gt=0.0)
-    trailing_stop_atr_multiplier: float = Field(default=3.0, gt=0.0)
-    risk_per_trade_pct: float = Field(default=1.0, gt=0.0, le=10.0)
+    atr_multiplier: float = Field(default=2.5, gt=0.0)
+    trailing_stop_atr_multiplier: float = Field(default=4.0, gt=0.0)
+    risk_per_trade_pct: float = Field(default=2.5, gt=0.0, le=10.0)
+    min_adx: float = Field(default=20.0, ge=0.0, le=100.0)
+    require_macd_confirm: bool = True
+    exit_on_ema_cross: bool = False
     allow_short: bool = False
 
     @model_validator(mode="after")
@@ -129,6 +148,7 @@ class MultiFactorConfig(BaseModel):
 
 class StrategyConfig(BaseModel):
     mode: str = "parallel_dual_engine"
+    macro_filter: MacroFilterConfig = Field(default_factory=MacroFilterConfig)
     regime_detection: RegimeDetectionConfig = Field(default_factory=RegimeDetectionConfig)
     grid_trading: GridTradingConfig = Field(default_factory=GridTradingConfig)
     trend_following: TrendFollowingConfig = Field(default_factory=TrendFollowingConfig)
@@ -138,7 +158,7 @@ class StrategyConfig(BaseModel):
 class DataConfig(BaseModel):
     kline_intervals: List[str] = Field(default_factory=lambda: ["5m", "15m", "1h"])
     primary_interval: str = "5m"
-    trend_interval: str = "15m"
+    trend_interval: str = "1h"
     max_klines_per_request: int = Field(default=500, ge=50, le=1000)
     ws_reconnect_delay_seconds: float = Field(default=5.0, ge=1.0)
     indicator_cache_ttl_seconds: int = Field(default=60, ge=1)
@@ -179,6 +199,9 @@ class AppConfig(BaseModel):
     def enforce_spot_rules(self) -> AppConfig:
         if self.exchange.market == "spot":
             self.strategy.trend_following.allow_short = False
+        macro_iv = self.strategy.macro_filter.interval
+        if self.strategy.macro_filter.enabled and macro_iv not in self.data.kline_intervals:
+            self.data.kline_intervals.append(macro_iv)
         return self
 
 

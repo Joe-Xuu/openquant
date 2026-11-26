@@ -36,11 +36,17 @@ from typing import Any, Dict, List, Optional, Tuple
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from data.indicators import compute_all, IndicatorBundle
+from data.indicators import compute_all, compute_all_series, ema as compute_ema, IndicatorBundle
 from execution.exchange_client import SymbolInfo
 from risk.risk_guard import RiskGuard, Verdict
 from strategy.grid_strategy import GridConfig, GridStrategy
-from strategy.regime_detector import MarketRegime, RegimeDetector, RegimeResult
+from strategy.regime_detector import (
+    MacroTrend,
+    MarketRegime,
+    RegimeDetector,
+    RegimeResult,
+    classify_macro_trend,
+)
 from strategy.signal import SignalAction, StrategySignal
 from strategy.trend_strategy import TrendDirection, TrendState, TrendStrategy
 
@@ -54,10 +60,10 @@ class BacktestConfig:
     """Backtest parameters aligned with live Binance Spot settings."""
     symbol: str = "DOGEUSDT"
     interval: str = "5m"
-    trend_interval: str = "15m"  # "5m", "15m", "1h"
+    trend_interval: str = "1h"   # "5m", "15m", "1h"
     initial_capital: float = 100.0
-    grid_capital_pct: float = 0.70
-    trend_capital_pct: float = 0.25
+    grid_capital_pct: float = 0.45
+    trend_capital_pct: float = 0.50
     fee_pct: float = 0.10        # 0.10% per side (Binance Spot standard)
     slippage_pct: float = 0.05   # 0.05% on market orders
     max_position_pct: float = 75.0
@@ -67,12 +73,29 @@ class BacktestConfig:
     warmup_candles: int = 100
     confidence_threshold_trend: float = 0.80
     lookback_candles: int = 300
-    grid_upper_pct: float = 5.0
-    grid_lower_pct: float = 5.0
-    grid_levels: int = 8
-    grid_profit_pct: float = 1.0
+    grid_upper_pct: float = 6.0
+    grid_lower_pct: float = 6.0
+    grid_levels: int = 5
+    grid_profit_pct: float = 1.8
     grid_rebalance_pct: float = 5.0
-    grid_stop_loss_pct: float = 5.0
+    grid_stop_loss_pct: float = 8.0
+    spot_mode: bool = True
+    liquidate_grid_on_stop_loss: bool = False
+    # Macro 1h trend filter (EMA50 vs EMA200)
+    use_macro_filter: bool = True
+    macro_ema_fast: int = 50
+    macro_ema_slow: int = 200
+    pause_grid_in_macro_bear: bool = True
+    close_grid_on_macro_bear: bool = True
+    grid_lot_stop_loss_pct: float = 0.0  # Optional per-lot hard stop-loss % (0 = disabled)
+    # Trend v2 parameters (Chandelier trailing stop + ADX/MACD quality filters)
+    trend_atr_mult: float = 2.5
+    trend_trail_mult: float = 4.0
+    trend_risk_pct: float = 2.5
+    trend_min_adx: float = 20.0
+    trend_require_macd: bool = True
+    trend_exit_on_ema_cross: bool = False
+    trend_gate_by_regime: bool = False  # When False, 1h macro + ADX/MACD gate trend directly
     allow_short: bool = False    # Spot default: long-only
     consecutive_buy_limit: int = 5
     enforce_risk_guard: bool = True
@@ -291,6 +314,7 @@ class BacktestEngine:
             profit_per_grid_pct=config.grid_profit_pct,
             total_capital=config.initial_capital * config.grid_capital_pct,
             rebalance_threshold_pct=config.grid_rebalance_pct,
+            spot_mode=config.spot_mode,
         )
         self.grid.grid_stop_loss_pct = config.grid_stop_loss_pct
 
@@ -299,10 +323,13 @@ class BacktestEngine:
             ema_slow=26,
             macd_signal_period=9,
             atr_period=14,
-            atr_multiplier=2.0,
-            trailing_stop_atr_multiplier=3.0,
-            risk_per_trade_pct=1.0,
+            atr_multiplier=config.trend_atr_mult,
+            trailing_stop_atr_multiplier=config.trend_trail_mult,
+            risk_per_trade_pct=config.trend_risk_pct,
             allow_short=config.allow_short,
+            min_adx=config.trend_min_adx,
+            require_macd_confirm=config.trend_require_macd,
+            exit_on_ema_cross=config.trend_exit_on_ema_cross,
         )
 
         self.regime_detector = RegimeDetector(
@@ -330,6 +357,8 @@ class BacktestEngine:
         self._consecutive_buys: int = 0
         self._trend_paused_grid: bool = False
         self._regime_switches: int = 0
+        self._grid_retry_after_bar: int = 0
+        self._current_bar_dt: datetime = datetime(2020, 1, 1, tzinfo=timezone.utc)
 
         self.risk_guard = RiskGuard(
             config={
@@ -342,6 +371,7 @@ class BacktestEngine:
             equity_provider=self._mark_to_market_equity,
             positions_provider=self._risk_positions,
             trade_history_provider=lambda s: [],
+            clock=lambda: self._current_bar_dt,
         )
 
     # ------------------------------------------------------------------
@@ -397,26 +427,47 @@ class BacktestEngine:
         if strategy_mode == "regime_switch":
             strategy_mode = "dual_engine"
 
-        L = self.cfg.lookback_candles
         n = len(ohlcv)
         if n <= self.cfg.warmup_candles:
             return self._calculate_performance(strategy_mode)
 
+        # Strictly causal O(N) indicator precomputation (index i depends ONLY on bars 0..i)
+        primary_indicators = compute_all_series(self.cfg.symbol, ohlcv)
+        if self._resample_factor > 1:
+            htf_bars = resample_ohlcv(ohlcv, self._resample_factor)
+            htf_indicators = compute_all_series(self.cfg.symbol, htf_bars)
+        else:
+            htf_indicators = primary_indicators
+
+        # Causal 1h macro EMA50 / EMA200 precomputation
+        macro_factor = max(1, 60 // max(1, _interval_to_minutes(self.cfg.interval)))
+        bars_1h = resample_ohlcv(ohlcv, macro_factor) if macro_factor > 1 else ohlcv
+        closes_1h = [b["close"] for b in bars_1h]
+        macro_ef = compute_ema(closes_1h, self.cfg.macro_ema_fast)
+        macro_es = compute_ema(closes_1h, self.cfg.macro_ema_slow)
+
         for i in range(self.cfg.warmup_candles, n):
             bar = ohlcv[i]
             self._last_close = bar["close"]
+            self._current_bar_dt = datetime.fromisoformat(bar["timestamp"])
 
             # 1. Process resting orders & intrabar stops on bar i (orders armed on bar < i)
             self._match_grid_orders(bar, bar_idx=i, mode=strategy_mode)
             self._check_trend_intrabar_stop(bar, bar_idx=i, mode=strategy_mode)
 
-            # 2. Compute indicators on window ending at bar i (zero future data)
-            start = max(0, i - L + 1)
-            window = ohlcv[start:i + 1]
-            indicators = compute_all(self.cfg.symbol, window)
+            # Update TrendState peak price intrabar for Chandelier stop accuracy
+            if self.trend_pos is not None and self.trend_pos.direction == "LONG":
+                if bar["high"] > self._trend_state.highest_price:
+                    self._trend_state.highest_price = bar["high"]
+
+            # 2. Fetch causal indicators at bar i (zero future data)
+            indicators = primary_indicators[i]
             if indicators.atr <= 0 or indicators.close <= 0:
                 self._record_equity(bar, self._current_regime, 0.5)
                 continue
+
+            # Small slice for RegimeDetector volatility percentile & 3-bar microstructure
+            reg_win = ohlcv[max(0, i - 25):i + 1]
 
             # 3. Regime detection
             if strategy_mode == "grid_only":
@@ -431,7 +482,7 @@ class BacktestEngine:
                 )
             else:
                 regime_result = self.regime_detector.detect(
-                    ohlcv=window,
+                    ohlcv=reg_win,
                     current_regime=self._current_regime,
                     adx=indicators.adx,
                     plus_di=indicators.plus_di,
@@ -446,13 +497,34 @@ class BacktestEngine:
                     self._regime_switches += 1
                 self._current_regime = regime_result.regime
 
+            # Strictly causal HTF indicator: only use last COMPLETED higher-timeframe bar
+            if self._resample_factor > 1:
+                htf_idx = (i // self._resample_factor) - (0 if (i + 1) % self._resample_factor == 0 else 1)
+                t_ind = htf_indicators[htf_idx] if htf_idx >= 26 else None
+            else:
+                t_ind = indicators
+
+            # Strictly causal 1h macro trend classification
+            if self.cfg.use_macro_filter:
+                m_idx = (i // macro_factor) - (0 if (i + 1) % macro_factor == 0 else 1)
+                if m_idx >= self.cfg.macro_ema_fast:
+                    macro_trend = classify_macro_trend(
+                        bar["close"], macro_ef[m_idx], macro_es[m_idx]
+                    )
+                else:
+                    macro_trend = MacroTrend.NEUTRAL
+            else:
+                macro_trend = MacroTrend.NEUTRAL
+
             # 4. Evaluate strategies at bar i close (new orders rest for bar i+1+)
             self._process_bar_strategies(
                 bar=bar,
                 bar_idx=i,
-                window=window,
+                window=reg_win,
                 indicators=indicators,
+                trend_indicators=t_ind,
                 regime=regime_result,
+                macro_trend=macro_trend,
                 strategy_mode=strategy_mode,
             )
 
@@ -485,10 +557,33 @@ class BacktestEngine:
         high, low = bar["high"], bar["low"]
         ts = bar["timestamp"]
 
-        # Step 1: Check TP sells on existing lots (entered on earlier bars)
+        # Step 1: Check TP sells & optional per-lot stop-loss on existing lots (entered on earlier bars)
         remaining_lots: List[GridLot] = []
         new_rebuys: List[GridBuyOrder] = []
+        lot_sl_mult = (1.0 - self.cfg.grid_lot_stop_loss_pct / 100.0) if self.cfg.grid_lot_stop_loss_pct > 0 else 0.0
         for lot in self.grid_lots:
+            if lot.entry_bar < bar_idx and lot_sl_mult > 0 and low <= lot.entry_price * lot_sl_mult:
+                sl_px = min(bar["open"], lot.entry_price * lot_sl_mult) * (1.0 - self.cfg.slippage_decimal)
+                revenue = sl_px * lot.quantity
+                exit_fee = revenue * self.cfg.fee_decimal
+                self.cash += revenue - exit_fee
+                pnl = (sl_px - lot.entry_price) * lot.quantity - lot.entry_fee - exit_fee
+                pnl_pct = (pnl / (lot.entry_price * lot.quantity)) * 100.0 if lot.entry_price > 0 else 0.0
+                self.trades.append(Trade(
+                    entry_time=lot.entry_time,
+                    exit_time=ts,
+                    symbol=self.cfg.symbol,
+                    side="SELL",
+                    strategy=f"{mode}:grid",
+                    entry_price=lot.entry_price,
+                    exit_price=sl_px,
+                    quantity=lot.quantity,
+                    pnl=pnl,
+                    pnl_pct=pnl_pct,
+                    fee=lot.entry_fee + exit_fee,
+                    exit_reason="grid_lot_sl",
+                ))
+                continue
             if lot.entry_bar < bar_idx and high >= lot.tp_price:
                 tp_px = lot.tp_price
                 revenue = tp_px * lot.quantity
@@ -575,19 +670,24 @@ class BacktestEngine:
         bar_idx: int,
         window: List[Dict[str, Any]],
         indicators: IndicatorBundle,
+        trend_indicators: Optional[IndicatorBundle],
         regime: RegimeResult,
+        macro_trend: MacroTrend,
         strategy_mode: str,
     ) -> None:
         live_eq = self._mark_to_market_equity(bar["close"])
-        self.grid.total_capital = max(1.0, live_eq * self.cfg.grid_capital_pct)
+        grid_inv = sum(l.quantity * bar["close"] for l in self.grid_lots)
+        grid_budget_pct = 1.0 if strategy_mode == "grid_only" else self.cfg.grid_capital_pct
+        avail_grid_cap = max(0.0, live_eq * grid_budget_pct - grid_inv)
+        self.grid.total_capital = avail_grid_cap
 
         # ---- GRID ----
         if strategy_mode in ("grid_only", "dual_engine"):
-            self._eval_grid(bar, bar_idx, window, indicators, regime, strategy_mode)
+            self._eval_grid(bar, bar_idx, window, indicators, regime, macro_trend, strategy_mode)
 
         # ---- TREND ----
         if strategy_mode in ("trend_only", "dual_engine"):
-            self._eval_trend(bar, bar_idx, window, indicators, regime, strategy_mode, live_eq)
+            self._eval_trend(bar, bar_idx, trend_indicators, regime, macro_trend, strategy_mode, live_eq)
 
     def _eval_grid(
         self,
@@ -596,15 +696,27 @@ class BacktestEngine:
         window: List[Dict[str, Any]],
         indicators: IndicatorBundle,
         regime: RegimeResult,
+        macro_trend: MacroTrend,
         mode: str,
     ) -> None:
         close = bar["close"]
 
+        # Macro bear filter: cancel resting BUY orders & optionally close underwater bags
+        if self.cfg.use_macro_filter and self.cfg.pause_grid_in_macro_bear and macro_trend == MacroTrend.BEAR:
+            if self.grid_buy_orders:
+                self.grid_buy_orders.clear()
+            if self.cfg.close_grid_on_macro_bear and self.grid_lots:
+                self._liquidate_grid_lots(close, bar["timestamp"], "macro_bear_exit", mode)
+            self._grid_config = None
+            return
+
         # Grid stop-loss check
         if self._grid_config is not None and self.grid.check_stop_loss(close, self._grid_config):
             self.grid_buy_orders.clear()
-            self._liquidate_grid_lots(close, bar["timestamp"], "grid_stop_loss", mode)
+            if self.cfg.liquidate_grid_on_stop_loss:
+                self._liquidate_grid_lots(close, bar["timestamp"], "grid_stop_loss", mode)
             self._grid_config = None
+            self._grid_retry_after_bar = bar_idx + 24  # 2h cooldown after stop-loss
             return
 
         strong_trend = (
@@ -623,6 +735,14 @@ class BacktestEngine:
         if (strong_trend or cb_triggered) and self._grid_config is not None:
             return
 
+        if bar_idx < self._grid_retry_after_bar:
+            return
+
+        # Don't attempt deploy if remaining grid cash is below min_notional
+        min_notional = float(self.symbol_info.min_notional)
+        if self.grid.total_capital < min_notional * 1.15:
+            return
+
         needs_deploy = self._grid_config is None
         needs_rebalance = (
             self._grid_config is not None
@@ -636,7 +756,7 @@ class BacktestEngine:
                 symbol=self.cfg.symbol,
                 atr=indicators.atr,
                 is_ranging=regime.is_ranging,
-                min_notional=float(self.symbol_info.min_notional),
+                min_notional=min_notional,
             )
             signal = self.grid.generate_signal(new_grid)
             meta = dict(signal.metadata)
@@ -644,6 +764,7 @@ class BacktestEngine:
             if self.cfg.enforce_risk_guard:
                 verdict = self.risk_guard.check_signal(signal)
                 if verdict.is_blocked:
+                    self._grid_retry_after_bar = bar_idx + 12  # wait 1h before retrying
                     return
                 if verdict.verdict == Verdict.MODIFIED and verdict.modified_params:
                     meta.update(verdict.modified_params)
@@ -666,31 +787,29 @@ class BacktestEngine:
         self,
         bar: Dict[str, Any],
         bar_idx: int,
-        window: List[Dict[str, Any]],
-        indicators: IndicatorBundle,
+        t_ind: Optional[IndicatorBundle],
         regime: RegimeResult,
+        macro_trend: MacroTrend,
         mode: str,
         live_eq: float,
     ) -> None:
+        if t_ind is None or t_ind.atr <= 0 or t_ind.close <= 0:
+            return
+
         # Active trend positions are ALWAYS monitored for exits/trailing stops!
-        should_eval = self._trend_state.is_active or (
-            mode == "trend_only"
-            or (regime.is_trending and regime.confidence >= self.cfg.confidence_threshold_trend)
-        )
+        if self._trend_state.is_active:
+            should_eval = True
+        elif self.cfg.trend_gate_by_regime and mode == "dual_engine":
+            should_eval = regime.is_trending and regime.confidence >= self.cfg.confidence_threshold_trend
+        else:
+            should_eval = True
+
         if not should_eval:
             return
 
-        # Compute indicators on decoupled trend_interval (zero look-ahead)
-        if self._resample_factor > 1:
-            t_window = resample_ohlcv(window, self._resample_factor)
-            if len(t_window) < 28:
-                return
-            t_ind = compute_all(self.cfg.symbol, t_window)
-        else:
-            t_ind = indicators
-
-        if t_ind.atr <= 0 or t_ind.close <= 0:
-            return
+        macro_bullish: Optional[bool] = None
+        if self.cfg.use_macro_filter:
+            macro_bullish = (macro_trend == MacroTrend.BULL)
 
         trend_cap = live_eq * (1.0 if mode == "trend_only" else self.cfg.trend_capital_pct)
         sig = self.trend.evaluate(
@@ -702,6 +821,8 @@ class BacktestEngine:
             atr=t_ind.atr,
             current_state=self._trend_state,
             capital=trend_cap,
+            adx=t_ind.adx,
+            macro_bullish=macro_bullish,
         )
         if sig is None:
             return
@@ -716,8 +837,10 @@ class BacktestEngine:
 
         if sig.action == SignalAction.START_TREND and not self._trend_state.is_active:
             direction = meta["direction"]
-            qty = self.symbol_info.floor_qty(meta.get("position_size", 0.0))
+            # Cap trend notional to trend_cap so it stays strictly within its capital bucket
             px = bar["close"]
+            max_bucket_qty = trend_cap / (px * (1.0 + self.cfg.fee_decimal + self.cfg.slippage_decimal))
+            qty = self.symbol_info.floor_qty(min(meta.get("position_size", 0.0), max_bucket_qty))
             if self.symbol_info.is_valid_order(px, qty):
                 opened = self._open_trend_position(
                     direction=direction,

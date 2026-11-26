@@ -80,6 +80,7 @@ class TrendState:
     entry_ema_slow: float = 0.0
     entry_macd_hist: float = 0.0
     entry_atr: float = 0.0
+    highest_price: float = 0.0  # Peak favorable price since entry (Chandelier stop)
 
     @property
     def is_active(self) -> bool:
@@ -98,6 +99,7 @@ class TrendState:
             "entry_ema_slow": self.entry_ema_slow,
             "entry_macd_hist": self.entry_macd_hist,
             "entry_atr": self.entry_atr,
+            "highest_price": self.highest_price,
         }
 
     @classmethod
@@ -112,29 +114,8 @@ class TrendState:
 
 class TrendStrategy:
     """
-    Compute trend-following entry/exit signals.
-
-    This is a PURE COMPUTATION engine. It receives indicator values and
-    returns StrategySignal objects. It performs NO I/O.
-
-    USAGE:
-        engine = TrendStrategy(
-            ema_fast=12, ema_slow=26, macd_signal=9,
-            atr_period=14, atr_multiplier=2.0, trailing_stop_atr_multiplier=3.0,
-        )
-
-        # On each tick:
-        signal = engine.evaluate(
-            symbol="BTCUSDT",
-            current_price=97500.0,
-            ema_fast=97400.0,
-            ema_slow=97100.0,
-            macd_hist=150.0,
-            atr=1200.0,
-            current_state=state,
-        )
-        if signal:
-            state = engine.update_state(state, signal, current_price)
+    Compute trend-following entry/exit signals with Chandelier trailing stops
+    and optional ADX / MACD / macro-trend quality filters.
     """
 
     def __init__(
@@ -143,28 +124,16 @@ class TrendStrategy:
         ema_slow: int = 26,
         macd_signal_period: int = 9,
         atr_period: int = 14,
-        atr_multiplier: float = 2.0,
-        trailing_stop_atr_multiplier: float = 3.0,
-        risk_per_trade_pct: float = 1.0,
+        atr_multiplier: float = 2.5,
+        trailing_stop_atr_multiplier: float = 3.5,
+        risk_per_trade_pct: float = 1.5,
         min_risk_reward_ratio: float = 1.5,
-        strategy_id: str = "trend_v1",
+        strategy_id: str = "trend_v2",
         allow_short: bool = False,
+        min_adx: float = 20.0,
+        require_macd_confirm: bool = True,
+        exit_on_ema_cross: bool = False,
     ):
-        """
-        Initialize the trend-following strategy.
-
-        Args:
-            ema_fast: Fast EMA period (default 12).
-            ema_slow: Slow EMA period (default 26).
-            macd_signal_period: MACD signal line period (default 9).
-            atr_period: ATR lookback period (default 14).
-            atr_multiplier: Stop-loss distance in ATR multiples (default 2.0).
-            trailing_stop_atr_multiplier: Trailing stop distance (default 3.0).
-            risk_per_trade_pct: % of capital to risk per trade (default 1.0%).
-            min_risk_reward_ratio: Minimum reward/risk for entry (default 1.5).
-            strategy_id: Identifier for signal tagging.
-            allow_short: Enable SHORT entries (False for Spot markets).
-        """
         self.ema_fast = ema_fast
         self.ema_slow = ema_slow
         self.macd_signal_period = macd_signal_period
@@ -175,6 +144,9 @@ class TrendStrategy:
         self.min_risk_reward_ratio = min_risk_reward_ratio
         self.strategy_id = strategy_id
         self.allow_short = allow_short
+        self.min_adx = min_adx
+        self.require_macd_confirm = require_macd_confirm
+        self.exit_on_ema_cross = exit_on_ema_cross
 
     # ------------------------------------------------------------------
     # Core Signal Evaluation
@@ -190,54 +162,37 @@ class TrendStrategy:
         atr: float,
         current_state: TrendState,
         capital: float = 10000.0,
+        adx: Optional[float] = None,
+        macro_bullish: Optional[bool] = None,
     ) -> Optional[StrategySignal]:
         """
         Evaluate whether to enter, exit, or adjust a trend position.
-
-        This is the MAIN entry point. Call on every tick with the latest
-        indicator values.
-
-        Args:
-            symbol: Trading pair.
-            current_price: Latest mid-price.
-            ema_fast_val: Current fast EMA value.
-            ema_slow_val: Current slow EMA value.
-            macd_hist: Current MACD histogram value.
-            atr: Current ATR value.
-            current_state: Current TrendState for this symbol.
-            capital: Available capital for position sizing.
-
-        Returns:
-            A StrategySignal if action is required, None otherwise.
         """
         if atr <= 0 or current_price <= 0:
             return None
 
-        # --- Determine market bias ---
-        # EMA alignment indicates direction
         ema_bullish = ema_fast_val > ema_slow_val
-        # MACD histogram confirms momentum
         macd_bullish = macd_hist > 0
 
-        # ---- Flat-market detection ----
-        # When EMAs are essentially equal AND MACD is near zero, the market
-        # has no clear direction — don't enter.
-        # Threshold: EMA difference < 0.05% of price AND |MACD hist| < ATR * 0.01
         ema_pct_diff = abs(ema_fast_val - ema_slow_val) / current_price * 100 if current_price > 0 else 0
         macd_negligible = abs(macd_hist) < atr * 0.01
         is_flat = ema_pct_diff < 0.05 and macd_negligible
 
-        # Entry signals: EMA direction is the primary signal. MACD provides
-        # extra confidence but is NOT required. The regime detector's 5-factor
-        # scoring already filters out false trends (confidence > 0.80 required
-        # in main.py). Requiring both EMA AND MACD made entries too rare.
-        strong_bullish = ema_bullish and not is_flat
-        strong_bearish = (not ema_bullish) and not is_flat
-        # Score: higher when both indicators agree (for signal priority)
+        if self.require_macd_confirm:
+            strong_bullish = ema_bullish and macd_bullish and not is_flat
+            strong_bearish = (not ema_bullish) and (not macd_bullish) and not is_flat
+        else:
+            strong_bullish = ema_bullish and not is_flat
+            strong_bearish = (not ema_bullish) and not is_flat
+
         _entry_score = 0.85 if (ema_bullish == macd_bullish) else 0.70
 
-        # --- State-dependent logic ---
         if not current_state.is_active:
+            # Quality gates for new entries
+            if adx is not None and adx < self.min_adx:
+                return None
+            if strong_bullish and macro_bullish is False:
+                return None
             return self._evaluate_entry(
                 symbol, current_price, atr, strong_bullish, strong_bearish,
                 ema_fast_val, ema_slow_val, macd_hist, capital, _entry_score,
@@ -246,6 +201,7 @@ class TrendStrategy:
             return self._evaluate_exit_or_adjust(
                 symbol, current_price, atr, strong_bullish, strong_bearish,
                 current_state, ema_fast_val, ema_slow_val, macd_hist, capital,
+                macro_bullish=macro_bullish,
             )
 
     def _evaluate_entry(
@@ -261,12 +217,6 @@ class TrendStrategy:
         capital: float,
         entry_score: float = 0.70,
     ) -> Optional[StrategySignal]:
-        """
-        Check entry conditions when flat (no position).
-
-        LONG entry:  strong_bullish (EMA crossover up + MACD > 0)
-        SHORT entry: strong_bearish (only when allow_short=True)
-        """
         if strong_bullish:
             direction = TrendDirection.LONG
             stop_loss = price - self.atr_multiplier * atr
@@ -276,14 +226,12 @@ class TrendStrategy:
             stop_loss = price + self.atr_multiplier * atr
             trailing_stop = price + self.trailing_stop_atr_multiplier * atr
         else:
-            return None  # No clear direction (or shorting disabled in Spot)
+            return None
 
-        # --- Risk/reward check ---
         stop_distance_pct = abs(price - stop_loss) / price * 100
         if stop_distance_pct < 0.1:
-            return None  # Stop too close — market noise will trigger it
+            return None
 
-        # --- Position sizing (Kelly-style, volatility-adjusted) ---
         risk_amount = capital * (self.risk_per_trade_pct / 100.0)
         position_size = risk_amount / abs(price - stop_loss) if abs(price - stop_loss) > 0 else 0.0
 
@@ -320,27 +268,28 @@ class TrendStrategy:
         ema_slow_val: float,
         macd_hist: float,
         capital: float,
+        macro_bullish: Optional[bool] = None,
     ) -> Optional[StrategySignal]:
         """
         Check exit/adjust conditions when a position is active.
 
-        EXIT conditions (in priority order):
-            1. Price hits stop-loss or trailing stop → immediate exit
-            2. Trend reversal (opposite strong signal) → exit (or reverse if allow_short)
-            3. Trailing stop ratchet up/down → MODIFY_POSITION
-            4. EMA cross against position → exit
+        EXIT priority:
+            1. Stop-loss or Chandelier trailing stop hit -> immediate exit
+            2. Chandelier trailing stop ratchet (based on highest favorable price) -> MODIFY_POSITION
+            3. Optional EMA reversal exit (only if exit_on_ema_cross=True or macro turned bearish)
         """
-        # --- Check stop-loss & trailing stop hit ---
         if state.direction == TrendDirection.LONG:
             effective_stop = max(state.stop_loss_price, state.trailing_stop_price)
             if effective_stop > 0 and price <= effective_stop:
                 reason = "trailing_stop_hit" if state.trailing_stop_price > state.stop_loss_price else "stop_loss_hit"
                 return self._generate_exit_signal(symbol, state, price, reason)
-            # Update trailing stop (ratchet up only)
-            new_trail = price - self.trailing_stop_atr_multiplier * atr
+
+            # Chandelier trailing stop anchored to highest price since entry
+            peak = max(state.highest_price or state.entry_price, price)
+            new_trail = peak - self.trailing_stop_atr_multiplier * atr
             if new_trail > state.trailing_stop_price and new_trail > state.stop_loss_price:
                 return self._generate_adjust_stop_signal(
-                    symbol, state, price, new_trail, atr
+                    symbol, state, price, new_trail, atr, highest_price=peak
                 )
 
         elif state.direction == TrendDirection.SHORT:
@@ -351,37 +300,28 @@ class TrendStrategy:
                     state.trailing_stop_price > 0 and state.trailing_stop_price < state.stop_loss_price
                 ) else "stop_loss_hit"
                 return self._generate_exit_signal(symbol, state, price, reason)
-            # Update trailing stop (ratchet down only)
             new_trail = price + self.trailing_stop_atr_multiplier * atr
             if (state.trailing_stop_price <= 0 or new_trail < state.trailing_stop_price) and new_trail < state.stop_loss_price:
                 return self._generate_adjust_stop_signal(
                     symbol, state, price, new_trail, atr
                 )
 
-        # --- Check trend reversal ---
-        if state.direction == TrendDirection.LONG and strong_bearish:
-            if self.allow_short:
+        # Only exit on EMA cross if explicitly enabled (lets Chandelier stop ride big bull trends)
+        if self.exit_on_ema_cross:
+            if state.direction == TrendDirection.LONG and strong_bearish:
+                if self.allow_short:
+                    return self._generate_reverse_signal(
+                        symbol, state, price, atr, TrendDirection.SHORT,
+                        ema_fast_val, ema_slow_val, macd_hist, capital,
+                    )
+                return self._generate_exit_signal(symbol, state, price, "trend_reversal")
+            elif state.direction == TrendDirection.SHORT and strong_bullish:
                 return self._generate_reverse_signal(
-                    symbol, state, price, atr, TrendDirection.SHORT,
+                    symbol, state, price, atr, TrendDirection.LONG,
                     ema_fast_val, ema_slow_val, macd_hist, capital,
                 )
-            return self._generate_exit_signal(symbol, state, price, "trend_reversal")
-        elif state.direction == TrendDirection.SHORT and strong_bullish:
-            return self._generate_reverse_signal(
-                symbol, state, price, atr, TrendDirection.LONG,
-                ema_fast_val, ema_slow_val, macd_hist, capital,
-            )
 
-        # --- Check EMA cross against position ---
-        ema_cross_down = ema_fast_val < ema_slow_val
-        ema_cross_up = ema_fast_val > ema_slow_val
-
-        if state.direction == TrendDirection.LONG and ema_cross_down and macd_hist < 0:
-            return self._generate_exit_signal(symbol, state, price, "ema_cross_against")
-        elif state.direction == TrendDirection.SHORT and ema_cross_up and macd_hist > 0:
-            return self._generate_exit_signal(symbol, state, price, "ema_cross_against")
-
-        return None  # Hold position, no action needed
+        return None
 
     # ------------------------------------------------------------------
     # Signal Factory Methods
@@ -465,6 +405,7 @@ class TrendStrategy:
         price: float,
         new_trailing_stop: float,
         atr: float,
+        highest_price: float = 0.0,
     ) -> StrategySignal:
         """Generate a signal to update the trailing stop."""
         return (
@@ -474,6 +415,7 @@ class TrendStrategy:
             .with_metadata("position_size", round(state.position_size, 8))
             .with_metadata("old_trailing_stop", round(state.trailing_stop_price, 8))
             .with_metadata("new_trailing_stop", round(new_trailing_stop, 8))
+            .with_metadata("highest_price", round(max(highest_price, price), 8))
             .with_metadata("current_price", round(price, 8))
             .with_metadata("atr", round(atr, 8))
             .with_strategy(self.strategy_id)
@@ -492,21 +434,6 @@ class TrendStrategy:
         fill_price: float,
         fill_time: Optional[str] = None,
     ) -> TrendState:
-        """
-        Compute the new TrendState after a signal is executed.
-
-        The strategy module does NOT track state internally — it's a pure
-        function. The caller (main.py) manages state and passes it in.
-
-        Args:
-            old_state: The state before the signal was executed.
-            signal: The signal that was executed.
-            fill_price: The actual fill price from the exchange.
-            fill_time: ISO-8601 timestamp of the fill.
-
-        Returns:
-            The new TrendState after applying the signal.
-        """
         if fill_time is None:
             fill_time = datetime.now(timezone.utc).isoformat()
 
@@ -527,6 +454,7 @@ class TrendStrategy:
                 entry_ema_slow=meta.get("ema_slow", 0.0),
                 entry_macd_hist=meta.get("macd_hist", 0.0),
                 entry_atr=meta.get("atr", 0.0),
+                highest_price=fill_price,
             )
 
         elif signal.action in (SignalAction.STOP_TREND, SignalAction.CLOSE_ALL):
@@ -534,7 +462,12 @@ class TrendStrategy:
 
         elif signal.action == SignalAction.MODIFY_POSITION:
             if signal.metadata.get("action_type") == "update_trailing_stop":
-                new_state = TrendState(
+                new_high = max(
+                    old_state.highest_price,
+                    signal.metadata.get("highest_price", 0.0),
+                    fill_price,
+                )
+                return TrendState(
                     symbol=old_state.symbol,
                     direction=old_state.direction,
                     entry_price=old_state.entry_price,
@@ -547,8 +480,8 @@ class TrendStrategy:
                     entry_ema_slow=old_state.entry_ema_slow,
                     entry_macd_hist=old_state.entry_macd_hist,
                     entry_atr=old_state.entry_atr,
+                    highest_price=new_high,
                 )
-                return new_state
 
         return old_state
 

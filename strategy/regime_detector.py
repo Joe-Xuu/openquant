@@ -54,6 +54,36 @@ class MarketRegime(str, Enum):
     TRENDING = "TRENDING"
 
 
+class MacroTrend(str, Enum):
+    """Higher-timeframe structural trend (e.g. 1h EMA50 vs EMA200)."""
+    BULL = "BULL"
+    BEAR = "BEAR"
+    NEUTRAL = "NEUTRAL"
+
+
+def classify_macro_trend(
+    close: float,
+    ema_fast: float,
+    ema_slow: float,
+    buffer_pct: float = 0.005,
+) -> MacroTrend:
+    """
+    Classify structural higher-timeframe trend from price & fast/slow EMAs
+    (e.g. 1h EMA50 vs EMA200). Pure, scale-invariant function.
+
+    - BEAR: ema_fast < ema_slow * (1 - buffer) AND close < ema_slow
+    - BULL: ema_fast > ema_slow * (1 + buffer) AND close > ema_slow
+    - NEUTRAL: transition / ranging zone
+    """
+    if close <= 0 or ema_fast <= 0 or ema_slow <= 0:
+        return MacroTrend.NEUTRAL
+    if ema_fast < ema_slow * (1.0 - buffer_pct) and close < ema_slow:
+        return MacroTrend.BEAR
+    if ema_fast > ema_slow * (1.0 + buffer_pct) and close > ema_slow:
+        return MacroTrend.BULL
+    return MacroTrend.NEUTRAL
+
+
 # ---------------------------------------------------------------------------
 # Data Classes
 # ---------------------------------------------------------------------------

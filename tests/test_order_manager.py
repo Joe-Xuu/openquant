@@ -288,6 +288,46 @@ class TestOrderManagerSafety:
         await mgr._handle_user_stream_message(ws_sl)
         assert stopped == [("DOGEUSDT", 0.078, 100.0)]
 
+    @pytest.mark.asyncio
+    async def test_stop_grid_liquidate_inventory_preserves_trend(self):
+        """Macro-bear STOP_GRID with liquidate_inventory cancels grid+TP and sells grid lots only."""
+        client = MockExchangeClient(balances={"USDT": 50.0, "DOGE": 300.0}, ticker_price=0.08)
+        client._open_orders = [
+            {"orderId": "1", "clientOrderId": "grid_abc", "symbol": "DOGEUSDT"},
+            {"orderId": "2", "clientOrderId": "tp_501", "symbol": "DOGEUSDT"},
+            {"orderId": "3", "clientOrderId": "trend_sl_xyz", "symbol": "DOGEUSDT"},
+        ]
+        mgr, grid_fills = _make_manager(client)
+        grid_fills["t_501"] = {
+            "trade_id": "t_501", "symbol": "DOGEUSDT", "exchange_order_id": "buy_501",
+            "buy_price": 0.082, "buy_qty": 100.0, "buy_time": "2026-01-01T00:00:00+00:00",
+            "sell_price": 0.0835, "sell_placed": True, "sell_filled": False,
+            "sell_order_id": "2", "sell_client_order_id": "tp_501",
+        }
+        stop_sig = (
+            SignalBuilder(SignalAction.STOP_GRID, "DOGEUSDT", 1.0)
+            .with_metadata("grid_id", "g1")
+            .with_metadata("reason", "macro_bear")
+            .with_metadata("liquidate_inventory", True)
+            .build()
+        )
+        await mgr.dispatch_signal(stop_sig)
+
+        # Cancelled grid + TP, preserved trend_sl_xyz
+        assert sorted(client.cancelled_order_ids) == ["1", "2"]
+        remaining = {o["clientOrderId"] for o in client._open_orders}
+        assert "trend_sl_xyz" in remaining
+        assert "grid_abc" not in remaining
+        assert "tp_501" not in remaining
+
+        # Placed exactly one MARKET SELL for pending grid qty (100 DOGE, NOT all 300 DOGE)
+        assert len(client.placed_orders) == 1
+        sell = client.placed_orders[0]
+        assert sell.side == "SELL"
+        assert sell.order_type == "MARKET"
+        assert sell.quantity == 100.0
+        assert grid_fills["t_501"]["sell_filled"] is True
+
 
 class TestSymbolInfoAndInfra:
     def test_symbol_info_precision_and_notional(self):
@@ -318,3 +358,15 @@ class TestSymbolInfoAndInfra:
             AppConfig.model_validate({
                 "trading": {"grid_capital_pct": 0.80, "trend_capital_pct": 0.30}
             })
+
+    def test_settings_json_loads_v4c_defaults(self):
+        from config.schema import load_app_config
+        cfg = load_app_config("config/settings.json")
+        assert cfg.trading.grid_capital_pct == 0.45
+        assert cfg.trading.trend_capital_pct == 0.50
+        assert cfg.data.trend_interval == "1h"
+        assert cfg.strategy.macro_filter.enabled is True
+        assert cfg.strategy.macro_filter.interval in cfg.data.kline_intervals
+        assert cfg.strategy.grid_trading.spot_mode is True
+        assert cfg.strategy.trend_following.trailing_stop_atr_multiplier == 4.0
+

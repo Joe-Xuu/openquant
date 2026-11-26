@@ -106,15 +106,33 @@ class TestBacktestEngineInvariants:
 
     def test_trend_strategy_subcent_precision_and_spot_long_only(self):
         """DOGE ($0.08) stop-loss must keep sub-cent precision and Spot mode must block SHORT."""
-        ts = TrendStrategy(allow_short=False)
+        ts = TrendStrategy(allow_short=False, atr_multiplier=2.5)
         state = TrendState.flat("DOGEUSDT")
 
-        # Bullish entry on $0.08 DOGE with ATR=0.0005 -> SL = 0.0790 (NOT rounded to 0.08!)
-        sig = ts.evaluate("DOGEUSDT", 0.08, 0.0805, 0.0795, 0.0002, 0.0005, state, capital=100.0)
+        # Bullish entry on $0.08 DOGE with ATR=0.0005 -> SL = 0.07875 (NOT rounded to 0.08!)
+        sig = ts.evaluate("DOGEUSDT", 0.08, 0.0805, 0.0795, 0.0002, 0.0005, state, capital=100.0, adx=25.0)
         assert sig is not None
         assert sig.metadata["stop_loss"] < 0.08
-        assert abs(sig.metadata["stop_loss"] - 0.079) < 1e-6
+        assert abs(sig.metadata["stop_loss"] - (0.08 - 2.5 * 0.0005)) < 1e-6
 
         # Bearish market in Spot mode -> None (no naked short)
-        sig_bear = ts.evaluate("DOGEUSDT", 0.08, 0.0790, 0.0805, -0.0002, 0.0005, state, capital=100.0)
+        sig_bear = ts.evaluate("DOGEUSDT", 0.08, 0.0790, 0.0805, -0.0002, 0.0005, state, capital=100.0, adx=25.0)
         assert sig_bear is None
+
+        # Low ADX chop -> blocked
+        sig_chop = ts.evaluate("DOGEUSDT", 0.08, 0.0805, 0.0795, 0.0002, 0.0005, state, capital=100.0, adx=12.0)
+        assert sig_chop is None
+
+    def test_grid_spot_mode_doubles_buy_capital_and_macro_classifier(self):
+        from strategy.grid_strategy import GridStrategy
+        from strategy.regime_detector import MacroTrend, classify_macro_trend
+
+        g_futures = GridStrategy(total_capital=100.0, grid_levels=4, profit_per_grid_pct=1.5, spot_mode=False)
+        g_spot = GridStrategy(total_capital=100.0, grid_levels=4, profit_per_grid_pct=1.5, spot_mode=True)
+        cfg_f = g_futures.compute_grid(reference_price=1.0, symbol="DOGEUSDT")
+        cfg_s = g_spot.compute_grid(reference_price=1.0, symbol="DOGEUSDT")
+        assert abs(cfg_s.total_buy_notional / cfg_f.total_buy_notional - 2.0) < 0.01
+
+        assert classify_macro_trend(90.0, 95.0, 100.0) == MacroTrend.BEAR
+        assert classify_macro_trend(110.0, 105.0, 100.0) == MacroTrend.BULL
+        assert classify_macro_trend(100.0, 100.1, 100.0) == MacroTrend.NEUTRAL

@@ -588,12 +588,19 @@ class OrderManager:
     async def _cancel_grid(
         self, signal: StrategySignal, metadata: Dict[str, Any]
     ) -> List[TrackedOrder]:
-        """Cancel all open grid BUY orders for the symbol (preserving trend orders)."""
+        """Cancel open grid orders for the symbol (preserving trend/manual orders).
+
+        When ``metadata.get("liquidate_inventory")`` is True (e.g. macro-bear exit),
+        also cancels ``tp_*`` sell orders and market-sells remaining pending grid
+        inventory (capped by free base balance).
+        """
         grid_id = metadata.get("grid_id", "")
+        liquidate = bool(metadata.get("liquidate_inventory", False))
         cancelled_orders: List[TrackedOrder] = []
 
+        prefixes = GRID_BUY_PREFIXES + (("tp_",) if liquidate else ())
         try:
-            await self._cancel_orders_by_prefix(signal.symbol, GRID_BUY_PREFIXES)
+            await self._cancel_orders_by_prefix(signal.symbol, prefixes)
         except Exception as e:
             logger.error(f"Failed to cancel grid orders for {signal.symbol}: {e}")
 
@@ -602,9 +609,47 @@ class OrderManager:
                 order.status = "CANCELLED"
                 cancelled_orders.append(order)
 
+        if liquidate:
+            try:
+                pending_fills = self._ledger_get_pending_tp_fills(signal.symbol)
+                pending_qty = sum(float(f.get("buy_qty", 0.0)) for f in pending_fills)
+                if pending_qty > 0:
+                    sym_info = self._get_symbol_info(signal.symbol)
+                    bal = await self._client.get_asset_balance(sym_info.base_asset)
+                    sell_qty = sym_info.floor_qty(min(pending_qty, float(bal.free)))
+                    px = await self._client.get_ticker_price(signal.symbol)
+                    if sym_info.is_valid_order(px, sell_qty):
+                        exit_cid = f"grid_exit_{uuid.uuid4().hex[:14]}"
+                        resp = await self._client.place_order(
+                            OrderRequest(
+                                symbol=signal.symbol,
+                                side="SELL",
+                                order_type="MARKET",
+                                quantity=sell_qty,
+                                client_order_id=exit_cid,
+                            )
+                        )
+                        fill_px = (
+                            (resp.cummulative_quote_qty / resp.executed_qty)
+                            if (resp.executed_qty > 0 and resp.cummulative_quote_qty > 0)
+                            else (resp.price or px)
+                        )
+                        now_dt = datetime.now(timezone.utc)
+                        for f in pending_fills:
+                            tid = f.get("trade_id")
+                            if tid:
+                                self._ledger_grid_sell_filled(tid, fill_px, now_dt)
+                        logger.warning(
+                            f"Liquidated {sell_qty} {sym_info.base_asset} grid inventory "
+                            f"@ {fill_px:.5f} (reason={metadata.get('reason', 'stop_grid')})"
+                        )
+            except Exception as e:
+                logger.error(f"Failed to liquidate grid inventory for {signal.symbol}: {e}")
+
         self.grid_active = False
         try:
-            self._ledger_record_trade_close(trade_id=grid_id, exit_price=0.0, fee=0.0)
+            if grid_id:
+                self._ledger_record_trade_close(trade_id=grid_id, exit_price=0.0, fee=0.0)
         except Exception:
             pass
 

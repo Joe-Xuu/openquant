@@ -50,14 +50,20 @@ from core.local_ledger import LedgerEngine, get_ledger
 from core.state_machine import StateTransition, SystemState, TradingStateMachine
 
 # --- Data ---
-from data.indicators import compute_all, IndicatorBundle
+from data.indicators import compute_all, ema as compute_ema, IndicatorBundle
 from data.market_data import MarketDataEngine
 
 # --- Strategy ---
 from strategy.signal import SignalAction, StrategySignal
 from strategy.grid_strategy import GridConfig, GridStatus, GridStrategy
 from strategy.trend_strategy import TrendState, TrendStrategy
-from strategy.regime_detector import MarketRegime, RegimeDetector, RegimeResult
+from strategy.regime_detector import (
+    MacroTrend,
+    MarketRegime,
+    RegimeDetector,
+    RegimeResult,
+    classify_macro_trend,
+)
 
 # --- Risk ---
 from risk.risk_guard import RiskGuard, RiskVerdict, Verdict
@@ -170,6 +176,8 @@ class TradingSystem:
         fallback_eq = self.app_config.trading.fallback_equity
         self._cached_live_equity: float = fallback_eq
 
+        self.macro_cfg = self.app_config.strategy.macro_filter
+
         self.grid_strategy = GridStrategy(
             grid_type=grid_cfg.type,
             upper_bound_pct=grid_cfg.upper_bound_pct,
@@ -178,6 +186,7 @@ class TradingSystem:
             profit_per_grid_pct=grid_cfg.profit_per_grid_pct,
             total_capital=fallback_eq * self.grid_capital_pct,
             rebalance_threshold_pct=grid_cfg.rebalance_threshold_pct,
+            spot_mode=(grid_cfg.spot_mode and not use_futures),
         )
         self.grid_strategy.grid_stop_loss_pct = grid_cfg.stop_loss_pct
 
@@ -189,6 +198,9 @@ class TradingSystem:
             atr_multiplier=trend_cfg.atr_multiplier,
             trailing_stop_atr_multiplier=trend_cfg.trailing_stop_atr_multiplier,
             risk_per_trade_pct=trend_cfg.risk_per_trade_pct,
+            min_adx=trend_cfg.min_adx,
+            require_macd_confirm=trend_cfg.require_macd_confirm,
+            exit_on_ema_cross=trend_cfg.exit_on_ema_cross,
             allow_short=trend_cfg.allow_short,
         )
 
@@ -270,6 +282,8 @@ class TradingSystem:
         self._grid_configs: Dict[str, GridConfig] = {}
         self._current_regime: Dict[str, MarketRegime] = {}
         self._trend_paused_grid: Dict[str, bool] = {}
+        self._macro_trend: Dict[str, MacroTrend] = {}
+        self._macro_paused_grid: Dict[str, bool] = {}
 
         # --- Statistics ---
         self._tick_count = 0
@@ -707,6 +721,24 @@ class TradingSystem:
         )
         self._current_regime[symbol] = regime_result.regime
 
+        # 3b. Macro trend filter (1h EMA50 vs EMA200)
+        macro_trend = MacroTrend.NEUTRAL
+        if self.macro_cfg.enabled:
+            try:
+                macro_ohlcv = await self.data_engine.get_ohlcv(
+                    symbol, interval=self.macro_cfg.interval
+                )
+                if len(macro_ohlcv) >= self.macro_cfg.ema_slow:
+                    m_closes = [c["close"] for c in macro_ohlcv]
+                    m_fast = compute_ema(m_closes, self.macro_cfg.ema_fast)
+                    m_slow = compute_ema(m_closes, self.macro_cfg.ema_slow)
+                    macro_trend = classify_macro_trend(
+                        m_closes[-1], m_fast, m_slow
+                    )
+            except Exception as e:
+                logger.debug(f"Macro filter fallback to NEUTRAL for {symbol}: {e}")
+        self._macro_trend[symbol] = macro_trend
+
         # 4. Generate strategy signals — grid ALWAYS, trend INDEPENDENTLY
         grid_signal: Optional[StrategySignal] = None
         trend_signal: Optional[StrategySignal] = None
@@ -714,7 +746,20 @@ class TradingSystem:
         sym_info = self.exchange_client.get_symbol_info(symbol)
         min_notional = float(sym_info.min_notional)
 
-        # ---- GRID (always running on primary_interval) ----
+        # Dynamically scale available grid budget (total grid allocation minus held grid inventory)
+        if live_eq > 0:
+            try:
+                pending_grid = self._ledger_get_pending_tp_fills(symbol)
+                grid_inv_val = sum(
+                    float(f.get("buy_qty", 0.0)) * indicators.close for f in pending_grid
+                )
+            except Exception:
+                grid_inv_val = 0.0
+            self.grid_strategy.total_capital = max(
+                0.0, live_eq * self.grid_capital_pct - grid_inv_val
+            )
+
+        # ---- GRID (always running on primary_interval, gated by macro filter) ----
         current_grid = self._grid_configs.get(symbol)
 
         # Stop-loss check first (FIXED: calls .emergency(), not nonexistent .emergency_stop())
@@ -729,6 +774,46 @@ class TradingSystem:
                 )
                 self._grid_configs.pop(symbol, None)
                 self.state_machine.emergency(reason=f"grid_stop_loss:{symbol}")
+
+        # ---- Macro-bear protection (1h EMA50 < EMA200) ----
+        macro_bear = (
+            self.macro_cfg.enabled
+            and self.macro_cfg.pause_grid_in_bear
+            and macro_trend == MacroTrend.BEAR
+        )
+        was_macro_paused = self._macro_paused_grid.get(symbol, False)
+        if macro_bear and not was_macro_paused:
+            logger.warning(
+                f"🐻 Macro BEAR detected for {symbol} ({self.macro_cfg.interval} "
+                f"EMA{self.macro_cfg.ema_fast} < EMA{self.macro_cfg.ema_slow}). "
+                f"Pausing grid buys"
+                + (" & liquidating grid inventory." if self.macro_cfg.close_grid_in_bear else ".")
+            )
+            self._macro_paused_grid[symbol] = True
+            if grid_signal is None and self.macro_cfg.close_grid_in_bear:
+                if current_grid is not None:
+                    grid_signal = self.grid_strategy.generate_stop_signal(
+                        current_grid, reason="macro_bear"
+                    )
+                    grid_signal.metadata["liquidate_inventory"] = True
+                    self._grid_configs.pop(symbol, None)
+                    current_grid = None
+                else:
+                    grid_signal = StrategySignal(
+                        action=SignalAction.STOP_GRID,
+                        symbol=symbol,
+                        confidence=1.0,
+                        metadata={
+                            "grid_id": "",
+                            "reason": "macro_bear",
+                            "liquidate_inventory": True,
+                        },
+                        source="GridStrategy",
+                    )
+        elif not macro_bear and was_macro_paused:
+            logger.info(f"✓ Macro BEAR cleared for {symbol} ({macro_trend.value}) — resuming grid")
+            self._macro_paused_grid[symbol] = False
+            current_grid = None  # force fresh deployment
 
         # ---- Consecutive buy circuit breaker ----
         cb_triggered = self.order_manager._consecutive_buys >= self.order_manager._consecutive_buy_limit
@@ -753,10 +838,10 @@ class TradingSystem:
             current_grid = None  # force fresh deployment
 
         if grid_signal is None:
-            grid_frozen = (strong_trend or cb_triggered)
-            if grid_frozen and current_grid is not None:
-                pass  # hold existing positions, don't deploy new buys
-            elif current_grid is None:
+            grid_frozen = (macro_bear or strong_trend or cb_triggered)
+            if grid_frozen:
+                pass  # hold or stay flat, don't deploy new buys
+            elif current_grid is None and self.grid_strategy.total_capital >= min_notional:
                 ref_price = self.grid_strategy.compute_rebalance_price(ohlcv)
                 current_grid = self.grid_strategy.compute_grid(
                     reference_price=ref_price, symbol=symbol,
@@ -771,8 +856,10 @@ class TradingSystem:
                 )
                 self.state_machine.activate_grid()
 
-            elif (self.grid_strategy.check_rebalance(indicators.close, current_grid)
-                  or (self._tick_count > 0 and self._tick_count % 144 == 0)):
+            elif current_grid is not None and (
+                self.grid_strategy.check_rebalance(indicators.close, current_grid)
+                or (self._tick_count > 0 and self._tick_count % 144 == 0)
+            ) and self.grid_strategy.total_capital >= min_notional:
                 if self._tick_count > 0 and self._tick_count % 144 == 0:
                     logger.info(f"  Periodic grid rebuild (tick #{self._tick_count})")
                 ref_price = self.grid_strategy.compute_rebalance_price(ohlcv)
@@ -788,12 +875,12 @@ class TradingSystem:
                     f"({len(new_grid.buy_levels)} buy lvls)"
                 )
 
-        # ---- TREND (decoupled trend_interval; active positions ALWAYS monitored!) ----
+        # ---- TREND (decoupled 1h trend_interval; active positions ALWAYS monitored!) ----
         trend_state = self._trend_states.get(symbol, TrendState.flat(symbol))
+        if trend_state.is_active and indicators.close > trend_state.highest_price:
+            trend_state.highest_price = indicators.close
         trend_cooldown = self._tick_count < 30
-        should_eval_trend = trend_state.is_active or (
-            regime_result.is_trending and regime_result.confidence > 0.80 and not trend_cooldown
-        )
+        should_eval_trend = trend_state.is_active or (not trend_cooldown)
         if should_eval_trend:
             trend_ohlcv = (
                 await self.data_engine.get_ohlcv(symbol, interval=self.trend_interval)
@@ -804,6 +891,11 @@ class TradingSystem:
                 t_ind = compute_all(symbol, trend_ohlcv)
                 if t_ind.atr > 0 and t_ind.close > 0:
                     trend_capital = live_eq * self.trend_capital_pct
+                    macro_bull = (
+                        (macro_trend == MacroTrend.BULL)
+                        if self.macro_cfg.enabled
+                        else None
+                    )
                     raw_trend = self.trend_strategy.evaluate(
                         symbol=symbol,
                         current_price=indicators.close,  # latest mark price for stops
@@ -813,6 +905,8 @@ class TradingSystem:
                         atr=t_ind.atr,
                         current_state=trend_state,
                         capital=trend_capital,
+                        adx=t_ind.adx,
+                        macro_bullish=macro_bull,
                     )
                     if raw_trend is not None:
                         if raw_trend.action == SignalAction.START_TREND and not trend_state.is_active:

@@ -142,3 +142,24 @@ class TestRiskGuard:
         guard = self._make_guard()
         guard.register_volatility_spike(0.05, 0.01)  # 5× average
         assert guard._circuit_breaker.triggered
+
+    def test_simulated_clock_daily_loss_rollover(self):
+        from datetime import datetime, timezone
+        now_box = [datetime(2026, 1, 1, 12, 0, tzinfo=timezone.utc)]
+        eq_box = [100.0]
+        guard = RiskGuard(
+            config={"max_daily_loss_pct": 5.0, "max_drawdown_pct": 25.0},
+            equity_provider=lambda: eq_box[0],
+            positions_provider=lambda: [],
+            trade_history_provider=lambda _s: [],
+            clock=lambda: now_box[0],
+        )
+        sig = StrategySignal(action=SignalAction.START_GRID, symbol="DOGEUSDT", score=0.8)
+        # Drop 6% on Day 1 -> blocked
+        eq_box[0] = 94.0
+        assert guard.check_signal(sig).verdict == Verdict.BLOCKED
+
+        # Advance simulated clock to Day 2 -> daily baseline resets to 94.0 -> approved
+        now_box[0] = datetime(2026, 1, 2, 0, 5, tzinfo=timezone.utc)
+        assert guard.check_signal(sig).verdict == Verdict.APPROVED
+
