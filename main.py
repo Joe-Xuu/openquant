@@ -284,6 +284,7 @@ class TradingSystem:
         self._trend_paused_grid: Dict[str, bool] = {}
         self._macro_trend: Dict[str, MacroTrend] = {}
         self._macro_paused_grid: Dict[str, bool] = {}
+        self._macro_liquidated: Dict[str, bool] = {}
 
         # --- Statistics ---
         self._tick_count = 0
@@ -721,8 +722,10 @@ class TradingSystem:
         )
         self._current_regime[symbol] = regime_result.regime
 
-        # 3b. Macro trend filter (1h EMA50 vs EMA200)
+        # 3b. Macro trend filter (1h EMA50 vs EMA200 + EMA200 slope)
         macro_trend = MacroTrend.NEUTRAL
+        macro_ema_slow_val = 0.0
+        macro_ema200_rising = True
         if self.macro_cfg.enabled:
             try:
                 macro_ohlcv = await self.data_engine.get_ohlcv(
@@ -730,10 +733,13 @@ class TradingSystem:
                 )
                 if len(macro_ohlcv) >= self.macro_cfg.ema_slow:
                     m_closes = [c["close"] for c in macro_ohlcv]
-                    m_fast = compute_ema(m_closes, self.macro_cfg.ema_fast)
-                    m_slow = compute_ema(m_closes, self.macro_cfg.ema_slow)
+                    m_fast_series = compute_ema(m_closes, self.macro_cfg.ema_fast)
+                    m_slow_series = compute_ema(m_closes, self.macro_cfg.ema_slow)
+                    macro_ema_slow_val = m_slow_series[-1]
+                    if len(m_slow_series) > 24:
+                        macro_ema200_rising = m_slow_series[-1] > m_slow_series[-25]
                     macro_trend = classify_macro_trend(
-                        m_closes[-1], m_fast, m_slow
+                        m_closes[-1], m_fast_series[-1], macro_ema_slow_val
                     )
             except Exception as e:
                 logger.debug(f"Macro filter fallback to NEUTRAL for {symbol}: {e}")
@@ -775,22 +781,49 @@ class TradingSystem:
                 self._grid_configs.pop(symbol, None)
                 self.state_machine.emergency(reason=f"grid_stop_loss:{symbol}")
 
-        # ---- Macro-bear protection (1h EMA50 < EMA200) ----
+        # ---- Macro-bear protection (two-tier: pause buys on BEAR; liquidate only on deep bear) ----
         macro_bear = (
             self.macro_cfg.enabled
             and self.macro_cfg.pause_grid_in_bear
             and macro_trend == MacroTrend.BEAR
         )
         was_macro_paused = self._macro_paused_grid.get(symbol, False)
-        if macro_bear and not was_macro_paused:
-            logger.warning(
-                f"🐻 Macro BEAR detected for {symbol} ({self.macro_cfg.interval} "
-                f"EMA{self.macro_cfg.ema_fast} < EMA{self.macro_cfg.ema_slow}). "
-                f"Pausing grid buys"
-                + (" & liquidating grid inventory." if self.macro_cfg.close_grid_in_bear else ".")
+        if macro_bear:
+            depth_pct = self.macro_cfg.bear_exit_depth_pct
+            deep_bear_liq = (
+                self.macro_cfg.close_grid_in_bear
+                and not self._macro_liquidated.get(symbol, False)
+                and (
+                    depth_pct <= 0.0
+                    or (
+                        macro_ema_slow_val > 0
+                        and indicators.close <= macro_ema_slow_val * (1.0 - depth_pct / 100.0)
+                    )
+                )
             )
-            self._macro_paused_grid[symbol] = True
-            if grid_signal is None and self.macro_cfg.close_grid_in_bear:
+            if not was_macro_paused:
+                logger.warning(
+                    f"🐻 Macro BEAR detected for {symbol} ({self.macro_cfg.interval} "
+                    f"EMA{self.macro_cfg.ema_fast} < EMA{self.macro_cfg.ema_slow}). "
+                    f"Pausing new grid buys (deep-bear exit threshold={depth_pct:.1f}% below EMA200)."
+                )
+                self._macro_paused_grid[symbol] = True
+                if grid_signal is None and not deep_bear_liq:
+                    # Tier 1: cancel resting BUY orders only, let existing TP sells fill naturally
+                    if current_grid is not None:
+                        grid_signal = self.grid_strategy.generate_stop_signal(
+                            current_grid, reason="macro_bear_pause"
+                        )
+                        grid_signal.metadata["liquidate_inventory"] = False
+                        self._grid_configs.pop(symbol, None)
+                        current_grid = None
+            if grid_signal is None and deep_bear_liq:
+                # Tier 2: price broke deep below EMA200 -> liquidate grid inventory
+                logger.warning(
+                    f"🐻 Deep BEAR liquidation for {symbol}: price {indicators.close:.5f} "
+                    f"<= EMA200×(1-{depth_pct:.1f}%)"
+                )
+                self._macro_liquidated[symbol] = True
                 if current_grid is not None:
                     grid_signal = self.grid_strategy.generate_stop_signal(
                         current_grid, reason="macro_bear"
@@ -810,9 +843,10 @@ class TradingSystem:
                         },
                         source="GridStrategy",
                     )
-        elif not macro_bear and was_macro_paused:
+        elif was_macro_paused:
             logger.info(f"✓ Macro BEAR cleared for {symbol} ({macro_trend.value}) — resuming grid")
             self._macro_paused_grid[symbol] = False
+            self._macro_liquidated[symbol] = False
             current_grid = None  # force fresh deployment
 
         # ---- Consecutive buy circuit breaker ----
@@ -896,6 +930,12 @@ class TradingSystem:
                         if self.macro_cfg.enabled
                         else None
                     )
+                    if (
+                        macro_bull
+                        and self.app_config.strategy.trend_following.require_ema200_rising
+                        and not macro_ema200_rising
+                    ):
+                        macro_bull = False
                     raw_trend = self.trend_strategy.evaluate(
                         symbol=symbol,
                         current_price=indicators.close,  # latest mark price for stops

@@ -88,6 +88,7 @@ class MacroFilterConfig(BaseModel):
     ema_slow: int = Field(default=200, ge=20)
     pause_grid_in_bear: bool = True
     close_grid_in_bear: bool = True
+    bear_exit_depth_pct: float = Field(default=6.0, ge=0.0, le=30.0)
 
     @model_validator(mode="after")
     def validate_macro_emas(self) -> MacroFilterConfig:
@@ -118,6 +119,7 @@ class TrendFollowingConfig(BaseModel):
     min_adx: float = Field(default=20.0, ge=0.0, le=100.0)
     require_macd_confirm: bool = True
     exit_on_ema_cross: bool = False
+    require_ema200_rising: bool = True
     allow_short: bool = False
 
     @model_validator(mode="after")

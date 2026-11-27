@@ -87,6 +87,7 @@ class BacktestConfig:
     macro_ema_slow: int = 200
     pause_grid_in_macro_bear: bool = True
     close_grid_on_macro_bear: bool = True
+    macro_bear_exit_depth_pct: float = 6.0  # 0 = exit immediately on BEAR; >0 = only liquidate if close <= EMA200*(1-depth%)
     grid_lot_stop_loss_pct: float = 0.0  # Optional per-lot hard stop-loss % (0 = disabled)
     # Trend v2 parameters (Chandelier trailing stop + ADX/MACD quality filters)
     trend_atr_mult: float = 2.5
@@ -95,6 +96,7 @@ class BacktestConfig:
     trend_min_adx: float = 20.0
     trend_require_macd: bool = True
     trend_exit_on_ema_cross: bool = False
+    trend_require_ema200_rising: bool = True
     trend_gate_by_regime: bool = False  # When False, 1h macro + ADX/MACD gate trend directly
     allow_short: bool = False    # Spot default: long-only
     consecutive_buy_limit: int = 5
@@ -505,9 +507,14 @@ class BacktestEngine:
                 t_ind = indicators
 
             # Strictly causal 1h macro trend classification
+            self._cur_macro_es: float = 0.0
+            self._cur_macro_es_rising: bool = True
             if self.cfg.use_macro_filter:
                 m_idx = (i // macro_factor) - (0 if (i + 1) % macro_factor == 0 else 1)
                 if m_idx >= self.cfg.macro_ema_fast:
+                    self._cur_macro_es = macro_es[m_idx]
+                    if m_idx >= 24:
+                        self._cur_macro_es_rising = macro_es[m_idx] > macro_es[m_idx - 24]
                     macro_trend = classify_macro_trend(
                         bar["close"], macro_ef[m_idx], macro_es[m_idx]
                     )
@@ -706,7 +713,13 @@ class BacktestEngine:
             if self.grid_buy_orders:
                 self.grid_buy_orders.clear()
             if self.cfg.close_grid_on_macro_bear and self.grid_lots:
-                self._liquidate_grid_lots(close, bar["timestamp"], "macro_bear_exit", mode)
+                depth = self.cfg.macro_bear_exit_depth_pct
+                should_liq = (
+                    depth <= 0.0
+                    or (self._cur_macro_es > 0 and close <= self._cur_macro_es * (1.0 - depth / 100.0))
+                )
+                if should_liq:
+                    self._liquidate_grid_lots(close, bar["timestamp"], "macro_bear_exit", mode)
             self._grid_config = None
             return
 
@@ -810,6 +823,8 @@ class BacktestEngine:
         macro_bullish: Optional[bool] = None
         if self.cfg.use_macro_filter:
             macro_bullish = (macro_trend == MacroTrend.BULL)
+            if self.cfg.trend_require_ema200_rising and not self._cur_macro_es_rising:
+                macro_bullish = False
 
         trend_cap = live_eq * (1.0 if mode == "trend_only" else self.cfg.trend_capital_pct)
         sig = self.trend.evaluate(

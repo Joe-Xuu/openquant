@@ -52,7 +52,8 @@
             "ema_fast": 50,
             "ema_slow": 200,
             "pause_grid_in_bear": true,
-            "close_grid_in_bear": true
+            "close_grid_in_bear": true,
+            "bear_exit_depth_pct": 6.0
         },
         "regime_detection": {
             "lookback_periods": 100,
@@ -82,6 +83,7 @@
             "min_adx": 20.0,
             "require_macd_confirm": true,
             "exit_on_ema_cross": false,
+            "require_ema200_rising": true,
             "allow_short": false
         },
         "multi_factor": {
