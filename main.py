@@ -146,12 +146,12 @@ class TradingSystem:
         use_testnet = exchange_cfg.testnet
         use_futures = exchange_cfg.market == "futures"
 
-        # REST API: testnet for orders, mainnet for live; WebSocket market data uses mainnet
+        # MarketDataEngine uses mainnet public endpoints (matches mainnet WS; avoids testnet 202/empty history)
         if use_futures:
-            rest_url = "https://testnet.binancefuture.com" if use_testnet else "https://fapi.binance.com"
+            data_rest_url = "https://fapi.binance.com"
             ws_url = "wss://fstream.binance.com/ws"
         else:
-            rest_url = "https://testnet.binance.vision" if use_testnet else "https://api.binance.com"
+            data_rest_url = "https://api.binance.com"
             ws_url = "wss://stream.binance.com:9443/ws"
 
         self.primary_interval = data_cfg.primary_interval
@@ -166,7 +166,7 @@ class TradingSystem:
             max_klines_per_request=data_cfg.max_klines_per_request,
             ws_reconnect_delay=data_cfg.ws_reconnect_delay_seconds,
             testnet=use_testnet,
-            rest_base_url=rest_url,
+            rest_base_url=data_rest_url,
             ws_base_url=ws_url,
         )
 
@@ -311,20 +311,34 @@ class TradingSystem:
     # ------------------------------------------------------------------
 
     async def _get_equity_async(self) -> float:
-        """Return current total equity from exchange (live balances × prices) and refresh cache."""
+        """Return live trading equity (Futures: USDT + unrealized PnL; Spot: USDT + configured base assets)."""
         try:
             balances = await self.exchange_client.get_balances()
-            equity = 0.0
-            for b in balances:
-                if b.asset == "USDT":
-                    equity += b.total
-                else:
-                    sym = f"{b.asset}USDT"
-                    try:
-                        px = await self.exchange_client.get_ticker_price(sym)
-                        equity += b.total * px
-                    except Exception:
-                        pass
+            usdt_total = sum(b.total for b in balances if b.asset == "USDT")
+
+            if self.app_config.exchange.market == "futures":
+                unrealized = 0.0
+                try:
+                    positions = await self.exchange_client.get_futures_positions()
+                    configured = {s.upper() for s in self.app_config.trading.symbols}
+                    for p in positions:
+                        if str(p.get("symbol", "")).upper() in configured:
+                            unrealized += float(p.get("unRealizedProfit", 0.0))
+                except Exception:
+                    pass
+                equity = usdt_total + unrealized
+            else:
+                equity = usdt_total
+                for sym in self.app_config.trading.symbols:
+                    base = self.exchange_client.get_symbol_info(sym).base_asset
+                    qty = sum(b.total for b in balances if b.asset == base)
+                    if qty > 0:
+                        try:
+                            px = await self.exchange_client.get_ticker_price(sym)
+                            equity += qty * px
+                        except Exception:
+                            pass
+
             if equity > 0:
                 self._cached_live_equity = equity
                 return equity

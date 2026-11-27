@@ -244,7 +244,7 @@ class MarketDataEngine:
             [open_time, open, high, low, close, volume, close_time,
              quote_asset_volume, num_trades, taker_buy_base, taker_buy_quote, ignore]
         """
-        url = f"{self.rest_base_url}/api/v3/klines"
+        url = self._kline_url()
         params = {
             "symbol": symbol.upper(),
             "interval": interval,
@@ -293,6 +293,11 @@ class MarketDataEngine:
         except Exception as e:
             logger.exception(f"Error fetching {symbol} {interval}: {e}")
 
+    def _kline_url(self) -> str:
+        if "fapi." in self.rest_base_url or "binancefuture" in self.rest_base_url:
+            return f"{self.rest_base_url}/fapi/v1/klines"
+        return f"{self.rest_base_url}/api/v3/klines"
+
     async def fetch_recent(
         self, symbol: str, interval: str, limit: int = 100
     ) -> List[Dict[str, float]]:
@@ -307,7 +312,7 @@ class MarketDataEngine:
         Returns:
             List of OHLCV dicts.
         """
-        url = f"{self.rest_base_url}/api/v3/klines"
+        url = self._kline_url()
         params = {
             "symbol": symbol.upper(),
             "interval": interval,

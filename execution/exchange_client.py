@@ -604,7 +604,7 @@ class ExchangeClient:
         try:
             return await self._signed_request("POST", "/fapi/v1/marginType", params)
         except BinanceAPIError as e:
-            if e.status_code == 400 and "-4046" in str(e.payload):
+            if "-4046" in str(e) or "No need to change margin type" in str(e):
                 return {"msg": "already_set"}
             raise
 
