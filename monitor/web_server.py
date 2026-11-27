@@ -1,15 +1,20 @@
 """
 ================================================================================
-LIVE MONITOR WEB SERVER — Lightweight Async Dashboard (aiohttp.web)
+LIVE MONITOR & CONTROL WEB SERVER — Lightweight Async Dashboard (aiohttp.web)
 ================================================================================
 
 Runs inside main.py's asyncio event loop with zero extra dependencies.
 Exposes:
-  GET /           — Self-contained mobile+desktop live dashboard (auto-refresh 5s)
-  GET /api/status — Live JSON snapshot (equity, positions, macro, risk, trades)
-  GET /health     — Health check endpoint for Docker / uptime monitors
+  GET  /            — Self-contained mobile+desktop live dashboard & control panel
+  GET  /api/status  — Live JSON snapshot (equity, positions, macro, risk, params, logs)
+  POST /api/control — Safe remote control (pause / resume / reset_risk / emergency_stop)
+  POST /api/params  — Validated hot-reload of safe strategy & risk parameters
+  GET  /health      — Health check endpoint for Docker / uptime monitors
 
-Optional authentication via MONITOR_TOKEN env var (?token=... or X-Monitor-Token).
+SECURITY:
+  - Read access requires MONITOR_TOKEN when configured (?token=... or X-Monitor-Token).
+  - Write endpoints (POST /api/control, POST /api/params) are STRICTLY DISABLED
+    (HTTP 403 read-only mode) unless MONITOR_TOKEN is explicitly configured!
 ================================================================================
 """
 
@@ -17,7 +22,7 @@ from __future__ import annotations
 
 import logging
 import os
-from typing import Any, Callable, Dict, Optional
+from typing import Any, Awaitable, Callable, Dict, Optional
 
 from aiohttp import web
 
@@ -29,7 +34,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>OpenQuant 实盘实时监控</title>
+  <title>OpenQuant 实盘监控与控制台</title>
   <style>
     :root {
       --bg: #0b0f17; --card: #131a26; --border: #232e42;
@@ -42,7 +47,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
       font-size: 13px; line-height: 1.5; padding: 14px;
     }
-    .wrap { max-width: 1120px; margin: 0 auto; display: flex; flex-direction: column; gap: 14px; }
+    .wrap { max-width: 1140px; margin: 0 auto; display: flex; flex-direction: column; gap: 14px; }
     .hdr { display: flex; flex-wrap: wrap; justify-content: space-between; align-items: center; gap: 10px; border-bottom: 1px solid var(--border); padding-bottom: 10px; }
     .title { font-size: 17px; font-weight: 700; display: flex; align-items: center; gap: 8px; }
     .dot { width: 9px; height: 9px; border-radius: 50%; background: var(--green); display: inline-block; box-shadow: 0 0 8px var(--green); }
@@ -59,23 +64,68 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     .val { font-size: 20px; font-weight: 700; font-family: ui-monospace, monospace; margin-top: 2px; }
     .sub { font-size: 11px; color: var(--muted); font-family: ui-monospace, monospace; margin-top: 2px; }
     .pos { color: var(--green); } .neg { color: var(--red); } .warn-txt { color: var(--amber); }
+    .btn {
+      padding: 7px 14px; border-radius: 8px; border: 1px solid var(--border);
+      background: #1e293b; color: var(--fg); font-size: 12px; font-weight: 600;
+      cursor: pointer; transition: opacity .15s, border-color .15s;
+    }
+    .btn:hover:not(:disabled) { border-color: var(--accent); opacity: .92; }
+    .btn:disabled { opacity: .4; cursor: not-allowed; }
+    .btn.green { background: rgba(16,185,129,.16); border-color: rgba(16,185,129,.5); color: var(--green); }
+    .btn.amber { background: rgba(245,158,11,.16); border-color: rgba(245,158,11,.5); color: var(--amber); }
+    .btn.red { background: rgba(239,68,68,.16); border-color: rgba(239,68,68,.5); color: var(--red); }
+    .btn.blue { background: var(--accent); border-color: var(--accent); color: #fff; }
+    .form-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(175px, 1fr)); gap: 10px; margin-top: 8px; }
+    .field { display: flex; flex-direction: column; gap: 4px; }
+    .field label { font-size: 11px; color: var(--muted); }
+    .field input[type="number"] {
+      background: var(--bg); color: var(--fg); border: 1px solid var(--border);
+      border-radius: 6px; padding: 6px 8px; font-family: ui-monospace, monospace; font-size: 12px;
+    }
+    .toast {
+      display: none; padding: 8px 12px; border-radius: 8px; font-size: 12px;
+      border: 1px solid var(--border); background: #1e293b;
+    }
+    .toast.show { display: block; }
+    .toast.ok { border-color: rgba(16,185,129,.5); color: var(--green); }
+    .toast.err { border-color: rgba(239,68,68,.5); color: var(--red); }
     table { width: 100%; border-collapse: collapse; font-family: ui-monospace, monospace; font-size: 12px; }
     th, td { padding: 7px 8px; border-bottom: 1px solid var(--border); text-align: left; white-space: nowrap; }
     th { color: var(--muted); font-weight: 600; font-family: inherit; }
     td.num, th.num { text-align: right; }
     .scroll { overflow-x: auto; }
+    .logbox {
+      background: var(--bg); border: 1px solid var(--border); border-radius: 8px;
+      padding: 8px 10px; font-family: ui-monospace, monospace; font-size: 11px;
+      max-height: 200px; overflow-y: auto; white-space: pre-wrap; color: var(--muted);
+    }
     canvas { width: 100%; height: 150px; display: block; }
-    h2 { font-size: 14px; margin-bottom: 8px; display: flex; justify-content: space-between; align-items: center; }
+    h2 { font-size: 14px; margin-bottom: 8px; display: flex; justify-content: space-between; align-items: center; gap: 8px; flex-wrap: wrap; }
   </style>
 </head>
 <body>
   <div class="wrap">
     <div class="hdr">
       <div>
-        <div class="title"><span id="statusDot" class="dot"></span> OpenQuant 实盘实时监控</div>
+        <div class="title"><span id="statusDot" class="dot"></span> OpenQuant 实盘监控与控制台</div>
         <div id="subInfo" class="sub">正在连接...</div>
       </div>
       <div id="badges" style="display:flex;gap:6px;flex-wrap:wrap;"></div>
+    </div>
+
+    <div id="toast" class="toast"></div>
+
+    <!-- Control Bar -->
+    <div class="card">
+      <h2>
+        <span>远程启停与风控操作</span>
+        <span id="ctrlHint" class="sub"></span>
+      </h2>
+      <div style="display:flex;flex-wrap:wrap;gap:8px;align-items:center;">
+        <button id="btnPauseResume" class="btn amber" onclick="togglePause()">暂停开新仓</button>
+        <button id="btnResetRisk" class="btn" onclick="resetRisk()">重置风控熔断/基准</button>
+        <button id="btnEmergency" class="btn red" onclick="emergencyStop()">紧急全平并暂停</button>
+      </div>
     </div>
 
     <div id="kpis" class="grid"></div>
@@ -83,6 +133,50 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     <div class="card">
       <h2><span>净值实时曲线（PostgreSQL 历史快照）</span><span id="eqRange" class="sub"></span></h2>
       <canvas id="sparkCanvas"></canvas>
+    </div>
+
+    <!-- Hot-Reload Parameters -->
+    <div class="card">
+      <h2>
+        <span>策略与风控热更新参数（即时生效，严格范围保护）</span>
+        <button id="btnSaveParams" class="btn blue" onclick="saveParams()">保存并热生效</button>
+      </h2>
+      <div class="form-grid">
+        <div class="field">
+          <label>网格资金占比 (0.10 ~ 0.75)</label>
+          <input id="p_grid_pct" type="number" step="0.05" min="0.10" max="0.75" />
+        </div>
+        <div class="field">
+          <label>趋势资金占比 (0.10 ~ 0.75)</label>
+          <input id="p_trend_pct" type="number" step="0.05" min="0.10" max="0.75" />
+        </div>
+        <div class="field">
+          <label>总回撤熔断线 % (5 ~ 35)</label>
+          <input id="p_max_dd" type="number" step="1" min="5" max="35" />
+        </div>
+        <div class="field">
+          <label>单日亏损上限 % (2 ~ 15)</label>
+          <input id="p_max_daily" type="number" step="0.5" min="2" max="15" />
+        </div>
+        <div class="field">
+          <label>趋势单笔风险 % (0.5 ~ 5.0)</label>
+          <input id="p_risk_pct" type="number" step="0.5" min="0.5" max="5.0" />
+        </div>
+        <div class="field">
+          <label>网格单格止盈 % (0.8 ~ 3.0)</label>
+          <input id="p_grid_tp" type="number" step="0.1" min="0.8" max="3.0" />
+        </div>
+        <div class="field">
+          <label>熊市网格清仓深度 % (0 ~ 15)</label>
+          <input id="p_bear_depth" type="number" step="0.5" min="0" max="15" />
+        </div>
+        <div class="field" style="justify-content:center;">
+          <label>趋势允许做空（仅合约有效）</label>
+          <label style="display:flex;align-items:center;gap:6px;color:var(--fg);margin-top:4px;cursor:pointer;">
+            <input id="p_allow_short" type="checkbox" /> 启用 4h 熊市做空
+          </label>
+        </div>
+      </div>
     </div>
 
     <div class="card">
@@ -111,12 +205,88 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         </table>
       </div>
     </div>
+
+    <div class="card">
+      <h2><span>实时运行日志（最近 50 行）</span><span class="sub">免 SSH 手机排错</span></h2>
+      <div id="logBox" class="logbox">等待日志...</div>
+    </div>
   </div>
 
   <script>
     const qs = new URLSearchParams(location.search);
     const token = qs.get("token") || "";
-    const apiUrl = "/api/status" + (token ? "?token=" + encodeURIComponent(token) : "");
+    const authSuffix = token ? "?token=" + encodeURIComponent(token) : "";
+    let lastState = null;
+    let paramsLoaded = false;
+
+    function showToast(msg, ok = true) {
+      const el = document.getElementById("toast");
+      el.textContent = msg;
+      el.className = "toast show " + (ok ? "ok" : "err");
+      setTimeout(() => { el.className = "toast"; }, 5000);
+    }
+
+    async function postJson(path, body) {
+      const r = await fetch(path + authSuffix, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "X-Monitor-Token": token },
+        body: JSON.stringify(body),
+      });
+      const data = await r.json().catch(() => ({}));
+      if (!r.ok) throw new Error(data.error || ("HTTP " + r.status));
+      return data;
+    }
+
+    async function togglePause() {
+      const isPaused = lastState && lastState.paused;
+      const action = isPaused ? "resume" : "pause";
+      const label = isPaused ? "恢复自动开仓" : "暂停新开仓（保留已有持仓止损与TP）";
+      if (!confirm("确认" + label + "？")) return;
+      try {
+        const res = await postJson("/api/control", { action });
+        showToast(res.message || "操作成功", true);
+        refresh();
+      } catch (e) { showToast("操作失败: " + e.message, false); }
+    }
+
+    async function resetRisk() {
+      if (!confirm("确认以当前实时净值重置回撤高点并解除风控熔断？")) return;
+      try {
+        const res = await postJson("/api/control", { action: "reset_risk" });
+        showToast(res.message || "风控基准已重置", true);
+        refresh();
+      } catch (e) { showToast("操作失败: " + e.message, false); }
+    }
+
+    async function emergencyStop() {
+      const typed = prompt("⚠️ 紧急全平停机将撤销所有挂单、市价平掉全部持仓并暂停系统！\n请输入 STOP 确认：");
+      if (typed !== "STOP") { if (typed !== null) showToast("输入不匹配，已取消", false); return; }
+      try {
+        const res = await postJson("/api/control", { action: "emergency_stop", confirm: "STOP" });
+        showToast(res.message || "已执行紧急全平并暂停", true);
+        refresh();
+      } catch (e) { showToast("操作失败: " + e.message, false); }
+    }
+
+    async function saveParams() {
+      const payload = {
+        grid_capital_pct: parseFloat(document.getElementById("p_grid_pct").value),
+        trend_capital_pct: parseFloat(document.getElementById("p_trend_pct").value),
+        max_drawdown_pct: parseFloat(document.getElementById("p_max_dd").value),
+        max_daily_loss_pct: parseFloat(document.getElementById("p_max_daily").value),
+        risk_per_trade_pct: parseFloat(document.getElementById("p_risk_pct").value),
+        profit_per_grid_pct: parseFloat(document.getElementById("p_grid_tp").value),
+        bear_exit_depth_pct: parseFloat(document.getElementById("p_bear_depth").value),
+        allow_short: document.getElementById("p_allow_short").checked,
+      };
+      if (!confirm("确认热更新以上参数？（将立即生效并推送微信通知）")) return;
+      try {
+        const res = await postJson("/api/params", payload);
+        showToast(res.message || "参数已更新", true);
+        paramsLoaded = false;
+        refresh();
+      } catch (e) { showToast("参数校验失败: " + e.message, false); }
+    }
 
     function fmtPx(p) {
       if (!p || p <= 0) return "—";
@@ -167,20 +337,50 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 
     async function refresh() {
       try {
-        const r = await fetch(apiUrl);
+        const r = await fetch("/api/status" + authSuffix);
         if (!r.ok) throw new Error("HTTP " + r.status);
         const d = await r.json();
+        lastState = d;
 
         const dot = document.getElementById("statusDot");
-        dot.className = "dot" + (d.risk.circuit_breaker_triggered ? " err" : (!d.running ? " warn" : ""));
+        dot.className = "dot" + ((d.risk && d.risk.circuit_breaker_triggered) ? " err" : (d.paused || !d.running ? " warn" : ""));
         document.getElementById("subInfo").textContent =
-          `状态: ${d.state} · 运行时长: ${fmtUp(d.uptime_sec)} · 更新于 ${new Date(d.server_time).toLocaleTimeString()}`;
+          `状态: ${d.paused ? "PAUSED (手动暂停)" : d.state} · 运行时长: ${fmtUp(d.uptime_sec)} · 更新于 ${new Date(d.server_time).toLocaleTimeString()}`;
 
         document.getElementById("badges").innerHTML = `
           <span class="pill blue">${d.market.toUpperCase()} ${d.leverage}x</span>
           <span class="pill ${d.testnet ? "amber" : "green"}">${d.testnet ? "TESTNET 模拟盘" : "MAINNET 实盘"}</span>
-          <span class="pill ${d.wechat_enabled ? "green" : ""}">微信推送: ${d.wechat_enabled ? "已开启" : "未配置"}</span>
+          <span class="pill ${d.controls_enabled ? "green" : "amber"}">${d.controls_enabled ? "远程控制已启用" : "只读模式 (未设口令)"}</span>
+          <span class="pill ${d.wechat_enabled ? "green" : ""}">微信: ${d.wechat_enabled ? "已开启" : "未配置"}</span>
         `;
+
+        // Control button states
+        const canCtrl = Boolean(d.controls_enabled);
+        const btnPR = document.getElementById("btnPauseResume");
+        btnPR.disabled = !canCtrl;
+        btnPR.textContent = d.paused ? "▶ 恢复自动开仓" : "⏸ 暂停开新仓";
+        btnPR.className = "btn " + (d.paused ? "green" : "amber");
+        document.getElementById("btnResetRisk").disabled = !canCtrl;
+        document.getElementById("btnEmergency").disabled = !canCtrl;
+        document.getElementById("btnSaveParams").disabled = !canCtrl;
+        document.getElementById("ctrlHint").textContent = canCtrl
+          ? (d.paused ? "当前已暂停新开仓，已有持仓止损与 TP 仍在守护中" : "正常运行中，所有操作均记审计日志并推微信")
+          : "请在 .env 设置 MONITOR_TOKEN 后启用远程操控";
+
+        // Populate params form once (avoid overwriting while user is typing)
+        if (!paramsLoaded && d.params) {
+          document.getElementById("p_grid_pct").value = d.params.grid_capital_pct;
+          document.getElementById("p_trend_pct").value = d.params.trend_capital_pct;
+          document.getElementById("p_max_dd").value = d.params.max_drawdown_pct;
+          document.getElementById("p_max_daily").value = d.params.max_daily_loss_pct;
+          document.getElementById("p_risk_pct").value = d.params.risk_per_trade_pct;
+          document.getElementById("p_grid_tp").value = d.params.profit_per_grid_pct;
+          document.getElementById("p_bear_depth").value = d.params.bear_exit_depth_pct;
+          const sh = document.getElementById("p_allow_short");
+          sh.checked = Boolean(d.params.allow_short);
+          sh.disabled = d.market === "spot";
+          paramsLoaded = true;
+        }
 
         const rk = d.risk || {};
         const n = (v, dft = 0) => Number(v ?? dft);
@@ -223,7 +423,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         const trades = d.recent_trades || [];
         document.getElementById("tradeMeta").textContent = `最近 ${trades.length} 笔`;
         document.getElementById("tradeBody").innerHTML = trades.map(t => {
-          const p = t.pnl_realized || 0;
+          const p = n(t.pnl_realized);
           return `
             <tr>
               <td>${(t.entry_time || "").slice(0, 19).replace("T", " ")}</td>
@@ -231,13 +431,15 @@ DASHBOARD_HTML = """<!DOCTYPE html>
               <td>${t.side}</td>
               <td class="num">${fmtPx(t.entry_price)}</td>
               <td class="num">${fmtPx(t.exit_price)}</td>
-              <td class="num">${(t.quantity || 0).toFixed(2)}</td>
+              <td class="num">${n(t.quantity).toFixed(2)}</td>
               <td class="num ${p >= 0 ? "pos" : "neg"}">${p >= 0 ? "+" : ""}$${p.toFixed(3)}</td>
               <td>${t.status}</td>
             </tr>
           `;
         }).join("") || `<tr><td colspan="8" style="color:var(--muted)">暂无成交记录</td></tr>`;
 
+        const logs = d.recent_logs || [];
+        document.getElementById("logBox").textContent = logs.length ? logs.join("\n") : "暂无日志...";
         drawSpark(d.equity_history || []);
       } catch (e) {
         document.getElementById("statusDot").className = "dot err";
@@ -254,16 +456,20 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 
 
 class MonitorWebServer:
-    """Embedded aiohttp.web live monitoring server for TradingSystem."""
+    """Embedded aiohttp.web live monitoring & safe remote control server."""
 
     def __init__(
         self,
         status_provider: Callable[[], Dict[str, Any]],
+        control_handler: Optional[Callable[[str, Dict[str, Any]], Awaitable[Dict[str, Any]]]] = None,
+        params_handler: Optional[Callable[[Dict[str, Any]], Awaitable[Dict[str, Any]]]] = None,
         host: Optional[str] = None,
         port: Optional[int] = None,
         token: Optional[str] = None,
     ):
         self._status_provider = status_provider
+        self._control_handler = control_handler
+        self._params_handler = params_handler
         self.host = host or os.getenv("MONITOR_HOST", "0.0.0.0")
         self.port = int(port if port is not None else os.getenv("MONITOR_PORT", "8080"))
         self.token = (token if token is not None else os.getenv("MONITOR_TOKEN", "")).strip()
@@ -271,6 +477,8 @@ class MonitorWebServer:
         self._app = web.Application()
         self._app.router.add_get("/", self._handle_index)
         self._app.router.add_get("/api/status", self._handle_status)
+        self._app.router.add_post("/api/control", self._handle_control)
+        self._app.router.add_post("/api/params", self._handle_params)
         self._app.router.add_get("/health", self._handle_health)
         self._runner: Optional[web.AppRunner] = None
         self._site: Optional[web.TCPSite] = None
@@ -282,6 +490,17 @@ class MonitorWebServer:
         h_tok = request.headers.get("X-Monitor-Token", "")
         return q_tok == self.token or h_tok == self.token
 
+    def _check_write_access(self, request: web.Request) -> Optional[web.Response]:
+        """Enforce strict token protection on all mutating endpoints."""
+        if not self.token:
+            return web.json_response(
+                {"error": "Read-only mode: set MONITOR_TOKEN in .env to enable remote controls"},
+                status=403,
+            )
+        if not self._is_authorized(request):
+            return web.json_response({"error": "unauthorized"}, status=401)
+        return None
+
     async def _handle_index(self, request: web.Request) -> web.Response:
         if not self._is_authorized(request):
             return web.Response(status=401, text="Unauthorized: append ?token=YOUR_MONITOR_TOKEN")
@@ -292,9 +511,43 @@ class MonitorWebServer:
             return web.json_response({"error": "unauthorized"}, status=401)
         try:
             data = self._status_provider()
+            data["controls_enabled"] = bool(self.token and self._control_handler is not None)
             return web.json_response(data)
         except Exception as e:
             logger.error(f"Monitor status error: {e}")
+            return web.json_response({"error": str(e)}, status=500)
+
+    async def _handle_control(self, request: web.Request) -> web.Response:
+        err = self._check_write_access(request)
+        if err is not None:
+            return err
+        if self._control_handler is None:
+            return web.json_response({"error": "control handler not configured"}, status=501)
+        try:
+            body = await request.json()
+            action = str(body.get("action", "")).strip().lower()
+            result = await self._control_handler(action, body)
+            return web.json_response(result)
+        except ValueError as e:
+            return web.json_response({"error": str(e)}, status=400)
+        except Exception as e:
+            logger.error(f"Monitor control error: {e}")
+            return web.json_response({"error": str(e)}, status=500)
+
+    async def _handle_params(self, request: web.Request) -> web.Response:
+        err = self._check_write_access(request)
+        if err is not None:
+            return err
+        if self._params_handler is None:
+            return web.json_response({"error": "params handler not configured"}, status=501)
+        try:
+            body = await request.json()
+            result = await self._params_handler(body)
+            return web.json_response(result)
+        except ValueError as e:
+            return web.json_response({"error": str(e)}, status=400)
+        except Exception as e:
+            logger.error(f"Monitor params error: {e}")
             return web.json_response({"error": str(e)}, status=500)
 
     async def _handle_health(self, _request: web.Request) -> web.Response:
@@ -305,7 +558,7 @@ class MonitorWebServer:
         await self._runner.setup()
         self._site = web.TCPSite(self._runner, self.host, self.port)
         await self._site.start()
-        auth_note = "token-protected" if self.token else "open (set MONITOR_TOKEN for public VPS!)"
+        auth_note = "token-protected (read+control)" if self.token else "read-only (set MONITOR_TOKEN to enable control)"
         logger.info(f"MonitorWebServer listening on http://{self.host}:{self.port} ({auth_note})")
 
     async def stop(self) -> None:

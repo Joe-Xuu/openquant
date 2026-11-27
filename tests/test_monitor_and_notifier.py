@@ -135,6 +135,135 @@ class TestMonitorWebServer:
                 async with sess.get(f"{base}/", headers={"X-Monitor-Token": "secret123"}) as r:
                     assert r.status == 200
                     html = await r.text()
-                    assert "OpenQuant 实盘实时监控" in html
+                    assert "OpenQuant 实盘监控与控制台" in html
         finally:
             await srv.stop()
+
+    @pytest.mark.asyncio
+    async def test_readonly_mode_blocks_writes_without_token(self):
+        called = []
+
+        async def ctrl(action, payload):
+            called.append(action)
+            return {"ok": True}
+
+        async def params(body):
+            called.append("params")
+            return {"ok": True}
+
+        srv = MonitorWebServer(
+            status_provider=lambda: {"running": True},
+            control_handler=ctrl,
+            params_handler=params,
+            host="127.0.0.1",
+            port=0,
+            token="",
+        )
+        await srv.start()
+        try:
+            port = srv._site._server.sockets[0].getsockname()[1]
+            base = f"http://127.0.0.1:{port}"
+            async with aiohttp.ClientSession() as sess:
+                async with sess.get(f"{base}/api/status") as r:
+                    assert r.status == 200
+                    data = await r.json()
+                    assert data["controls_enabled"] is False
+
+                async with sess.post(f"{base}/api/control", json={"action": "pause"}) as r:
+                    assert r.status == 403
+                async with sess.post(f"{base}/api/params", json={"max_drawdown_pct": 12}) as r:
+                    assert r.status == 403
+                assert called == []
+        finally:
+            await srv.stop()
+
+    @pytest.mark.asyncio
+    async def test_authenticated_control_and_params_endpoints(self):
+        state = {"paused": False, "max_drawdown_pct": 15.0}
+
+        async def ctrl(action, payload):
+            if action == "pause":
+                state["paused"] = True
+                return {"ok": True, "paused": True}
+            if action == "resume":
+                state["paused"] = False
+                return {"ok": True, "paused": False}
+            if action == "emergency_stop":
+                if payload.get("confirm") != "STOP":
+                    raise ValueError("Confirmation 'STOP' required")
+                state["paused"] = True
+                return {"ok": True, "paused": True}
+            raise ValueError(f"Unknown action: {action}")
+
+        async def params(body):
+            dd = float(body.get("max_drawdown_pct", 15.0))
+            if dd < 5.0 or dd > 35.0:
+                raise ValueError("max_drawdown_pct out of bounds")
+            state["max_drawdown_pct"] = dd
+            return {"ok": True, "params": {"max_drawdown_pct": dd}}
+
+        srv = MonitorWebServer(
+            status_provider=lambda: {"running": True, "paused": state["paused"]},
+            control_handler=ctrl,
+            params_handler=params,
+            host="127.0.0.1",
+            port=0,
+            token="tok999",
+        )
+        await srv.start()
+        try:
+            port = srv._site._server.sockets[0].getsockname()[1]
+            base = f"http://127.0.0.1:{port}"
+            hdrs = {"X-Monitor-Token": "tok999"}
+            async with aiohttp.ClientSession() as sess:
+                # Wrong token -> 401
+                async with sess.post(f"{base}/api/control", json={"action": "pause"}, headers={"X-Monitor-Token": "wrong"}) as r:
+                    assert r.status == 401
+
+                # Pause / resume
+                async with sess.post(f"{base}/api/control", json={"action": "pause"}, headers=hdrs) as r:
+                    assert r.status == 200
+                    assert (await r.json())["paused"] is True
+                async with sess.post(f"{base}/api/control", json={"action": "resume"}, headers=hdrs) as r:
+                    assert r.status == 200
+                    assert (await r.json())["paused"] is False
+
+                # Emergency stop requires confirm == "STOP"
+                async with sess.post(f"{base}/api/control", json={"action": "emergency_stop", "confirm": "NO"}, headers=hdrs) as r:
+                    assert r.status == 400
+                async with sess.post(f"{base}/api/control", json={"action": "emergency_stop", "confirm": "STOP"}, headers=hdrs) as r:
+                    assert r.status == 200
+                    assert state["paused"] is True
+
+                # Params valid + out-of-bounds
+                async with sess.post(f"{base}/api/params", json={"max_drawdown_pct": 20.0}, headers=hdrs) as r:
+                    assert r.status == 200
+                    assert state["max_drawdown_pct"] == 20.0
+                async with sess.post(f"{base}/api/params", json={"max_drawdown_pct": 99.0}, headers=hdrs) as r:
+                    assert r.status == 400
+        finally:
+            await srv.stop()
+
+
+class TestRiskGuardReset:
+    def test_reset_risk_state_clears_circuit_breaker(self):
+        from risk.risk_guard import RiskGuard
+
+        eq = [1000.0]
+        rg = RiskGuard(
+            config={"max_drawdown_pct": 10.0, "max_daily_loss_pct": 5.0},
+            equity_provider=lambda: eq[0],
+            positions_provider=lambda: [],
+            trade_history_provider=lambda _s: [],
+        )
+        rg.sync_baseline(1000.0)
+        eq[0] = 850.0
+        rg._circuit_breaker = True
+        rg._circuit_breaker_reason = "drawdown"
+
+        rg.reset_risk_state(850.0)
+        summary = rg.get_risk_summary()
+        assert summary["circuit_breaker_triggered"] is False
+        assert summary["peak_equity"] == 850.0
+        assert summary["drawdown_pct"] == 0.0
+

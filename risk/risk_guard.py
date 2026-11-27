@@ -37,11 +37,14 @@ DECOUPLING NOTE:
 
 from __future__ import annotations
 
+import logging
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
 from typing import Any, Callable, Dict, List, Optional, Tuple
+
+logger = logging.getLogger("risk.risk_guard")
 
 
 # ---------------------------------------------------------------------------
@@ -175,6 +178,17 @@ class RiskGuard:
         self._daily_start_equity = equity
         if equity > self._peak_equity or self._peak_equity <= 0:
             self._peak_equity = equity
+
+    def reset_risk_state(self, equity: float) -> None:
+        """Operator-confirmed reset of peak equity, daily baseline, and circuit breaker."""
+        if equity > 0:
+            self._initial_capital = equity
+            self._peak_equity = equity
+            self._daily_start_equity = equity
+        self._today_pnl = 0.0
+        self._today_date = self._clock().strftime("%Y-%m-%d")
+        self._circuit_breaker = CircuitBreakerState()
+        logger.warning(f"RiskGuard reset by operator: baseline=${self._peak_equity:.2f}")
 
     # ------------------------------------------------------------------
     # Main Check Pipeline

@@ -34,9 +34,10 @@ import os
 import signal
 import sys
 import time
+from collections import deque
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 # Load environment variables from .env
 from dotenv import load_dotenv
@@ -85,6 +86,21 @@ Path("logs").mkdir(exist_ok=True)
 # Rotating log files: new file every hour, keep 72 backups (3 days)
 from logging.handlers import TimedRotatingFileHandler
 
+RECENT_LOGS: deque[str] = deque(maxlen=60)
+
+
+class _MemoryLogHandler(logging.Handler):
+    """Lightweight ring buffer capturing recent log lines for the Web UI."""
+
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            RECENT_LOGS.append(self.format(record))
+        except Exception:
+            pass
+
+
+_log_formatter = logging.Formatter("%(asctime)s [%(levelname)-7s] %(name)s: %(message)s")
+
 file_handler = TimedRotatingFileHandler(
     filename="logs/trading_system.log",
     when="H",          # rotate hourly
@@ -92,9 +108,10 @@ file_handler = TimedRotatingFileHandler(
     backupCount=72,    # keep last 72 hours (3 days)
     encoding="utf-8",
 )
-file_handler.setFormatter(logging.Formatter(
-    "%(asctime)s [%(levelname)-7s] %(name)s: %(message)s"
-))
+file_handler.setFormatter(_log_formatter)
+
+memory_handler = _MemoryLogHandler()
+memory_handler.setFormatter(_log_formatter)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -102,6 +119,7 @@ logging.basicConfig(
     handlers=[
         logging.StreamHandler(sys.stdout),
         file_handler,
+        memory_handler,
     ],
 )
 logger = logging.getLogger("main")
@@ -293,10 +311,15 @@ class TradingSystem:
         self._last_prices: Dict[str, float] = {}
 
         # --- Notifications & Live Web Monitor ---
+        self._manual_paused: bool = False
         self.notifier = WeChatNotifier()
         self._monitor_enabled = os.getenv("MONITOR_ENABLED", "true").lower() == "true"
         self.monitor_server: Optional[MonitorWebServer] = (
-            MonitorWebServer(status_provider=self._build_monitor_snapshot)
+            MonitorWebServer(
+                status_provider=self._build_monitor_snapshot,
+                control_handler=self._handle_web_control,
+                params_handler=self._handle_web_params,
+            )
             if self._monitor_enabled
             else None
         )
@@ -404,7 +427,11 @@ class TradingSystem:
                 "trend_stop": eff_stop,
                 "trend_qty": ts.position_size,
                 "grid_active": sym in self._grid_configs,
-                "grid_paused": self._macro_paused_grid.get(sym, False) or self._trend_paused_grid.get(sym, False),
+                "grid_paused": (
+                    self._manual_paused
+                    or self._macro_paused_grid.get(sym, False)
+                    or self._trend_paused_grid.get(sym, False)
+                ),
             })
 
         recent_trades = []
@@ -435,6 +462,7 @@ class TradingSystem:
 
         return {
             "running": self.running,
+            "paused": self._manual_paused,
             "state": self.state_machine.state.value,
             "market": self.app_config.exchange.market,
             "testnet": self.app_config.exchange.testnet,
@@ -449,9 +477,210 @@ class TradingSystem:
             "wechat_enabled": self.notifier.enabled,
             "server_time": datetime.now(timezone.utc).isoformat(),
             "risk": self.risk_guard.get_risk_summary(),
+            "params": self._get_tunable_params(),
             "symbols": sym_rows,
             "recent_trades": recent_trades,
             "equity_history": eq_history,
+            "recent_logs": list(RECENT_LOGS)[-50:],
+        }
+
+    def _get_tunable_params(self) -> Dict[str, Any]:
+        """Return current values of Web-UI hot-reloadable parameters."""
+        return {
+            "grid_capital_pct": round(float(self.grid_capital_pct), 4),
+            "trend_capital_pct": round(float(self.trend_capital_pct), 4),
+            "max_drawdown_pct": round(float(self.risk_guard.max_drawdown_pct), 2),
+            "max_daily_loss_pct": round(float(self.risk_guard.max_daily_loss_pct), 2),
+            "risk_per_trade_pct": round(float(self.trend_strategy.risk_per_trade_pct), 2),
+            "profit_per_grid_pct": round(float(self.grid_strategy.profit_per_grid_pct), 2),
+            "bear_exit_depth_pct": round(float(self.macro_cfg.bear_exit_depth_pct), 2),
+            "allow_short": bool(self.trend_strategy.allow_short),
+        }
+
+    async def _handle_web_control(self, action: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+        """Execute validated remote control actions from the Web UI."""
+        if action == "pause":
+            self._manual_paused = True
+            self.state_machine.pause(reason="web_ui_manual_pause")
+            logger.warning("WEB CONTROL [AUDIT]: System PAUSED by user (new entries halted; stops/TPs active)")
+            self.notifier.send_background(
+                title="Web 远程操作：已暂停开新仓",
+                body=f"- 状态: `PAUSED`（已有持仓止损与网格 TP 仍受守护）\n- 当前净值: `${self._cached_live_equity:.2f}`",
+                level="WARN",
+            )
+            return {"ok": True, "paused": True, "message": "已暂停开新仓（已有持仓止损与 TP 仍在守护中）"}
+
+        if action == "resume":
+            self._manual_paused = False
+            self.state_machine.resume()
+            logger.info("WEB CONTROL [AUDIT]: System RESUMED by user")
+            self.notifier.send_background(
+                title="Web 远程操作：已恢复自动开仓",
+                body=f"- 状态: `ACTIVE`\n- 当前净值: `${self._cached_live_equity:.2f}`",
+                level="SUCCESS",
+            )
+            return {"ok": True, "paused": False, "message": "已恢复自动开仓"}
+
+        if action == "reset_risk":
+            eq = await self._get_equity_async()
+            self._initial_equity = eq
+            self.risk_guard.reset_risk_state(eq)
+            logger.warning(f"WEB CONTROL [AUDIT]: RiskGuard reset to live equity ${eq:.2f}")
+            self.notifier.send_background(
+                title="Web 远程操作：风控基准已重置",
+                body=f"- 新基准净值: `${eq:.2f}`\n- 熔断器状态: `已解除`",
+                level="WARN",
+            )
+            return {"ok": True, "equity": round(eq, 4), "message": f"风控高点与熔断已重置至当前净值 ${eq:.2f}"}
+
+        if action == "emergency_stop":
+            if str(payload.get("confirm", "")).strip() != "STOP":
+                raise ValueError("Confirmation 'STOP' required for emergency_stop")
+            self._manual_paused = True
+            logger.error("WEB CONTROL [AUDIT]: EMERGENCY STOP triggered! Cancelling orders & liquidating positions...")
+            for sym in self.app_config.trading.symbols:
+                # 1. Close active trend position if any
+                ts = self._trend_states.get(sym)
+                if ts is not None and ts.is_active:
+                    try:
+                        stop_sig = StrategySignal(
+                            action=SignalAction.STOP_TREND,
+                            symbol=sym,
+                            confidence=1.0,
+                            metadata={
+                                "direction": ts.direction.value,
+                                "position_size": ts.position_size,
+                                "entry_price": ts.entry_price,
+                                "exit_reason": "web_emergency_stop",
+                                "pnl_pct": 0.0,
+                            },
+                            source="WebControl",
+                        )
+                        await self.order_manager.dispatch_signal(stop_sig)
+                        self._trend_states[sym] = TrendState.flat(sym)
+                    except Exception as e:
+                        logger.error(f"Emergency trend close failed for {sym}: {e}")
+
+                # 2. Stop & liquidate grid inventory
+                try:
+                    grid_sig = StrategySignal(
+                        action=SignalAction.STOP_GRID,
+                        symbol=sym,
+                        confidence=1.0,
+                        metadata={
+                            "grid_id": self._grid_configs[sym].grid_id if sym in self._grid_configs else "",
+                            "reason": "web_emergency_stop",
+                            "liquidate_inventory": True,
+                        },
+                        source="WebControl",
+                    )
+                    await self.order_manager.dispatch_signal(grid_sig)
+                    self._grid_configs.pop(sym, None)
+                except Exception as e:
+                    logger.error(f"Emergency grid liquidate failed for {sym}: {e}")
+
+                # 3. Cancel any remaining open orders on exchange
+                try:
+                    await self.exchange_client.cancel_all_orders(sym)
+                except Exception as e:
+                    logger.error(f"Emergency cancel_all_orders failed for {sym}: {e}")
+
+            self.state_machine.pause(reason="web_emergency_stop")
+            await self.notifier.send(
+                title="⚠️ Web 远程紧急全平停机已执行",
+                body=(
+                    f"- 标的: `{', '.join(self.app_config.trading.symbols)}`\n"
+                    f"- 已撤销全部挂单、市价平仓并进入 `PAUSED` 状态\n"
+                    f"- 当前净值: `${self._cached_live_equity:.2f}`"
+                ),
+                level="ERROR",
+            )
+            return {"ok": True, "paused": True, "message": "已执行紧急撤单全平，系统进入暂停状态"}
+
+        raise ValueError(f"Unknown control action: {action}")
+
+    async def _handle_web_params(self, updates: Dict[str, Any]) -> Dict[str, Any]:
+        """Validate and hot-apply safe strategy/risk parameters from the Web UI."""
+        if not isinstance(updates, dict) or not updates:
+            raise ValueError("Empty parameter payload")
+
+        bounds = {
+            "grid_capital_pct": (0.10, 0.75),
+            "trend_capital_pct": (0.10, 0.75),
+            "max_drawdown_pct": (5.0, 35.0),
+            "max_daily_loss_pct": (2.0, 15.0),
+            "risk_per_trade_pct": (0.5, 5.0),
+            "profit_per_grid_pct": (0.8, 3.0),
+            "bear_exit_depth_pct": (0.0, 15.0),
+        }
+
+        validated: Dict[str, Any] = {}
+        for key, (lo, hi) in bounds.items():
+            if key in updates and updates[key] is not None:
+                try:
+                    val = float(updates[key])
+                except (TypeError, ValueError):
+                    raise ValueError(f"Invalid numeric value for {key}")
+                if val < lo or val > hi:
+                    raise ValueError(f"{key} must be between {lo} and {hi} (got {val})")
+                validated[key] = val
+
+        new_grid_pct = validated.get("grid_capital_pct", self.grid_capital_pct)
+        new_trend_pct = validated.get("trend_capital_pct", self.trend_capital_pct)
+        if new_grid_pct + new_trend_pct > 0.95 + 1e-9:
+            raise ValueError(
+                f"grid_capital_pct + trend_capital_pct must be <= 0.95 (got {new_grid_pct + new_trend_pct:.2f})"
+            )
+
+        if "allow_short" in updates and updates["allow_short"] is not None:
+            allow_short = bool(updates["allow_short"])
+            if allow_short and self.app_config.exchange.market == "spot":
+                raise ValueError("Spot mode does not allow shorting")
+            validated["allow_short"] = allow_short
+
+        if not validated:
+            raise ValueError("No recognized tunable parameters provided")
+
+        # Apply hot-reload changes
+        changes = []
+        if "grid_capital_pct" in validated:
+            self.grid_capital_pct = validated["grid_capital_pct"]
+            changes.append(f"grid_capital_pct={self.grid_capital_pct:.2f}")
+        if "trend_capital_pct" in validated:
+            self.trend_capital_pct = validated["trend_capital_pct"]
+            changes.append(f"trend_capital_pct={self.trend_capital_pct:.2f}")
+        if "max_drawdown_pct" in validated:
+            self.risk_guard.max_drawdown_pct = validated["max_drawdown_pct"]
+            self._equity_stop_pct = validated["max_drawdown_pct"]
+            changes.append(f"max_drawdown_pct={self.risk_guard.max_drawdown_pct:.1f}%")
+        if "max_daily_loss_pct" in validated:
+            self.risk_guard.max_daily_loss_pct = validated["max_daily_loss_pct"]
+            changes.append(f"max_daily_loss_pct={self.risk_guard.max_daily_loss_pct:.1f}%")
+        if "risk_per_trade_pct" in validated:
+            self.trend_strategy.risk_per_trade_pct = validated["risk_per_trade_pct"]
+            changes.append(f"risk_per_trade_pct={self.trend_strategy.risk_per_trade_pct:.2f}%")
+        if "profit_per_grid_pct" in validated:
+            self.grid_strategy.profit_per_grid_pct = validated["profit_per_grid_pct"]
+            self.order_manager.grid_profit_pct = validated["profit_per_grid_pct"]
+            changes.append(f"profit_per_grid_pct={self.grid_strategy.profit_per_grid_pct:.2f}%")
+        if "bear_exit_depth_pct" in validated:
+            self.macro_cfg.bear_exit_depth_pct = validated["bear_exit_depth_pct"]
+            changes.append(f"bear_exit_depth_pct={self.macro_cfg.bear_exit_depth_pct:.1f}%")
+        if "allow_short" in validated:
+            self.trend_strategy.allow_short = validated["allow_short"]
+            changes.append(f"allow_short={self.trend_strategy.allow_short}")
+
+        summary = ", ".join(changes)
+        logger.warning(f"WEB PARAMS [AUDIT]: Hot-reloaded parameters: {summary}")
+        self.notifier.send_background(
+            title="Web 远程操作：策略参数已热更新",
+            body="\n".join(f"- `{c}`" for c in changes),
+            level="INFO",
+        )
+        return {
+            "ok": True,
+            "message": f"参数已热生效（{len(changes)} 项）",
+            "params": self._get_tunable_params(),
         }
 
     def _get_positions(self) -> List[Dict]:
@@ -1075,7 +1304,7 @@ class TradingSystem:
             current_grid = None  # force fresh deployment
 
         if grid_signal is None:
-            grid_frozen = (macro_bear or strong_trend or cb_triggered)
+            grid_frozen = (self._manual_paused or macro_bear or strong_trend or cb_triggered)
             if grid_frozen:
                 pass  # hold or stay flat, don't deploy new buys
             elif current_grid is None and self.grid_strategy.total_capital >= min_notional:
@@ -1120,7 +1349,7 @@ class TradingSystem:
             if trend_state.lowest_price <= 0 or indicators.close < trend_state.lowest_price:
                 trend_state.lowest_price = indicators.close
         trend_cooldown = self._tick_count < 30
-        should_eval_trend = trend_state.is_active or (not trend_cooldown)
+        should_eval_trend = trend_state.is_active or (not trend_cooldown and not self._manual_paused)
         if should_eval_trend:
             trend_ohlcv = (
                 await self.data_engine.get_ohlcv(symbol, interval=self.trend_interval)
@@ -1162,7 +1391,11 @@ class TradingSystem:
                         macro_bearish=macro_bear_gate,
                     )
                     if raw_trend is not None:
-                        if raw_trend.action == SignalAction.START_TREND and not trend_state.is_active:
+                        if (
+                            raw_trend.action == SignalAction.START_TREND
+                            and not trend_state.is_active
+                            and not self._manual_paused
+                        ):
                             trend_signal = raw_trend
                         elif raw_trend.action in (
                             SignalAction.STOP_TREND,
