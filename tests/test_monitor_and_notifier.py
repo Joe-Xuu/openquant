@@ -303,6 +303,42 @@ class TestMonitorWebServer:
         finally:
             await srv.stop()
 
+    @pytest.mark.asyncio
+    async def test_klines_endpoint(self):
+        async def fake_klines(sym: str, interval: str, limit: int):
+            return {
+                "symbol": sym or "DOGEUSDT",
+                "interval": interval,
+                "price": 0.06123,
+                "klines": [
+                    {"t": "2026-11-27T01:00:00+00:00", "o": 0.060, "h": 0.062, "l": 0.059, "c": 0.06123, "v": 12345.0}
+                ],
+            }
+
+        srv = MonitorWebServer(
+            status_provider=lambda: {"running": True},
+            klines_provider=fake_klines,
+            host="127.0.0.1",
+            port=0,
+            token="tok_k",
+        )
+        await srv.start()
+        try:
+            port = srv._site._server.sockets[0].getsockname()[1]
+            base = f"http://127.0.0.1:{port}"
+            async with aiohttp.ClientSession() as sess:
+                async with sess.get(f"{base}/api/klines") as r:
+                    assert r.status == 401
+                async with sess.get(f"{base}/api/klines?interval=15m&limit=60", headers={"X-Monitor-Token": "tok_k"}) as r:
+                    assert r.status == 200
+                    d = await r.json()
+                    assert d["symbol"] == "DOGEUSDT"
+                    assert d["interval"] == "15m"
+                    assert d["price"] == 0.06123
+                    assert len(d["klines"]) == 1
+        finally:
+            await srv.stop()
+
 
 class TestRiskGuardReset:
     def test_reset_risk_state_clears_circuit_breaker(self):

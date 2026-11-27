@@ -314,6 +314,7 @@ class TradingSystem:
         self._manual_paused: bool = False
         self._open_orders_cache: List[Dict[str, Any]] = []
         self._open_orders_cache_ts: float = 0.0
+        self._klines_cache: Dict[tuple, tuple] = {}
         self.notifier = WeChatNotifier()
         self._monitor_enabled = os.getenv("MONITOR_ENABLED", "true").lower() == "true"
         self.monitor_server: Optional[MonitorWebServer] = (
@@ -323,6 +324,7 @@ class TradingSystem:
                 params_handler=self._handle_web_params,
                 orders_provider=self._fetch_open_orders,
                 cancel_order_handler=self._handle_web_cancel_order,
+                klines_provider=self._fetch_live_klines,
             )
             if self._monitor_enabled
             else None
@@ -420,7 +422,11 @@ class TradingSystem:
                 else:
                     cands = [p for p in (ts.stop_loss_price, ts.trailing_stop_price) if p > 0]
                     eff_stop = min(cands) if cands else 0.0
-            live_px = self.data_engine.get_latest_price_sync(sym) or self._last_prices.get(sym, 0.0)
+            ws_px = self.data_engine.get_latest_price_sync(sym)
+            if ws_px > 0 and self.data_engine.get_data_age(sym) < 15.0:
+                live_px = ws_px
+            else:
+                live_px = self._last_prices.get(sym, 0.0) or ws_px
             sym_rows.append({
                 "symbol": sym,
                 "price": live_px,
@@ -789,6 +795,56 @@ class TradingSystem:
             level="INFO",
         )
         return {"ok": True, "message": f"已撤销 {sym} 挂单 #{order_id or client_order_id}"}
+
+    async def _fetch_live_klines(
+        self, symbol: str = "", interval: str = "5m", limit: int = 100
+    ) -> Dict[str, Any]:
+        """Fetch fresh OHLCV klines and live price directly from Binance REST (3s TTL cache)."""
+        sym = symbol or self.app_config.trading.symbols[0]
+        allowed_syms = {s.upper() for s in self.app_config.trading.symbols}
+        if sym.upper() not in allowed_syms:
+            raise ValueError(f"Unconfigured symbol: {sym}")
+        if interval not in ("1m", "5m", "15m", "1h", "4h"):
+            raise ValueError(f"Unsupported interval: {interval}")
+
+        cache_key = (sym, interval, limit)
+        now = time.time()
+        cached = self._klines_cache.get(cache_key)
+        if cached and (now - cached[0]) < 3.0:
+            return cached[1]
+
+        bars = await self.data_engine.fetch_recent(sym, interval, limit=limit)
+        if not bars:
+            bars = (await self.data_engine.get_ohlcv(sym, interval=interval))[-limit:]
+
+        live_price = 0.0
+        try:
+            live_price = await self.exchange_client.get_ticker_price(sym)
+        except Exception:
+            pass
+        if live_price <= 0 and bars:
+            live_price = float(bars[-1].get("close", 0.0))
+        if live_price > 0:
+            self._last_prices[sym] = live_price
+
+        payload = {
+            "symbol": sym,
+            "interval": interval,
+            "price": live_price,
+            "klines": [
+                {
+                    "t": str(b.get("timestamp", "")),
+                    "o": float(b.get("open", 0.0)),
+                    "h": float(b.get("high", 0.0)),
+                    "l": float(b.get("low", 0.0)),
+                    "c": float(b.get("close", 0.0)),
+                    "v": float(b.get("volume", 0.0)),
+                }
+                for b in bars
+            ],
+        }
+        self._klines_cache[cache_key] = (now, payload)
+        return payload
 
     def _get_positions(self) -> List[Dict]:
         """Return open positions from the ledger."""
@@ -1194,17 +1250,20 @@ class TradingSystem:
                 self.running = False
                 return
 
-        # 0. Data freshness — warn if WebSocket data is stale, but continue
+        # 0. Data freshness — if WebSocket data is stale, auto-refresh via REST fallback
         data_age = self.data_engine.get_data_age(symbol)
         max_stale = self._get_tick_interval_seconds() * 3
-        grace_period = self._get_tick_interval_seconds() * 3
+        grace_period = 60.0
         runtime = time.time() - self._start_time if self._start_time else 0
         if runtime > grace_period and data_age > max_stale:
             age_str = f"{data_age:.0f}s" if data_age != float("inf") else "never"
             logger.warning(
                 f"WebSocket data stale for {symbol}: {age_str} (limit={max_stale:.0f}s). "
-                f"Proceeding with cached data."
+                f"Refreshing klines via REST fallback..."
             )
+            for iv in {self.primary_interval, self.trend_interval, self.macro_cfg.interval, self.macro_cfg.short_interval}:
+                if iv in self.data_engine.buffers.get(symbol, {}):
+                    await self.data_engine._fetch_historical(symbol, iv)
 
         # 1. Get latest OHLCV data (primary interval for grid + regime)
         ohlcv = await self.data_engine.get_ohlcv(symbol, interval=self.primary_interval)

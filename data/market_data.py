@@ -371,7 +371,7 @@ class MarketDataEngine:
 
         while self._running:
             try:
-                async with self._session.ws_connect(ws_url) as ws:
+                async with self._session.ws_connect(ws_url, heartbeat=20.0) as ws:
                     self._ws_connection = ws
                     logger.info(f"WebSocket connected: {len(stream_names)} streams")
                     reconnect_delay = self.ws_reconnect_delay  # Reset on successful connect

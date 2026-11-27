@@ -132,6 +132,27 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
 
     <div id="kpis" class="grid"></div>
 
+    <!-- Live K-Line Candlestick Chart -->
+    <div class="card">
+      <h2>
+        <span style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;">
+          <span>实时 K 线与挂单点位</span>
+          <span id="klineSym" class="pill blue">—</span>
+          <span id="klineLivePx" style="font-family:ui-monospace,monospace;font-size:17px;font-weight:700;">—</span>
+          <span id="klineChg" class="sub"></span>
+        </span>
+        <div id="tfBtns" style="display:flex;gap:4px;flex-wrap:wrap;">
+          <button class="btn" style="padding:3px 9px;font-size:11px;" onclick="setTf('1m')">1m</button>
+          <button class="btn blue" style="padding:3px 9px;font-size:11px;" onclick="setTf('5m')">5m</button>
+          <button class="btn" style="padding:3px 9px;font-size:11px;" onclick="setTf('15m')">15m</button>
+          <button class="btn" style="padding:3px 9px;font-size:11px;" onclick="setTf('1h')">1h</button>
+          <button class="btn" style="padding:3px 9px;font-size:11px;" onclick="setTf('4h')">4h</button>
+        </div>
+      </h2>
+      <canvas id="klineCanvas" style="height:260px;"></canvas>
+      <div id="klineMeta" class="sub" style="margin-top:4px;">正在拉取实时 K 线...</div>
+    </div>
+
     <div class="card">
       <h2><span>净值实时曲线（PostgreSQL 历史快照）</span><span id="eqRange" class="sub"></span></h2>
       <canvas id="sparkCanvas"></canvas>
@@ -242,6 +263,9 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
     const authSuffix = token ? "?token=" + encodeURIComponent(token) : "";
     let lastState = null;
     let paramsLoaded = false;
+    let currentTf = "5m";
+    let lastOrders = [];
+    let lastKlineData = null;
 
     function showToast(msg, ok = true) {
       const el = document.getElementById("toast");
@@ -341,6 +365,8 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
         if (!r.ok) return;
         const data = await r.json();
         const orders = data.orders || [];
+        lastOrders = orders;
+        if (lastKlineData) drawKlines(lastKlineData, lastOrders);
         const canCtrl = Boolean(lastState && lastState.controls_enabled);
         const buys = orders.filter(o => o.side === "BUY").length;
         const sells = orders.filter(o => o.side === "SELL").length;
@@ -370,6 +396,153 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
         }).join("") || `<tr><td colspan="9" style="color:var(--muted)">当前无未成交挂单</td></tr>`;
       } catch (e) {
         document.getElementById("orderMeta").textContent = "拉取挂单失败";
+      }
+    }
+
+    function setTf(tf) {
+      currentTf = tf;
+      document.querySelectorAll("#tfBtns button").forEach(b => {
+        b.className = b.textContent.trim() === tf ? "btn blue" : "btn";
+      });
+      refreshKlines();
+    }
+
+    async function refreshKlines() {
+      try {
+        const sep = authSuffix ? "&" : "?";
+        const r = await fetch(`/api/klines${authSuffix}${sep}interval=${encodeURIComponent(currentTf)}&limit=100`);
+        if (!r.ok) return;
+        const d = await r.json();
+        lastKlineData = d;
+        document.getElementById("klineSym").textContent = d.symbol || "—";
+        const ks = d.klines || [];
+        const livePx = Number(d.price || (ks.length ? ks[ks.length - 1].c : 0));
+        const pxEl = document.getElementById("klineLivePx");
+        pxEl.textContent = livePx > 0 ? ("$" + fmtPx(livePx)) : "—";
+        if (ks.length >= 2 && livePx > 0) {
+          const firstO = Number(ks[0].o || livePx);
+          const chg = firstO > 0 ? ((livePx - firstO) / firstO * 100) : 0;
+          pxEl.className = chg >= 0 ? "pos" : "neg";
+          document.getElementById("klineChg").textContent =
+            `${currentTf} 区间 ${chg >= 0 ? "+" : ""}${chg.toFixed(2)}% · 高 $${fmtPx(Math.max(...ks.map(k => k.h)))} / 低 $${fmtPx(Math.min(...ks.map(k => k.l)))}`;
+        }
+        drawKlines(d, lastOrders);
+        document.getElementById("klineMeta").textContent =
+          `共 ${ks.length} 根 ${currentTf} K 线 · 蓝虚线=买单挂单 · 橙虚线=卖单/TP · 实时每 5 秒刷新`;
+      } catch (e) {
+        document.getElementById("klineMeta").textContent = "拉取 K 线失败: " + e.message;
+      }
+    }
+
+    function drawKlines(d, orders) {
+      const c = document.getElementById("klineCanvas");
+      const dpr = window.devicePixelRatio || 1;
+      const w = c.parentElement.clientWidth - 24, h = 260;
+      c.width = w * dpr; c.height = h * dpr;
+      const ctx = c.getContext("2d");
+      ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+      ctx.clearRect(0, 0, w, h);
+
+      const ks = (d && d.klines) || [];
+      if (ks.length < 2) {
+        ctx.fillStyle = "#8b9bb4"; ctx.font = "12px sans-serif";
+        ctx.fillText("等待 K 线数据...", 12, 130);
+        return;
+      }
+
+      const sym = d.symbol || "";
+      const symOrders = (orders || []).filter(o => o.symbol === sym && Number(o.price) > 0);
+      const livePx = Number(d.price || ks[ks.length - 1].c);
+
+      let mn = Math.min(...ks.map(k => k.l));
+      let mx = Math.max(...ks.map(k => k.h));
+      if (livePx > 0) { mn = Math.min(mn, livePx); mx = Math.max(mx, livePx); }
+      // Include nearby open orders (within 15% of range) so grid lines show clearly
+      const span = Math.max(mx - mn, livePx * 0.01);
+      symOrders.forEach(o => {
+        const p = Number(o.price);
+        if (p >= mn - span * 1.2 && p <= mx + span * 1.2) {
+          mn = Math.min(mn, p);
+          mx = Math.max(mx, p);
+        }
+      });
+      const pad = Math.max((mx - mn) * 0.08, livePx * 0.001);
+      mn -= pad; mx += pad;
+
+      const pL = 8, pR = 66, pT = 12, pB = 22;
+      const volH = 38;
+      const pw = w - pL - pR, ph = h - pT - pB - volH;
+      const yOf = v => pT + (1 - (v - mn) / (mx - mn)) * ph;
+      const step = pw / ks.length;
+      const bodyW = Math.max(2, Math.min(10, step * 0.66));
+
+      // Horizontal price grid + right-axis labels
+      ctx.strokeStyle = "#1e293b"; ctx.lineWidth = 0.8;
+      ctx.fillStyle = "#8b9bb4"; ctx.font = "11px ui-monospace, monospace"; ctx.textAlign = "left";
+      for (let g = 0; g <= 4; g++) {
+        const y = pT + (g / 4) * ph;
+        const val = mx - (g / 4) * (mx - mn);
+        ctx.beginPath(); ctx.moveTo(pL, y); ctx.lineTo(w - pR, y); ctx.stroke();
+        ctx.fillText(fmtPx(val), w - pR + 6, y + 4);
+      }
+
+      // Volume bars at bottom
+      const maxVol = Math.max(...ks.map(k => k.v || 0), 1e-9);
+      const volTop = pT + ph + 4;
+      ks.forEach((k, i) => {
+        const x = pL + i * step + step / 2;
+        const vh = ((k.v || 0) / maxVol) * (volH - 6);
+        ctx.fillStyle = k.c >= k.o ? "rgba(16,185,129,0.28)" : "rgba(239,68,68,0.28)";
+        ctx.fillRect(x - bodyW / 2, volTop + (volH - 6) - vh, bodyW, vh);
+      });
+
+      // Candlesticks
+      ks.forEach((k, i) => {
+        const x = pL + i * step + step / 2;
+        const up = k.c >= k.o;
+        const col = up ? "#10b981" : "#ef4444";
+        ctx.strokeStyle = col; ctx.fillStyle = col; ctx.lineWidth = 1;
+        ctx.beginPath(); ctx.moveTo(x, yOf(k.h)); ctx.lineTo(x, yOf(k.l)); ctx.stroke();
+        const yO = yOf(k.o), yC = yOf(k.c);
+        const top = Math.min(yO, yC), bh = Math.max(1.2, Math.abs(yC - yO));
+        ctx.fillRect(x - bodyW / 2, top, bodyW, bh);
+      });
+
+      // Open order dashed lines
+      ctx.save();
+      ctx.setLineDash([4, 4]);
+      symOrders.forEach(o => {
+        const p = Number(o.price);
+        if (p < mn || p > mx) return;
+        const y = yOf(p);
+        ctx.strokeStyle = o.side === "BUY" ? "rgba(59,130,246,0.85)" : "rgba(245,158,11,0.9)";
+        ctx.lineWidth = 1.1;
+        ctx.beginPath(); ctx.moveTo(pL, y); ctx.lineTo(w - pR, y); ctx.stroke();
+      });
+      ctx.restore();
+
+      // Current live price line + right-axis pill
+      if (livePx > 0 && livePx >= mn && livePx <= mx) {
+        const y = yOf(livePx);
+        ctx.save();
+        ctx.setLineDash([2, 2]);
+        ctx.strokeStyle = "#e6edf7"; ctx.lineWidth = 1;
+        ctx.beginPath(); ctx.moveTo(pL, y); ctx.lineTo(w - pR, y); ctx.stroke();
+        ctx.restore();
+        ctx.fillStyle = "#3b82f6";
+        ctx.fillRect(w - pR + 2, y - 9, pR - 4, 18);
+        ctx.fillStyle = "#ffffff"; ctx.font = "bold 11px ui-monospace, monospace";
+        ctx.fillText(fmtPx(livePx), w - pR + 6, y + 4);
+      }
+
+      // Bottom time labels
+      ctx.fillStyle = "#8b9bb4"; ctx.font = "10px ui-monospace, monospace"; ctx.textAlign = "center";
+      const ticks = 5;
+      for (let t = 0; t < ticks; t++) {
+        const idx = Math.min(ks.length - 1, Math.floor((t / (ticks - 1)) * (ks.length - 1)));
+        const ts = (ks[idx].t || "").slice(11, 16);
+        const x = pL + idx * step + step / 2;
+        ctx.fillText(ts, Math.max(24, Math.min(w - pR - 20, x)), h - 5);
       }
     }
 
@@ -526,6 +699,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
         const logs = d.recent_logs || [];
         document.getElementById("logBox").textContent = logs.length ? logs.join("\n") : "暂无日志...";
         drawSpark(d.equity_history || []);
+        refreshKlines();
         refreshOrders(false);
       } catch (e) {
         document.getElementById("statusDot").className = "dot err";
@@ -534,7 +708,10 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
     }
     refresh();
     setInterval(refresh, 5000);
-    window.addEventListener("resize", refresh);
+    window.addEventListener("resize", () => {
+      if (lastState) drawSpark(lastState.equity_history || []);
+      if (lastKlineData) drawKlines(lastKlineData, lastOrders);
+    });
   </script>
 </body>
 </html>
@@ -551,6 +728,7 @@ class MonitorWebServer:
         params_handler: Optional[Callable[[Dict[str, Any]], Awaitable[Dict[str, Any]]]] = None,
         orders_provider: Optional[Callable[[bool], Awaitable[List[Dict[str, Any]]]]] = None,
         cancel_order_handler: Optional[Callable[[Dict[str, Any]], Awaitable[Dict[str, Any]]]] = None,
+        klines_provider: Optional[Callable[[str, str, int], Awaitable[Dict[str, Any]]]] = None,
         host: Optional[str] = None,
         port: Optional[int] = None,
         token: Optional[str] = None,
@@ -560,6 +738,7 @@ class MonitorWebServer:
         self._params_handler = params_handler
         self._orders_provider = orders_provider
         self._cancel_order_handler = cancel_order_handler
+        self._klines_provider = klines_provider
         self.host = host or os.getenv("MONITOR_HOST", "0.0.0.0")
         self.port = int(port if port is not None else os.getenv("MONITOR_PORT", "8080"))
         self.token = (token if token is not None else os.getenv("MONITOR_TOKEN", "")).strip()
@@ -567,6 +746,7 @@ class MonitorWebServer:
         self._app = web.Application()
         self._app.router.add_get("/", self._handle_index)
         self._app.router.add_get("/api/status", self._handle_status)
+        self._app.router.add_get("/api/klines", self._handle_klines)
         self._app.router.add_get("/api/orders", self._handle_orders)
         self._app.router.add_post("/api/orders/cancel", self._handle_cancel_order)
         self._app.router.add_post("/api/control", self._handle_control)
@@ -607,6 +787,23 @@ class MonitorWebServer:
             return web.json_response(data)
         except Exception as e:
             logger.error(f"Monitor status error: {e}")
+            return web.json_response({"error": str(e)}, status=500)
+
+    async def _handle_klines(self, request: web.Request) -> web.Response:
+        if not self._is_authorized(request):
+            return web.json_response({"error": "unauthorized"}, status=401)
+        if self._klines_provider is None:
+            return web.json_response({"symbol": "", "interval": "5m", "price": 0.0, "klines": []})
+        try:
+            symbol = request.query.get("symbol", "").strip().upper()
+            interval = request.query.get("interval", "5m").strip()
+            limit = max(30, min(200, int(request.query.get("limit", "100"))))
+            data = await self._klines_provider(symbol, interval, limit)
+            return web.json_response(data)
+        except ValueError as e:
+            return web.json_response({"error": str(e)}, status=400)
+        except Exception as e:
+            logger.error(f"Monitor klines error: {e}")
             return web.json_response({"error": str(e)}, status=500)
 
     async def _handle_orders(self, request: web.Request) -> web.Response:
