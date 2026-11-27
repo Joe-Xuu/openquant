@@ -420,9 +420,10 @@ class TradingSystem:
                 else:
                     cands = [p for p in (ts.stop_loss_price, ts.trailing_stop_price) if p > 0]
                     eff_stop = min(cands) if cands else 0.0
+            live_px = self.data_engine.get_latest_price_sync(sym) or self._last_prices.get(sym, 0.0)
             sym_rows.append({
                 "symbol": sym,
-                "price": self._last_prices.get(sym, 0.0),
+                "price": live_px,
                 "regime": self._current_regime.get(sym, MarketRegime.RANGING).value,
                 "macro_1h": self._macro_trend.get(sym, MacroTrend.NEUTRAL).value,
                 "short_macro_bear": self._short_macro_bearish.get(sym, False),

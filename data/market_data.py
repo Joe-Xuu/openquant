@@ -486,6 +486,13 @@ class MarketDataEngine:
                 return buffer.latest.close
             return 0.0
 
+    def get_latest_price_sync(self, symbol: str) -> float:
+        """Non-blocking snapshot of the latest WebSocket close price (for Web UI)."""
+        buffer = self.buffers.get(symbol, {}).get(self.primary_interval)
+        if buffer and buffer.latest:
+            return buffer.latest.close
+        return 0.0
+
     async def get_latest_bar(
         self, symbol: str, interval: Optional[str] = None
     ) -> Optional[OHLCVBar]:
