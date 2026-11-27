@@ -23,6 +23,8 @@
         "fallback_equity": 100.0,
         "grid_capital_pct": 0.45,
         "trend_capital_pct": 0.50,
+        "leverage": 1.0,
+        "margin_type": "ISOLATED",
         "max_positions_per_symbol": 1,
         "max_total_positions": 5,
         "order_timeout_seconds": 30,

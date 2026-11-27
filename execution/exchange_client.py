@@ -200,12 +200,16 @@ class OrderRequest:
     time_in_force: str = "GTC"
     client_order_id: Optional[str] = None
     new_client_order_id: Optional[str] = None  # For modification
+    reduce_only: bool = False
 
     def validate(self) -> Tuple[bool, str]:
         """Validate order parameters before dispatch."""
         if self.order_type in ("LIMIT", "STOP_LOSS_LIMIT", "TAKE_PROFIT_LIMIT") and self.price is None:
             return False, f"Price required for {self.order_type} order"
-        if self.order_type in ("STOP_LOSS", "STOP_LOSS_LIMIT", "TAKE_PROFIT", "TAKE_PROFIT_LIMIT") and self.stop_price is None:
+        if self.order_type in (
+            "STOP_LOSS", "STOP_LOSS_LIMIT", "STOP_MARKET",
+            "TAKE_PROFIT", "TAKE_PROFIT_LIMIT", "TAKE_PROFIT_MARKET",
+        ) and self.stop_price is None:
             return False, f"Stop price required for {self.order_type} order"
         if self.quantity <= 0:
             return False, f"Quantity must be positive, got {self.quantity}"
@@ -478,7 +482,7 @@ class ExchangeClient:
                 "type": request.order_type.upper(),
                 "quantity": request.quantity,
                 "newClientOrderId": request.client_order_id,
-                "newOrderRespType": "FULL",
+                "newOrderRespType": "RESULT" if self.market == "futures" else "FULL",
             }
 
             if request.price is not None:
@@ -487,11 +491,14 @@ class ExchangeClient:
                 params["stopPrice"] = request.stop_price
             if request.order_type in ("LIMIT", "STOP_LOSS_LIMIT", "TAKE_PROFIT_LIMIT"):
                 params["timeInForce"] = request.time_in_force
+            if request.reduce_only and self.market == "futures":
+                params["reduceOnly"] = "true"
 
             logger.info(
                 f"Placing order: {request.symbol} {request.side} "
                 f"{request.order_type} qty={request.quantity}"
                 + (f" @ {request.price}" if request.price else "")
+                + (" [reduceOnly]" if request.reduce_only and self.market == "futures" else "")
             )
 
             response = await self._signed_request("POST", f"{self._api_prefix}/order", params)
@@ -504,10 +511,12 @@ class ExchangeClient:
                 side=response.get("side", request.side),
                 order_type=response.get("type", request.order_type),
                 status=response.get("status", "UNKNOWN"),
-                price=float(response.get("price", 0)),
+                price=float(response.get("avgPrice") or response.get("price") or 0),
                 quantity=float(response.get("origQty", 0)),
                 executed_qty=float(response.get("executedQty", 0)),
-                cummulative_quote_qty=float(response.get("cummulativeQuoteQty", 0)),
+                cummulative_quote_qty=float(
+                    response.get("cumQuote") or response.get("cummulativeQuoteQty") or 0
+                ),
                 created_at=datetime.now(timezone.utc).isoformat(),
                 updated_at=datetime.now(timezone.utc).isoformat(),
                 raw_response=response,
@@ -567,13 +576,44 @@ class ExchangeClient:
         start_time: Optional[int] = None,
         from_id: Optional[int] = None,
     ) -> List[Dict[str, Any]]:
-        """Fetch recent account trades (fills) for a symbol."""
+        """Fetch recent account trades (fills) for a symbol (Spot myTrades / Futures userTrades)."""
         params: Dict[str, Any] = {"symbol": symbol.upper(), "limit": limit}
         if start_time is not None:
             params["startTime"] = start_time
         if from_id is not None:
             params["fromId"] = from_id
-        return await self._signed_request("GET", f"{self._api_prefix}/myTrades", params)
+        endpoint = "/fapi/v1/userTrades" if self.market == "futures" else f"{self._api_prefix}/myTrades"
+        return await self._signed_request("GET", endpoint, params)
+
+    # ------------------------------------------------------------------
+    # Futures Leverage, Margin Mode & Positions
+    # ------------------------------------------------------------------
+
+    async def set_leverage(self, symbol: str, leverage: int) -> Dict[str, Any]:
+        """Set isolated/crossed leverage for a USDT-M Futures symbol."""
+        if self.market != "futures":
+            return {}
+        params = {"symbol": symbol.upper(), "leverage": max(1, int(leverage))}
+        return await self._signed_request("POST", "/fapi/v1/leverage", params)
+
+    async def set_margin_type(self, symbol: str, margin_type: str = "ISOLATED") -> Dict[str, Any]:
+        """Set margin type (ISOLATED/CROSSED) for a USDT-M Futures symbol."""
+        if self.market != "futures":
+            return {}
+        params = {"symbol": symbol.upper(), "marginType": margin_type.upper()}
+        try:
+            return await self._signed_request("POST", "/fapi/v1/marginType", params)
+        except BinanceAPIError as e:
+            if e.status_code == 400 and "-4046" in str(e.payload):
+                return {"msg": "already_set"}
+            raise
+
+    async def get_futures_positions(self, symbol: Optional[str] = None) -> List[Dict[str, Any]]:
+        """Fetch open USDT-M Futures positionRisk entries."""
+        if self.market != "futures":
+            return []
+        params = {"symbol": symbol.upper()} if symbol else {}
+        return await self._signed_request("GET", "/fapi/v2/positionRisk", params)
 
     # ------------------------------------------------------------------
     # User Data Stream (listenKey)
@@ -624,7 +664,18 @@ class ExchangeClient:
     # ------------------------------------------------------------------
 
     async def get_balances(self) -> List[BalanceInfo]:
-        """Get current account balances."""
+        """Get current account balances (Spot /api/v3/account or Futures /fapi/v2/balance)."""
+        if self.market == "futures":
+            rows = await self._signed_request("GET", "/fapi/v2/balance")
+            balances = []
+            for b in rows:
+                total = float(b.get("balance", 0.0))
+                free = float(b.get("availableBalance", 0.0))
+                locked = max(0.0, total - free)
+                if total > 0 or free > 0:
+                    balances.append(BalanceInfo(asset=b["asset"], free=free, locked=locked))
+            return balances
+
         response = await self._signed_request("GET", f"{self._api_prefix}/account")
         balances = []
         for b in response.get("balances", []):

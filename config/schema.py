@@ -40,6 +40,8 @@ class TradingConfig(BaseModel):
     fallback_equity: float = Field(default=100.0, gt=0.0)
     grid_capital_pct: float = Field(default=0.45, gt=0.0, le=1.0)
     trend_capital_pct: float = Field(default=0.50, ge=0.0, le=1.0)
+    leverage: float = Field(default=1.0, ge=1.0, le=3.0)
+    margin_type: Literal["ISOLATED", "CROSSED"] = "ISOLATED"
     max_positions_per_symbol: int = Field(default=1, ge=1)
     max_total_positions: int = Field(default=5, ge=1)
     order_timeout_seconds: int = Field(default=30, ge=5)
@@ -201,6 +203,14 @@ class AppConfig(BaseModel):
     def enforce_spot_rules(self) -> AppConfig:
         if self.exchange.market == "spot":
             self.strategy.trend_following.allow_short = False
+            self.trading.leverage = 1.0
+            self.risk.max_leverage = 1.0
+        else:
+            # Futures: align risk max_leverage & exposure ceilings with configured leverage
+            self.risk.max_leverage = max(self.risk.max_leverage, self.trading.leverage)
+            self.risk.max_exposure_pct = max(
+                self.risk.max_exposure_pct, 100.0 * self.trading.leverage
+            )
         macro_iv = self.strategy.macro_filter.interval
         if self.strategy.macro_filter.enabled and macro_iv not in self.data.kline_intervals:
             self.data.kline_intervals.append(macro_iv)
@@ -222,6 +232,19 @@ def load_app_config(config_path: str = "config/settings.json") -> AppConfig:
         ex["testnet"] = os.getenv("BINANCE_TESTNET", "true").lower() == "true"
     if os.getenv("BINANCE_MARKET") is not None:
         ex["market"] = os.getenv("BINANCE_MARKET", "spot").lower()
+
+    tr = raw.setdefault("trading", {})
+    if os.getenv("BINANCE_LEVERAGE") is not None:
+        tr["leverage"] = float(os.getenv("BINANCE_LEVERAGE", "1.0"))
+    if os.getenv("BINANCE_MARGIN_TYPE") is not None:
+        tr["margin_type"] = os.getenv("BINANCE_MARGIN_TYPE", "ISOLATED").upper()
+
+    if ex.get("market") == "futures":
+        st = raw.setdefault("strategy", {}).setdefault("trend_following", {})
+        if os.getenv("ALLOW_SHORT") is not None:
+            st["allow_short"] = os.getenv("ALLOW_SHORT", "true").lower() == "true"
+        elif "allow_short" not in st or st["allow_short"] is False:
+            st["allow_short"] = True
 
     rk = raw.setdefault("risk", {})
     for key, env_key in (

@@ -59,12 +59,15 @@ from strategy.trend_strategy import TrendDirection, TrendState, TrendStrategy
 class BacktestConfig:
     """Backtest parameters aligned with live Binance Spot settings."""
     symbol: str = "DOGEUSDT"
+    market: str = "spot"         # "spot" or "futures"
+    leverage: float = 1.0        # Isolated margin leverage for futures (>=1.0; ignored in spot)
+    funding_rate_8h_pct: float = 0.01  # Conservative 8h funding drag % in futures
     interval: str = "5m"
     trend_interval: str = "1h"   # "5m", "15m", "1h"
     initial_capital: float = 100.0
     grid_capital_pct: float = 0.45
     trend_capital_pct: float = 0.50
-    fee_pct: float = 0.10        # 0.10% per side (Binance Spot standard)
+    fee_pct: float = 0.10        # 0.10% per side (Binance Spot standard; use 0.05% for Futures)
     slippage_pct: float = 0.05   # 0.05% on market orders
     max_position_pct: float = 75.0
     max_exposure_pct: float = 100.0
@@ -98,9 +101,13 @@ class BacktestConfig:
     trend_exit_on_ema_cross: bool = False
     trend_require_ema200_rising: bool = True
     trend_gate_by_regime: bool = False  # When False, 1h macro + ADX/MACD gate trend directly
-    allow_short: bool = False    # Spot default: long-only
+    allow_short: bool = False    # Spot default: long-only; True in Futures
     consecutive_buy_limit: int = 5
     enforce_risk_guard: bool = True
+
+    @property
+    def effective_leverage(self) -> float:
+        return max(1.0, self.leverage) if self.market == "futures" else 1.0
 
     @property
     def fee_decimal(self) -> float:
@@ -175,6 +182,8 @@ class TrendPosition:
     entry_time: str
     entry_bar: int
     margin_locked: float = 0.0
+    liquidation_price: float = 0.0
+    funding_paid: float = 0.0
 
 
 # ============================================================================
@@ -362,12 +371,14 @@ class BacktestEngine:
         self._grid_retry_after_bar: int = 0
         self._current_bar_dt: datetime = datetime(2020, 1, 1, tzinfo=timezone.utc)
 
+        lev = self.cfg.effective_leverage
         self.risk_guard = RiskGuard(
             config={
                 "max_drawdown_pct": self.cfg.max_drawdown_pct,
                 "max_daily_loss_pct": self.cfg.max_daily_loss_pct,
-                "max_position_size_pct": self.cfg.max_position_pct,
-                "max_exposure_pct": self.cfg.max_exposure_pct,
+                "max_position_size_pct": self.cfg.max_position_pct * lev,
+                "max_exposure_pct": self.cfg.max_exposure_pct * lev,
+                "max_leverage": lev,
                 "min_order_notional": float(self.symbol_info.min_notional),
             },
             equity_provider=self._mark_to_market_equity,
@@ -386,11 +397,15 @@ class BacktestEngine:
         trend_val = 0.0
         if self.trend_pos is not None:
             if self.trend_pos.direction == "LONG":
-                trend_val = self.trend_pos.quantity * px
+                if self.trend_pos.margin_locked > 0:
+                    unrealized = (px - self.trend_pos.entry_price) * self.trend_pos.quantity
+                    trend_val = max(0.0, self.trend_pos.margin_locked + unrealized)
+                else:
+                    trend_val = self.trend_pos.quantity * px
             else:
-                # Short: margin_locked + unrealized PnL
+                # Short: isolated margin_locked + unrealized PnL
                 unrealized = (self.trend_pos.entry_price - px) * self.trend_pos.quantity
-                trend_val = self.trend_pos.margin_locked + unrealized
+                trend_val = max(0.0, self.trend_pos.margin_locked + unrealized)
         return self.cash + grid_val + trend_val
 
     def _risk_positions(self) -> List[Dict[str, Any]]:
@@ -457,10 +472,26 @@ class BacktestEngine:
             self._match_grid_orders(bar, bar_idx=i, mode=strategy_mode)
             self._check_trend_intrabar_stop(bar, bar_idx=i, mode=strategy_mode)
 
-            # Update TrendState peak price intrabar for Chandelier stop accuracy
-            if self.trend_pos is not None and self.trend_pos.direction == "LONG":
-                if bar["high"] > self._trend_state.highest_price:
-                    self._trend_state.highest_price = bar["high"]
+            # Update TrendState peak/trough price intrabar for Chandelier stop accuracy
+            if self.trend_pos is not None:
+                if self.trend_pos.direction == "LONG":
+                    if bar["high"] > self._trend_state.highest_price:
+                        self._trend_state.highest_price = bar["high"]
+                else:
+                    if self._trend_state.lowest_price <= 0 or bar["low"] < self._trend_state.lowest_price:
+                        self._trend_state.lowest_price = bar["low"]
+
+                # Conservative 8h funding rate deduction in Futures mode (every 96 5m bars)
+                if (
+                    self.cfg.market == "futures"
+                    and self.cfg.funding_rate_8h_pct > 0
+                    and i > self.trend_pos.entry_bar
+                    and (i - self.trend_pos.entry_bar) % 96 == 0
+                ):
+                    notional = self.trend_pos.quantity * bar["close"]
+                    funding = notional * (self.cfg.funding_rate_8h_pct / 100.0)
+                    self.cash -= funding
+                    self.trend_pos.funding_paid += funding
 
             # 2. Fetch causal indicators at bar i (zero future data)
             indicators = primary_indicators[i]
@@ -509,12 +540,14 @@ class BacktestEngine:
             # Strictly causal 1h macro trend classification
             self._cur_macro_es: float = 0.0
             self._cur_macro_es_rising: bool = True
+            self._cur_macro_es_falling: bool = True
             if self.cfg.use_macro_filter:
                 m_idx = (i // macro_factor) - (0 if (i + 1) % macro_factor == 0 else 1)
                 if m_idx >= self.cfg.macro_ema_fast:
                     self._cur_macro_es = macro_es[m_idx]
                     if m_idx >= 24:
                         self._cur_macro_es_rising = macro_es[m_idx] > macro_es[m_idx - 24]
+                        self._cur_macro_es_falling = macro_es[m_idx] < macro_es[m_idx - 24]
                     macro_trend = classify_macro_trend(
                         bar["close"], macro_ef[m_idx], macro_es[m_idx]
                     )
@@ -821,11 +854,17 @@ class BacktestEngine:
             return
 
         macro_bullish: Optional[bool] = None
+        macro_bearish: Optional[bool] = None
         if self.cfg.use_macro_filter:
             macro_bullish = (macro_trend == MacroTrend.BULL)
-            if self.cfg.trend_require_ema200_rising and not self._cur_macro_es_rising:
-                macro_bullish = False
+            macro_bearish = (macro_trend == MacroTrend.BEAR)
+            if self.cfg.trend_require_ema200_rising:
+                if not self._cur_macro_es_rising:
+                    macro_bullish = False
+                if not self._cur_macro_es_falling:
+                    macro_bearish = False
 
+        lev = self.cfg.effective_leverage
         trend_cap = live_eq * (1.0 if mode == "trend_only" else self.cfg.trend_capital_pct)
         sig = self.trend.evaluate(
             symbol=self.cfg.symbol,
@@ -835,9 +874,10 @@ class BacktestEngine:
             macd_hist=t_ind.macd_hist,
             atr=t_ind.atr,
             current_state=self._trend_state,
-            capital=trend_cap,
+            capital=trend_cap * lev,
             adx=t_ind.adx,
             macro_bullish=macro_bullish,
+            macro_bearish=macro_bearish,
         )
         if sig is None:
             return
@@ -852,9 +892,9 @@ class BacktestEngine:
 
         if sig.action == SignalAction.START_TREND and not self._trend_state.is_active:
             direction = meta["direction"]
-            # Cap trend notional to trend_cap so it stays strictly within its capital bucket
+            # Cap trend notional to trend_cap * leverage so it stays within its margin bucket
             px = bar["close"]
-            max_bucket_qty = trend_cap / (px * (1.0 + self.cfg.fee_decimal + self.cfg.slippage_decimal))
+            max_bucket_qty = (trend_cap * lev) / (px * (1.0 + self.cfg.fee_decimal * lev + self.cfg.slippage_decimal))
             qty = self.symbol_info.floor_qty(min(meta.get("position_size", 0.0), max_bucket_qty))
             if self.symbol_info.is_valid_order(px, qty):
                 opened = self._open_trend_position(
@@ -902,15 +942,22 @@ class BacktestEngine:
         if qty <= 0 or price <= 0:
             return False
 
+        is_futures = (self.cfg.market == "futures")
+        lev = self.cfg.effective_leverage
+
         if direction == "LONG":
             fill_px = price * (1.0 + self.cfg.slippage_decimal)
-            max_affordable = self.cash / (fill_px * (1.0 + self.cfg.fee_decimal))
+            # Required cash per unit = (fill_px / lev) + fill_px * fee
+            cash_per_unit = fill_px * ((1.0 / lev) + self.cfg.fee_decimal)
+            max_affordable = self.cash / cash_per_unit if cash_per_unit > 0 else 0.0
             qty = self.symbol_info.floor_qty(min(qty, max_affordable))
             if not self.symbol_info.is_valid_order(fill_px, qty):
                 return False
             notional = fill_px * qty
             fee = notional * self.cfg.fee_decimal
-            self.cash -= notional + fee
+            margin = (notional / lev) if is_futures else 0.0
+            liq_px = (fill_px * (1.0 - 0.90 / lev)) if (is_futures and lev > 1.0) else 0.0
+            self.cash -= (margin if is_futures else notional) + fee
             self.trend_pos = TrendPosition(
                 direction="LONG",
                 quantity=qty,
@@ -920,19 +967,23 @@ class BacktestEngine:
                 trailing_stop=trailing_stop,
                 entry_time=timestamp,
                 entry_bar=bar_idx,
+                margin_locked=margin,
+                liquidation_price=liq_px,
             )
             return True
 
         elif direction == "SHORT" and self.cfg.allow_short:
             fill_px = price * (1.0 - self.cfg.slippage_decimal)
-            # Deduct 100% notional margin + fee from cash (1x short, zero free money!)
-            max_affordable = self.cash / (fill_px * (1.0 + self.cfg.fee_decimal))
+            cash_per_unit = fill_px * ((1.0 / lev) + self.cfg.fee_decimal)
+            max_affordable = self.cash / cash_per_unit if cash_per_unit > 0 else 0.0
             qty = self.symbol_info.floor_qty(min(qty, max_affordable))
             if not self.symbol_info.is_valid_order(fill_px, qty):
                 return False
             notional = fill_px * qty
             fee = notional * self.cfg.fee_decimal
-            self.cash -= notional + fee  # lock margin + pay entry fee
+            margin = notional / lev
+            liq_px = (fill_px * (1.0 + 0.90 / lev)) if lev > 1.0 else (fill_px * 1.90)
+            self.cash -= margin + fee
             self.trend_pos = TrendPosition(
                 direction="SHORT",
                 quantity=qty,
@@ -942,7 +993,8 @@ class BacktestEngine:
                 trailing_stop=trailing_stop,
                 entry_time=timestamp,
                 entry_bar=bar_idx,
-                margin_locked=notional,
+                margin_locked=margin,
+                liquidation_price=liq_px,
             )
             return True
 
@@ -956,19 +1008,25 @@ class BacktestEngine:
             fill_px = price * (1.0 - self.cfg.slippage_decimal)
             revenue = fill_px * pos.quantity
             exit_fee = revenue * self.cfg.fee_decimal
-            self.cash += revenue - exit_fee
-            pnl = (fill_px - pos.entry_price) * pos.quantity - pos.entry_fee - exit_fee
-            pnl_pct = (pnl / (pos.entry_price * pos.quantity)) * 100.0 if pos.entry_price > 0 else 0.0
+            gross_pnl = (fill_px - pos.entry_price) * pos.quantity
+            if pos.margin_locked > 0:
+                returned = max(0.0, pos.margin_locked + gross_pnl - exit_fee)
+                self.cash += returned
+                pnl = (returned - pos.margin_locked) - pos.entry_fee - pos.funding_paid
+            else:
+                self.cash += revenue - exit_fee
+                pnl = gross_pnl - pos.entry_fee - exit_fee - pos.funding_paid
+            pnl_pct = (pnl / (pos.margin_locked or (pos.entry_price * pos.quantity))) * 100.0 if pos.entry_price > 0 else 0.0
             trade_side = "SELL"
         else:
             fill_px = price * (1.0 + self.cfg.slippage_decimal)
             buyback = fill_px * pos.quantity
             exit_fee = buyback * self.cfg.fee_decimal
             gross_pnl = (pos.entry_price - fill_px) * pos.quantity
-            # Return locked margin + gross PnL - exit fee
-            self.cash += pos.margin_locked + gross_pnl - exit_fee
-            pnl = gross_pnl - pos.entry_fee - exit_fee
-            pnl_pct = (pnl / (pos.entry_price * pos.quantity)) * 100.0 if pos.entry_price > 0 else 0.0
+            returned = max(0.0, pos.margin_locked + gross_pnl - exit_fee)
+            self.cash += returned
+            pnl = (returned - pos.margin_locked) - pos.entry_fee - pos.funding_paid
+            pnl_pct = (pnl / (pos.margin_locked or (pos.entry_price * pos.quantity))) * 100.0 if pos.entry_price > 0 else 0.0
             trade_side = "BUY"
 
         self.trades.append(Trade(
@@ -982,7 +1040,7 @@ class BacktestEngine:
             quantity=pos.quantity,
             pnl=pnl,
             pnl_pct=pnl_pct,
-            fee=pos.entry_fee + exit_fee,
+            fee=pos.entry_fee + exit_fee + pos.funding_paid,
             exit_reason=reason,
         ))
         self.risk_guard.register_trade_result(pnl)

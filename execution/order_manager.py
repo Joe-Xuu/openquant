@@ -763,38 +763,50 @@ class OrderManager:
         quantity: float,
         trade_id: str = "",
     ) -> Optional[TrackedOrder]:
-        """Place a prefix-tagged STOP_LOSS_LIMIT order for a trend position."""
+        """Place a prefix-tagged stop-loss order (Spot STOP_LOSS_LIMIT / Futures STOP_MARKET reduceOnly)."""
         sym_info = self._get_symbol_info(symbol)
+        is_futures = getattr(self._client, "market", "spot") == "futures"
         stop_side = "SELL" if direction == "LONG" else "BUY"
         stop_px = sym_info.round_price(stop_price)
-        # Limit price 0.2% beyond stop price for reliable execution
         limit_px = sym_info.round_price(
             stop_px * (0.998 if stop_side == "SELL" else 1.002)
         )
-        # Floor quantity to step_size and cap at free balance for spot SELL
+        # Floor quantity to step_size; cap at free base balance only on Spot SELL
         qty = sym_info.floor_qty(quantity)
-        if stop_side == "SELL":
+        if not is_futures and stop_side == "SELL":
             try:
                 bal = await self._client.get_asset_balance(sym_info.base_asset)
                 qty = sym_info.floor_qty(min(qty, bal.free))
             except Exception:
                 pass
 
-        if not sym_info.is_valid_order(limit_px, qty):
-            logger.warning(f"Trend stop-loss skipped (invalid/dust): qty={qty} @ {limit_px}")
+        check_px = stop_px if is_futures else limit_px
+        if not sym_info.is_valid_order(check_px, qty):
+            logger.warning(f"Trend stop-loss skipped (invalid/dust): qty={qty} @ {check_px}")
             return None
 
         sl_cid = f"trend_sl_{uuid.uuid4().hex[:14]}"
-        stop_req = OrderRequest(
-            symbol=symbol,
-            side=stop_side,
-            order_type="STOP_LOSS_LIMIT",
-            price=limit_px,
-            stop_price=stop_px,
-            quantity=qty,
-            time_in_force="GTC",
-            client_order_id=sl_cid,
-        )
+        if is_futures:
+            stop_req = OrderRequest(
+                symbol=symbol,
+                side=stop_side,
+                order_type="STOP_MARKET",
+                stop_price=stop_px,
+                quantity=qty,
+                client_order_id=sl_cid,
+                reduce_only=True,
+            )
+        else:
+            stop_req = OrderRequest(
+                symbol=symbol,
+                side=stop_side,
+                order_type="STOP_LOSS_LIMIT",
+                price=limit_px,
+                stop_price=stop_px,
+                quantity=qty,
+                time_in_force="GTC",
+                client_order_id=sl_cid,
+            )
         resp = await self._client.place_order(stop_req)
         tracked = TrackedOrder(
             order_id=sl_cid,
@@ -802,20 +814,24 @@ class OrderManager:
             client_order_id=sl_cid,
             symbol=symbol,
             side=stop_side,
-            order_type="STOP_LOSS_LIMIT",
-            price=limit_px,
+            order_type=stop_req.order_type,
+            price=stop_px if is_futures else limit_px,
             quantity=qty,
             status=resp.status,
             trade_id=trade_id,
         )
         self._orders[sl_cid] = tracked
-        logger.info(f"Trend stop-loss placed: {symbol} {stop_side} {qty} stop={stop_px} limit={limit_px}")
+        logger.info(
+            f"Trend stop-loss placed: {symbol} {stop_side} {stop_req.order_type} "
+            f"{qty} stop={stop_px}" + ("" if is_futures else f" limit={limit_px}")
+        )
         return tracked
 
     async def _close_trend(
         self, signal: StrategySignal, metadata: Dict[str, Any]
     ) -> List[TrackedOrder]:
         """Close a trend position at market WITHOUT cancelling grid or TP orders."""
+        is_futures = getattr(self._client, "market", "spot") == "futures"
         direction = metadata.get("direction", "LONG")
         close_side = "SELL" if direction == "LONG" else "BUY"
         raw_qty = metadata.get("position_size", 0.0)
@@ -834,7 +850,7 @@ class OrderManager:
 
         sym_info = self._get_symbol_info(signal.symbol)
         qty = sym_info.floor_qty(raw_qty)
-        if close_side == "SELL":
+        if not is_futures and close_side == "SELL":
             try:
                 bal = await self._client.get_asset_balance(sym_info.base_asset)
                 qty = sym_info.floor_qty(min(qty, bal.free))
@@ -852,6 +868,7 @@ class OrderManager:
             order_type="MARKET",
             quantity=qty,
             client_order_id=exit_cid,
+            reduce_only=is_futures,
         )
 
         tracked_orders: List[TrackedOrder] = []
@@ -962,28 +979,34 @@ class OrderManager:
                 logger.warning(f"listenKey keepalive failed: {e}")
 
     async def _handle_user_stream_message(self, msg: Dict[str, Any]) -> None:
-        """Parse Binance executionReport and route TRADE executions to _handle_fill_event."""
-        if msg.get("e") != "executionReport":
-            return
-        # Only process actual trade executions (x == "TRADE")
-        if msg.get("x") != "TRADE":
+        """Parse Spot executionReport or Futures ORDER_TRADE_UPDATE and route TRADE fills."""
+        event_type = msg.get("e")
+        if event_type == "executionReport":
+            payload = msg
+        elif event_type == "ORDER_TRADE_UPDATE":
+            payload = msg.get("o", {})
+        else:
             return
 
-        trade_id = str(msg.get("t", ""))
+        # Only process actual trade executions (x == "TRADE")
+        if payload.get("x") != "TRADE":
+            return
+
+        trade_id = str(payload.get("t", ""))
         if not trade_id or trade_id == "-1":
             return
 
         event = FillEvent(
             trade_id=trade_id,
-            exchange_order_id=str(msg.get("i", "")),
-            client_order_id=str(msg.get("c", "")),
-            symbol=str(msg.get("s", "")).upper(),
-            side=str(msg.get("S", "")).upper(),
-            price=float(msg.get("L", 0)),  # Last executed price
-            qty=float(msg.get("l", 0)),    # Last executed quantity
-            commission=float(msg.get("n", 0)),
-            commission_asset=str(msg.get("N", "") or "").upper(),
-            timestamp_sec=float(msg.get("T", 0)) / 1000.0,
+            exchange_order_id=str(payload.get("i", "")),
+            client_order_id=str(payload.get("c", "")),
+            symbol=str(payload.get("s", "")).upper(),
+            side=str(payload.get("S", "")).upper(),
+            price=float(payload.get("L", 0)),  # Last executed price
+            qty=float(payload.get("l", 0)),    # Last executed quantity
+            commission=float(payload.get("n", 0)),
+            commission_asset=str(payload.get("N", "") or "").upper(),
+            timestamp_sec=float(payload.get("T", msg.get("T", 0))) / 1000.0,
         )
         await self._handle_fill_event(event)
 

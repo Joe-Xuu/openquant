@@ -80,7 +80,8 @@ class TrendState:
     entry_ema_slow: float = 0.0
     entry_macd_hist: float = 0.0
     entry_atr: float = 0.0
-    highest_price: float = 0.0  # Peak favorable price since entry (Chandelier stop)
+    highest_price: float = 0.0  # Peak favorable price since entry (LONG Chandelier stop)
+    lowest_price: float = 0.0   # Trough favorable price since entry (SHORT Chandelier stop)
 
     @property
     def is_active(self) -> bool:
@@ -100,6 +101,7 @@ class TrendState:
             "entry_macd_hist": self.entry_macd_hist,
             "entry_atr": self.entry_atr,
             "highest_price": self.highest_price,
+            "lowest_price": self.lowest_price,
         }
 
     @classmethod
@@ -164,6 +166,7 @@ class TrendStrategy:
         capital: float = 10000.0,
         adx: Optional[float] = None,
         macro_bullish: Optional[bool] = None,
+        macro_bearish: Optional[bool] = None,
     ) -> Optional[StrategySignal]:
         """
         Evaluate whether to enter, exit, or adjust a trend position.
@@ -192,6 +195,8 @@ class TrendStrategy:
             if adx is not None and adx < self.min_adx:
                 return None
             if strong_bullish and macro_bullish is False:
+                return None
+            if strong_bearish and macro_bearish is False:
                 return None
             return self._evaluate_entry(
                 symbol, current_price, atr, strong_bullish, strong_bearish,
@@ -300,10 +305,13 @@ class TrendStrategy:
                     state.trailing_stop_price > 0 and state.trailing_stop_price < state.stop_loss_price
                 ) else "stop_loss_hit"
                 return self._generate_exit_signal(symbol, state, price, reason)
-            new_trail = price + self.trailing_stop_atr_multiplier * atr
+
+            # Chandelier trailing stop anchored to lowest price since entry
+            trough = min(state.lowest_price or state.entry_price, price)
+            new_trail = trough + self.trailing_stop_atr_multiplier * atr
             if (state.trailing_stop_price <= 0 or new_trail < state.trailing_stop_price) and new_trail < state.stop_loss_price:
                 return self._generate_adjust_stop_signal(
-                    symbol, state, price, new_trail, atr
+                    symbol, state, price, new_trail, atr, lowest_price=trough
                 )
 
         # Only exit on EMA cross if explicitly enabled (lets Chandelier stop ride big bull trends)
@@ -406,8 +414,10 @@ class TrendStrategy:
         new_trailing_stop: float,
         atr: float,
         highest_price: float = 0.0,
+        lowest_price: float = 0.0,
     ) -> StrategySignal:
         """Generate a signal to update the trailing stop."""
+        low_val = min(p for p in (lowest_price, price) if p > 0)
         return (
             SignalBuilder(SignalAction.MODIFY_POSITION, symbol, 0.9)
             .with_metadata("action_type", "update_trailing_stop")
@@ -416,6 +426,7 @@ class TrendStrategy:
             .with_metadata("old_trailing_stop", round(state.trailing_stop_price, 8))
             .with_metadata("new_trailing_stop", round(new_trailing_stop, 8))
             .with_metadata("highest_price", round(max(highest_price, price), 8))
+            .with_metadata("lowest_price", round(low_val, 8))
             .with_metadata("current_price", round(price, 8))
             .with_metadata("atr", round(atr, 8))
             .with_strategy(self.strategy_id)
@@ -455,6 +466,7 @@ class TrendStrategy:
                 entry_macd_hist=meta.get("macd_hist", 0.0),
                 entry_atr=meta.get("atr", 0.0),
                 highest_price=fill_price,
+                lowest_price=fill_price,
             )
 
         elif signal.action in (SignalAction.STOP_TREND, SignalAction.CLOSE_ALL):
@@ -467,6 +479,14 @@ class TrendStrategy:
                     signal.metadata.get("highest_price", 0.0),
                     fill_price,
                 )
+                low_candidates = [
+                    v for v in (
+                        old_state.lowest_price,
+                        signal.metadata.get("lowest_price", 0.0),
+                        fill_price,
+                    ) if v > 0
+                ]
+                new_low = min(low_candidates) if low_candidates else fill_price
                 return TrendState(
                     symbol=old_state.symbol,
                     direction=old_state.direction,
@@ -481,6 +501,7 @@ class TrendStrategy:
                     entry_macd_hist=old_state.entry_macd_hist,
                     entry_atr=old_state.entry_atr,
                     highest_price=new_high,
+                    lowest_price=new_low,
                 )
 
         return old_state

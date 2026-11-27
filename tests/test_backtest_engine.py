@@ -136,3 +136,38 @@ class TestBacktestEngineInvariants:
         assert classify_macro_trend(90.0, 95.0, 100.0) == MacroTrend.BEAR
         assert classify_macro_trend(110.0, 105.0, 100.0) == MacroTrend.BULL
         assert classify_macro_trend(100.0, 100.1, 100.0) == MacroTrend.NEUTRAL
+
+    def test_futures_short_chandelier_and_margin_conservation(self):
+        from strategy.trend_strategy import TrendDirection, TrendState, TrendStrategy
+
+        # 1) SHORT Chandelier trailing stop ratchets down on lowest_price
+        ts = TrendStrategy(allow_short=True, atr_multiplier=2.5, trailing_stop_atr_multiplier=4.0, min_adx=20.0)
+        state = TrendState.flat("DOGEUSDT")
+        sig = ts.evaluate(
+            "DOGEUSDT", 1.0, 0.99, 1.01, -0.005, 0.01, state,
+            capital=100.0, adx=25.0, macro_bearish=True,
+        )
+        assert sig is not None and sig.metadata["direction"] == "SHORT"
+        state = ts.update_state(state, sig, 1.0)
+        assert state.direction == TrendDirection.SHORT and state.lowest_price == 1.0
+
+        # Price drops to 0.92 -> Chandelier trail ratchets below initial stop (1.025) to 0.96
+        adj = ts.evaluate(
+            "DOGEUSDT", 0.92, 0.94, 0.97, -0.005, 0.01, state,
+            capital=100.0, adx=25.0, macro_bearish=True,
+        )
+        assert adj is not None and adj.metadata["new_trailing_stop"] == pytest.approx(0.96, rel=1e-4)
+
+        # 2) Futures 1.5x backtest on bear crash preserves exact accounting conservation
+        bars = _make_series([1.0] * 80 + [1.0 * (0.997 ** i) for i in range(320)])
+        cfg = BacktestConfig(
+            symbol="DOGEUSDT", market="futures", leverage=1.5, allow_short=True,
+            fee_pct=0.05, funding_rate_8h_pct=0.01, initial_capital=100.0,
+            warmup_candles=60, trend_interval="5m", use_macro_filter=False,
+        )
+        eng = BacktestEngine(cfg)
+        rep = eng.run(bars, strategy_mode="trend_only")
+        trade_pnl = sum(t.pnl for t in eng.trades)
+        assert abs((cfg.initial_capital + trade_pnl) - rep.final_equity) < 0.05
+        assert rep.total_return_pct > 0.0  # SHORT profits cleanly on sustained downtrend
+

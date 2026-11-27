@@ -467,6 +467,21 @@ class TradingSystem:
         await self.exchange_client.load_symbol_info(symbols)
         for sym in symbols:
             self.ledger.ensure_symbol_accounts(sym)
+            if self.app_config.exchange.market == "futures":
+                try:
+                    await self.exchange_client.set_margin_type(
+                        sym, self.app_config.trading.margin_type
+                    )
+                    await self.exchange_client.set_leverage(
+                        sym, int(round(self.app_config.trading.leverage))
+                    )
+                    logger.info(
+                        f"  Futures configured for {sym}: "
+                        f"{self.app_config.trading.margin_type} "
+                        f"{self.app_config.trading.leverage:.1f}x"
+                    )
+                except Exception as e:
+                    logger.warning(f"  Futures margin/leverage setup warning for {sym}: {e}")
 
         # 2. Non-destructive startup sync: align ledger equity via adjustment entry
         try:
@@ -726,6 +741,7 @@ class TradingSystem:
         macro_trend = MacroTrend.NEUTRAL
         macro_ema_slow_val = 0.0
         macro_ema200_rising = True
+        macro_ema200_falling = True
         if self.macro_cfg.enabled:
             try:
                 macro_ohlcv = await self.data_engine.get_ohlcv(
@@ -738,6 +754,7 @@ class TradingSystem:
                     macro_ema_slow_val = m_slow_series[-1]
                     if len(m_slow_series) > 24:
                         macro_ema200_rising = m_slow_series[-1] > m_slow_series[-25]
+                        macro_ema200_falling = m_slow_series[-1] < m_slow_series[-25]
                     macro_trend = classify_macro_trend(
                         m_closes[-1], m_fast_series[-1], macro_ema_slow_val
                     )
@@ -911,8 +928,11 @@ class TradingSystem:
 
         # ---- TREND (decoupled 1h trend_interval; active positions ALWAYS monitored!) ----
         trend_state = self._trend_states.get(symbol, TrendState.flat(symbol))
-        if trend_state.is_active and indicators.close > trend_state.highest_price:
-            trend_state.highest_price = indicators.close
+        if trend_state.is_active:
+            if indicators.close > trend_state.highest_price:
+                trend_state.highest_price = indicators.close
+            if trend_state.lowest_price <= 0 or indicators.close < trend_state.lowest_price:
+                trend_state.lowest_price = indicators.close
         trend_cooldown = self._tick_count < 30
         should_eval_trend = trend_state.is_active or (not trend_cooldown)
         if should_eval_trend:
@@ -924,18 +944,27 @@ class TradingSystem:
             if len(trend_ohlcv) >= 30:
                 t_ind = compute_all(symbol, trend_ohlcv)
                 if t_ind.atr > 0 and t_ind.close > 0:
-                    trend_capital = live_eq * self.trend_capital_pct
+                    eff_lev = (
+                        self.app_config.trading.leverage
+                        if self.app_config.exchange.market == "futures"
+                        else 1.0
+                    )
+                    trend_capital = live_eq * self.trend_capital_pct * eff_lev
                     macro_bull = (
                         (macro_trend == MacroTrend.BULL)
                         if self.macro_cfg.enabled
                         else None
                     )
-                    if (
-                        macro_bull
-                        and self.app_config.strategy.trend_following.require_ema200_rising
-                        and not macro_ema200_rising
-                    ):
-                        macro_bull = False
+                    macro_bear_gate = (
+                        (macro_trend == MacroTrend.BEAR)
+                        if self.macro_cfg.enabled
+                        else None
+                    )
+                    if self.app_config.strategy.trend_following.require_ema200_rising:
+                        if macro_bull and not macro_ema200_rising:
+                            macro_bull = False
+                        if macro_bear_gate and not macro_ema200_falling:
+                            macro_bear_gate = False
                     raw_trend = self.trend_strategy.evaluate(
                         symbol=symbol,
                         current_price=indicators.close,  # latest mark price for stops
@@ -947,6 +976,7 @@ class TradingSystem:
                         capital=trend_capital,
                         adx=t_ind.adx,
                         macro_bullish=macro_bull,
+                        macro_bearish=macro_bear_gate,
                     )
                     if raw_trend is not None:
                         if raw_trend.action == SignalAction.START_TREND and not trend_state.is_active:

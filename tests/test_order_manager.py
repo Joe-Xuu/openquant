@@ -370,3 +370,65 @@ class TestSymbolInfoAndInfra:
         assert cfg.strategy.grid_trading.spot_mode is True
         assert cfg.strategy.trend_following.trailing_stop_atr_multiplier == 4.0
 
+    def test_futures_leverage_cap_and_spot_enforcement(self):
+        # Spot always clamps leverage to 1.0 and disables short
+        spot = AppConfig.model_validate({
+            "exchange": {"market": "spot"},
+            "trading": {"leverage": 2.0},
+            "strategy": {"trend_following": {"allow_short": True}},
+        })
+        assert spot.trading.leverage == 1.0
+        assert spot.strategy.trend_following.allow_short is False
+
+        # Futures allows up to 3.0x and syncs risk max_leverage
+        fut = AppConfig.model_validate({
+            "exchange": {"market": "futures"},
+            "trading": {"leverage": 1.5, "margin_type": "ISOLATED"},
+            "strategy": {"trend_following": {"allow_short": True}},
+        })
+        assert fut.trading.leverage == 1.5
+        assert fut.risk.max_leverage >= 1.5
+        assert fut.strategy.trend_following.allow_short is True
+
+        # Leverage > 3.0 is rejected by schema hard cap
+        with pytest.raises(ValueError):
+            AppConfig.model_validate({"exchange": {"market": "futures"}, "trading": {"leverage": 5.0}})
+
+    @pytest.mark.asyncio
+    async def test_futures_short_dispatch_and_order_trade_update(self):
+        """Futures SHORT entry uses STOP_MARKET reduceOnly SL, MARKET reduceOnly exit, and ORDER_TRADE_UPDATE WS."""
+        stopped = []
+        client = MockExchangeClient(balances={"USDT": 100.0}, ticker_price=0.10)
+        client.market = "futures"
+        mgr, _ = _make_manager(client, on_trend_stop=lambda s, p, q: stopped.append((s, p, q)))
+
+        # 1) Dispatch SHORT entry -> SELL MARKET + BUY STOP_MARKET reduceOnly
+        entry_sig = (
+            SignalBuilder(SignalAction.START_TREND, "DOGEUSDT", 0.9)
+            .with_metadata("direction", "SHORT")
+            .with_metadata("entry_price", 0.10)
+            .with_metadata("position_size", 500.0)
+            .with_metadata("stop_loss", 0.105)
+            .build()
+        )
+        await mgr.dispatch_signal(entry_sig)
+        assert len(client.placed_orders) == 2
+        entry_o, sl_o = client.placed_orders
+        assert entry_o.side == "SELL" and entry_o.order_type == "MARKET"
+        assert sl_o.side == "BUY" and sl_o.order_type == "STOP_MARKET" and sl_o.reduce_only is True
+
+        # 2) Futures ORDER_TRADE_UPDATE WS stop-loss fill triggers callback
+        now_ms = int(time.time() * 1000)
+        fut_ws = {
+            "e": "ORDER_TRADE_UPDATE",
+            "T": now_ms,
+            "o": {
+                "s": "DOGEUSDT", "c": sl_o.client_order_id, "S": "BUY",
+                "x": "TRADE", "i": 9999, "t": 8881,
+                "L": "0.1051", "l": "500", "n": "0.02", "N": "USDT", "T": now_ms,
+            },
+        }
+        await mgr._handle_user_stream_message(fut_ws)
+        assert stopped == [("DOGEUSDT", 0.1051, 500.0)]
+
+
