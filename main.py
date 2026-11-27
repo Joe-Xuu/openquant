@@ -312,6 +312,8 @@ class TradingSystem:
 
         # --- Notifications & Live Web Monitor ---
         self._manual_paused: bool = False
+        self._open_orders_cache: List[Dict[str, Any]] = []
+        self._open_orders_cache_ts: float = 0.0
         self.notifier = WeChatNotifier()
         self._monitor_enabled = os.getenv("MONITOR_ENABLED", "true").lower() == "true"
         self.monitor_server: Optional[MonitorWebServer] = (
@@ -319,6 +321,8 @@ class TradingSystem:
                 status_provider=self._build_monitor_snapshot,
                 control_handler=self._handle_web_control,
                 params_handler=self._handle_web_params,
+                orders_provider=self._fetch_open_orders,
+                cancel_order_handler=self._handle_web_cancel_order,
             )
             if self._monitor_enabled
             else None
@@ -682,6 +686,108 @@ class TradingSystem:
             "message": f"参数已热生效（{len(changes)} 项）",
             "params": self._get_tunable_params(),
         }
+
+    @staticmethod
+    def _classify_order_tag(client_order_id: str) -> str:
+        cid = (client_order_id or "").lower()
+        if cid.startswith("trend_sl_"):
+            return "趋势止损SL"
+        if cid.startswith("trend_"):
+            return "趋势单"
+        if cid.startswith("tp_"):
+            return "网格止盈TP"
+        if cid.startswith(("grid_", "co_", "rebuy_")):
+            return "网格买单"
+        return "手动/其他"
+
+    async def _fetch_open_orders(self, force: bool = False) -> List[Dict[str, Any]]:
+        """Fetch live open orders from exchange (4s TTL cache to protect API rate limits)."""
+        now = time.time()
+        if not force and (now - self._open_orders_cache_ts) < 4.0:
+            return self._open_orders_cache
+
+        rows: List[Dict[str, Any]] = []
+        for sym in self.app_config.trading.symbols:
+            try:
+                raw_orders = await self.exchange_client.get_open_orders(sym)
+            except Exception as e:
+                logger.debug(f"Failed to fetch open orders for {sym}: {e}")
+                continue
+            for o in raw_orders:
+                px = float(o.get("price") or 0.0)
+                if px <= 0:
+                    px = float(o.get("stopPrice") or 0.0)
+                ts_ms = o.get("time") or o.get("updateTime") or 0
+                try:
+                    t_str = (
+                        datetime.fromtimestamp(int(ts_ms) / 1000.0, tz=timezone.utc).isoformat()
+                        if ts_ms
+                        else ""
+                    )
+                except Exception:
+                    t_str = ""
+                cid = str(o.get("clientOrderId", ""))
+                rows.append({
+                    "symbol": str(o.get("symbol", sym)),
+                    "order_id": str(o.get("orderId", "")),
+                    "client_order_id": cid,
+                    "tag": self._classify_order_tag(cid),
+                    "side": str(o.get("side", "")),
+                    "type": str(o.get("type", "")),
+                    "price": px,
+                    "orig_qty": float(o.get("origQty", 0.0)),
+                    "executed_qty": float(o.get("executedQty", 0.0)),
+                    "reduce_only": bool(o.get("reduceOnly", False)),
+                    "time": t_str,
+                })
+
+        # Sort like an order book: SELL descending (high->low), then BUY descending
+        rows.sort(key=lambda r: (r["symbol"], 0 if r["side"] == "SELL" else 1, -r["price"]))
+        self._open_orders_cache = rows
+        self._open_orders_cache_ts = now
+        return rows
+
+    async def _handle_web_cancel_order(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        """Cancel a single open order or all open orders from the Web UI."""
+        allowed_syms = {s.upper() for s in self.app_config.trading.symbols}
+        if payload.get("cancel_all"):
+            req_sym = str(payload.get("symbol", "ALL")).upper().strip()
+            targets = list(self.app_config.trading.symbols) if req_sym == "ALL" else [req_sym]
+            for s in targets:
+                if s.upper() not in allowed_syms:
+                    raise ValueError(f"Symbol {s} is not configured in this bot")
+            for s in targets:
+                await self.exchange_client.cancel_all_orders(s)
+            self._open_orders_cache_ts = 0.0
+            logger.warning(f"WEB ORDER [AUDIT]: Cancelled ALL open orders for {targets}")
+            self.notifier.send_background(
+                title="Web 远程操作：一键撤销全部挂单",
+                body=f"- 标的: `{', '.join(targets)}`\n- 说明: 仅撤单，未平仓",
+                level="WARN",
+            )
+            return {"ok": True, "message": f"已撤销 {', '.join(targets)} 全部挂单"}
+
+        sym = str(payload.get("symbol", "")).upper().strip()
+        order_id = str(payload.get("order_id", "")).strip() or None
+        client_order_id = str(payload.get("client_order_id", "")).strip() or None
+        if not sym or sym not in allowed_syms:
+            raise ValueError(f"Invalid or unconfigured symbol: {sym}")
+        if not order_id and not client_order_id:
+            raise ValueError("order_id or client_order_id is required")
+
+        await self.exchange_client.cancel_order(
+            symbol=sym,
+            order_id=order_id,
+            client_order_id=client_order_id,
+        )
+        self._open_orders_cache_ts = 0.0
+        logger.warning(f"WEB ORDER [AUDIT]: Cancelled order {sym} order_id={order_id} cid={client_order_id}")
+        self.notifier.send_background(
+            title=f"Web 远程操作：已撤单 · {sym}",
+            body=f"- 订单号: `{order_id or client_order_id}`",
+            level="INFO",
+        )
+        return {"ok": True, "message": f"已撤销 {sym} 挂单 #{order_id or client_order_id}"}
 
     def _get_positions(self) -> List[Dict]:
         """Return open positions from the ledger."""

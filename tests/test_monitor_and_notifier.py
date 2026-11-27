@@ -244,6 +244,65 @@ class TestMonitorWebServer:
         finally:
             await srv.stop()
 
+    @pytest.mark.asyncio
+    async def test_open_orders_and_manual_cancel(self):
+        orders = [
+            {"symbol": "DOGEUSDT", "order_id": "101", "tag": "网格买单", "side": "BUY", "type": "LIMIT", "price": 0.055, "orig_qty": 100.0, "executed_qty": 0.0, "reduce_only": False, "time": ""},
+            {"symbol": "DOGEUSDT", "order_id": "102", "tag": "网格止盈TP", "side": "SELL", "type": "LIMIT", "price": 0.060, "orig_qty": 100.0, "executed_qty": 0.0, "reduce_only": True, "time": ""},
+        ]
+
+        async def fetch_orders(_force: bool):
+            return list(orders)
+
+        async def cancel_order(body):
+            if body.get("cancel_all"):
+                orders.clear()
+                return {"ok": True, "message": "all cancelled"}
+            oid = str(body.get("order_id", ""))
+            before = len(orders)
+            orders[:] = [o for o in orders if o["order_id"] != oid]
+            if len(orders) == before:
+                raise ValueError("order not found")
+            return {"ok": True, "message": f"cancelled {oid}"}
+
+        srv = MonitorWebServer(
+            status_provider=lambda: {"running": True},
+            orders_provider=fetch_orders,
+            cancel_order_handler=cancel_order,
+            host="127.0.0.1",
+            port=0,
+            token="tok_ord",
+        )
+        await srv.start()
+        try:
+            port = srv._site._server.sockets[0].getsockname()[1]
+            base = f"http://127.0.0.1:{port}"
+            hdrs = {"X-Monitor-Token": "tok_ord"}
+            async with aiohttp.ClientSession() as sess:
+                # Unauthorized without token
+                async with sess.get(f"{base}/api/orders") as r:
+                    assert r.status == 401
+
+                # Fetch orders
+                async with sess.get(f"{base}/api/orders?force=1", headers=hdrs) as r:
+                    assert r.status == 200
+                    assert len((await r.json())["orders"]) == 2
+
+                # Cancel single order
+                async with sess.post(f"{base}/api/orders/cancel", json={"symbol": "DOGEUSDT", "order_id": "101"}, headers=hdrs) as r:
+                    assert r.status == 200
+                async with sess.get(f"{base}/api/orders", headers=hdrs) as r:
+                    rem = (await r.json())["orders"]
+                    assert len(rem) == 1 and rem[0]["order_id"] == "102"
+
+                # Cancel all remaining
+                async with sess.post(f"{base}/api/orders/cancel", json={"cancel_all": True, "symbol": "ALL"}, headers=hdrs) as r:
+                    assert r.status == 200
+                async with sess.get(f"{base}/api/orders", headers=hdrs) as r:
+                    assert (await r.json())["orders"] == []
+        finally:
+            await srv.stop()
+
 
 class TestRiskGuardReset:
     def test_reset_risk_state_clears_circuit_breaker(self):

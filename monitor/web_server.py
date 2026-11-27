@@ -5,16 +5,18 @@ LIVE MONITOR & CONTROL WEB SERVER — Lightweight Async Dashboard (aiohttp.web)
 
 Runs inside main.py's asyncio event loop with zero extra dependencies.
 Exposes:
-  GET  /            — Self-contained mobile+desktop live dashboard & control panel
-  GET  /api/status  — Live JSON snapshot (equity, positions, macro, risk, params, logs)
-  POST /api/control — Safe remote control (pause / resume / reset_risk / emergency_stop)
-  POST /api/params  — Validated hot-reload of safe strategy & risk parameters
-  GET  /health      — Health check endpoint for Docker / uptime monitors
+  GET  /                  — Self-contained mobile+desktop live dashboard & control panel
+  GET  /api/status        — Live JSON snapshot (equity, positions, macro, risk, params, logs)
+  GET  /api/orders        — Live open orders directly from exchange
+  POST /api/orders/cancel — Cancel a single order or all open orders (token-protected)
+  POST /api/control       — Safe remote control (pause / resume / reset_risk / emergency_stop)
+  POST /api/params        — Validated hot-reload of safe strategy & risk parameters
+  GET  /health            — Health check endpoint for Docker / uptime monitors
 
 SECURITY:
   - Read access requires MONITOR_TOKEN when configured (?token=... or X-Monitor-Token).
-  - Write endpoints (POST /api/control, POST /api/params) are STRICTLY DISABLED
-    (HTTP 403 read-only mode) unless MONITOR_TOKEN is explicitly configured!
+  - Write endpoints (POST /api/control, POST /api/params, POST /api/orders/cancel) are
+    STRICTLY DISABLED (HTTP 403 read-only mode) unless MONITOR_TOKEN is explicitly configured!
 ================================================================================
 """
 
@@ -22,7 +24,7 @@ from __future__ import annotations
 
 import logging
 import os
-from typing import Any, Awaitable, Callable, Dict, Optional
+from typing import Any, Awaitable, Callable, Dict, List, Optional
 
 from aiohttp import web
 
@@ -195,6 +197,28 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     </div>
 
     <div class="card">
+      <h2>
+        <span>当前交易所实时挂单（支持手动撤单）</span>
+        <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;">
+          <span id="orderMeta" class="sub">加载中...</span>
+          <button class="btn" style="padding:4px 10px;font-size:11px;" onclick="refreshOrders(true)">刷新挂单</button>
+          <button id="btnCancelAll" class="btn red" style="padding:4px 10px;font-size:11px;" onclick="cancelAllOrders()">一键撤销全部挂单</button>
+        </div>
+      </h2>
+      <div class="scroll">
+        <table>
+          <thead>
+            <tr>
+              <th>币种</th><th>标签</th><th>方向</th><th>类型</th>
+              <th class="num">委托价</th><th class="num">数量 (已成)</th><th class="num">金额 ($)</th><th>时间</th><th class="num">操作</th>
+            </tr>
+          </thead>
+          <tbody id="orderBody"><tr><td colspan="9" style="color:var(--muted)">等待拉取挂单...</td></tr></tbody>
+        </table>
+      </div>
+    </div>
+
+    <div class="card">
       <h2><span>最近成交记录</span><span id="tradeMeta" class="sub"></span></h2>
       <div class="scroll">
         <table>
@@ -286,6 +310,67 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         paramsLoaded = false;
         refresh();
       } catch (e) { showToast("参数校验失败: " + e.message, false); }
+    }
+
+    async function cancelOneOrder(symbol, orderId, side, price, tag) {
+      const warn = tag === "趋势止损SL"
+        ? "\n⚠️ 警告：这是一笔趋势硬止损单，撤销后当前趋势持仓将暂时失去交易所端硬止损保护！"
+        : "";
+      if (!confirm(`确认撤销挂单？\n${symbol} ${side} @ ${price} (${tag}, ID: ${orderId})${warn}`)) return;
+      try {
+        const res = await postJson("/api/orders/cancel", { symbol, order_id: String(orderId) });
+        showToast(res.message || "撤单成功", true);
+        refreshOrders(true);
+      } catch (e) { showToast("撤单失败: " + e.message, false); }
+    }
+
+    async function cancelAllOrders() {
+      if (!confirm("⚠️ 确认一键撤销交易所所有未成交挂单？（包括网格挂单与止盈/止损挂单，但不会平掉现有持仓）")) return;
+      try {
+        const res = await postJson("/api/orders/cancel", { cancel_all: true, symbol: "ALL" });
+        showToast(res.message || "已撤销全部挂单", true);
+        refreshOrders(true);
+      } catch (e) { showToast("一键撤单失败: " + e.message, false); }
+    }
+
+    async function refreshOrders(force = false) {
+      try {
+        const sep = authSuffix ? "&" : "?";
+        const url = "/api/orders" + authSuffix + (force ? (sep + "force=1") : "");
+        const r = await fetch(url);
+        if (!r.ok) return;
+        const data = await r.json();
+        const orders = data.orders || [];
+        const canCtrl = Boolean(lastState && lastState.controls_enabled);
+        const buys = orders.filter(o => o.side === "BUY").length;
+        const sells = orders.filter(o => o.side === "SELL").length;
+        document.getElementById("orderMeta").textContent = `共 ${orders.length} 笔（买 ${buys} · 卖 ${sells}）`;
+        document.getElementById("btnCancelAll").disabled = !canCtrl || orders.length === 0;
+
+        document.getElementById("orderBody").innerHTML = orders.map(o => {
+          const sideCls = o.side === "BUY" ? "green" : "red";
+          const tagCls = o.tag === "趋势止损SL" ? "red" : (o.tag === "网格止盈TP" ? "green" : (o.tag === "网格买单" ? "blue" : "amber"));
+          const notional = (Number(o.price || 0) * Number(o.orig_qty || 0));
+          const btn = canCtrl
+            ? `<button class="btn red" style="padding:3px 8px;font-size:11px;" onclick="cancelOneOrder('${o.symbol}','${o.order_id}','${o.side}','${fmtPx(o.price)}','${o.tag}')">撤单</button>`
+            : `<span class="sub">只读</span>`;
+          return `
+            <tr>
+              <td style="font-weight:700">${o.symbol}</td>
+              <td><span class="pill ${tagCls}">${o.tag}</span></td>
+              <td><span class="pill ${sideCls}">${o.side}</span></td>
+              <td>${o.type}${o.reduce_only ? ' <span class="sub">(减仓)</span>' : ''}</td>
+              <td class="num">${fmtPx(o.price)}</td>
+              <td class="num">${Number(o.orig_qty).toFixed(2)} <span class="sub">(${Number(o.executed_qty).toFixed(2)})</span></td>
+              <td class="num">$${notional.toFixed(2)}</td>
+              <td>${(o.time || "").slice(5, 19).replace("T", " ")}</td>
+              <td class="num">${btn}</td>
+            </tr>
+          `;
+        }).join("") || `<tr><td colspan="9" style="color:var(--muted)">当前无未成交挂单</td></tr>`;
+      } catch (e) {
+        document.getElementById("orderMeta").textContent = "拉取挂单失败";
+      }
     }
 
     function fmtPx(p) {
@@ -441,6 +526,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         const logs = d.recent_logs || [];
         document.getElementById("logBox").textContent = logs.length ? logs.join("\n") : "暂无日志...";
         drawSpark(d.equity_history || []);
+        refreshOrders(false);
       } catch (e) {
         document.getElementById("statusDot").className = "dot err";
         document.getElementById("subInfo").textContent = "连接失败: " + e.message;
@@ -463,6 +549,8 @@ class MonitorWebServer:
         status_provider: Callable[[], Dict[str, Any]],
         control_handler: Optional[Callable[[str, Dict[str, Any]], Awaitable[Dict[str, Any]]]] = None,
         params_handler: Optional[Callable[[Dict[str, Any]], Awaitable[Dict[str, Any]]]] = None,
+        orders_provider: Optional[Callable[[bool], Awaitable[List[Dict[str, Any]]]]] = None,
+        cancel_order_handler: Optional[Callable[[Dict[str, Any]], Awaitable[Dict[str, Any]]]] = None,
         host: Optional[str] = None,
         port: Optional[int] = None,
         token: Optional[str] = None,
@@ -470,6 +558,8 @@ class MonitorWebServer:
         self._status_provider = status_provider
         self._control_handler = control_handler
         self._params_handler = params_handler
+        self._orders_provider = orders_provider
+        self._cancel_order_handler = cancel_order_handler
         self.host = host or os.getenv("MONITOR_HOST", "0.0.0.0")
         self.port = int(port if port is not None else os.getenv("MONITOR_PORT", "8080"))
         self.token = (token if token is not None else os.getenv("MONITOR_TOKEN", "")).strip()
@@ -477,6 +567,8 @@ class MonitorWebServer:
         self._app = web.Application()
         self._app.router.add_get("/", self._handle_index)
         self._app.router.add_get("/api/status", self._handle_status)
+        self._app.router.add_get("/api/orders", self._handle_orders)
+        self._app.router.add_post("/api/orders/cancel", self._handle_cancel_order)
         self._app.router.add_post("/api/control", self._handle_control)
         self._app.router.add_post("/api/params", self._handle_params)
         self._app.router.add_get("/health", self._handle_health)
@@ -515,6 +607,35 @@ class MonitorWebServer:
             return web.json_response(data)
         except Exception as e:
             logger.error(f"Monitor status error: {e}")
+            return web.json_response({"error": str(e)}, status=500)
+
+    async def _handle_orders(self, request: web.Request) -> web.Response:
+        if not self._is_authorized(request):
+            return web.json_response({"error": "unauthorized"}, status=401)
+        if self._orders_provider is None:
+            return web.json_response({"orders": []})
+        try:
+            force = request.query.get("force", "") in ("1", "true", "yes")
+            orders = await self._orders_provider(force)
+            return web.json_response({"orders": orders})
+        except Exception as e:
+            logger.error(f"Monitor orders error: {e}")
+            return web.json_response({"error": str(e)}, status=500)
+
+    async def _handle_cancel_order(self, request: web.Request) -> web.Response:
+        err = self._check_write_access(request)
+        if err is not None:
+            return err
+        if self._cancel_order_handler is None:
+            return web.json_response({"error": "cancel order handler not configured"}, status=501)
+        try:
+            body = await request.json()
+            result = await self._cancel_order_handler(body)
+            return web.json_response(result)
+        except ValueError as e:
+            return web.json_response({"error": str(e)}, status=400)
+        except Exception as e:
+            logger.error(f"Monitor cancel order error: {e}")
             return web.json_response({"error": str(e)}, status=500)
 
     async def _handle_control(self, request: web.Request) -> web.Response:
