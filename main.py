@@ -47,7 +47,11 @@ from config.schema import AppConfig, load_app_config
 
 # --- Core ---
 from core.local_ledger import LedgerEngine, get_ledger
+from core.notifier import WeChatNotifier
 from core.state_machine import StateTransition, SystemState, TradingStateMachine
+
+# --- Monitor ---
+from monitor.web_server import MonitorWebServer
 
 # --- Data ---
 from data.indicators import compute_all, ema as compute_ema, IndicatorBundle
@@ -285,6 +289,17 @@ class TradingSystem:
         self._macro_trend: Dict[str, MacroTrend] = {}
         self._macro_paused_grid: Dict[str, bool] = {}
         self._macro_liquidated: Dict[str, bool] = {}
+        self._short_macro_bearish: Dict[str, bool] = {}
+        self._last_prices: Dict[str, float] = {}
+
+        # --- Notifications & Live Web Monitor ---
+        self.notifier = WeChatNotifier()
+        self._monitor_enabled = os.getenv("MONITOR_ENABLED", "true").lower() == "true"
+        self.monitor_server: Optional[MonitorWebServer] = (
+            MonitorWebServer(status_provider=self._build_monitor_snapshot)
+            if self._monitor_enabled
+            else None
+        )
 
         # --- Statistics ---
         self._tick_count = 0
@@ -567,11 +582,30 @@ class TradingSystem:
         self.state_machine.transition(StateTransition.DATA_READY)
         await self.data_engine.start()
 
+        # 7. Start WeChat notifier & live web monitor dashboard
+        await self.notifier.start()
+        if self.monitor_server is not None:
+            try:
+                await self.monitor_server.start()
+            except Exception as e:
+                logger.warning(f"MonitorWebServer failed to start (non-fatal): {e}")
+
         logger.info("Warming up indicators...")
         await asyncio.sleep(5)
 
         self.running = True
         logger.info("Trading system started. Entering main loop.")
+        await self.notifier.send(
+            title="系统启动成功",
+            body=(
+                f"- 市场: `{self.app_config.exchange.market.upper()} {self.app_config.trading.leverage:.1f}x` "
+                f"({'Testnet 模拟' if self.app_config.exchange.testnet else 'Mainnet 实盘'})\n"
+                f"- 标的: `{', '.join(symbols)}`\n"
+                f"- 初始净值: `${self._initial_equity:.2f}`\n"
+                f"- 回撤止损线: `-{self._equity_stop_pct}%`"
+            ),
+            level="SUCCESS",
+        )
 
         # --- Main Event Loop ---
         await self._main_loop()
@@ -586,6 +620,15 @@ class TradingSystem:
         self.ledger.set_metadata("last_shutdown", datetime.now(timezone.utc).isoformat())
         # NOTE: We do NOT cancel open orders — they survive restarts.
         # The next startup will reconcile fills and resume grid state.
+
+        await self.notifier.send(
+            title="系统已安全停止",
+            body=f"- 当前净值: `${self._cached_live_equity:.2f}`\n- Ticks: `{self._tick_count}` | 信号: `{self._signal_count}`",
+            level="WARN",
+        )
+        if self.monitor_server is not None:
+            await self.monitor_server.stop()
+        await self.notifier.stop()
 
         await self.order_manager.stop()
         await self.data_engine.stop()
@@ -692,6 +735,14 @@ class TradingSystem:
                     f"${live_eq:.2f} <= ${stop_line:.2f} "
                     f"(-{(1 - live_eq/self._initial_equity)*100:.1f}%)"
                 )
+                await self.notifier.send(
+                    title=f"触发账户总回撤硬止损 · {symbol}",
+                    body=(
+                        f"- 当前净值: `${live_eq:.2f}` <= 止损线 `${stop_line:.2f}`\n"
+                        f"- 已撤单并紧急停机，请人工检查！"
+                    ),
+                    level="ERROR",
+                )
                 try:
                     await self.exchange_client.cancel_all_orders(symbol)
                 except Exception:
@@ -721,6 +772,7 @@ class TradingSystem:
         indicators = compute_all(symbol, ohlcv)
         if indicators.atr <= 0 or indicators.close <= 0:
             return
+        self._last_prices[symbol] = indicators.close
 
         # 3. Score regime
         regime_result = self.regime_detector.detect(
@@ -787,6 +839,7 @@ class TradingSystem:
             except Exception as e:
                 logger.debug(f"Macro filter fallback to NEUTRAL for {symbol}: {e}")
         self._macro_trend[symbol] = macro_trend
+        self._short_macro_bearish[symbol] = short_macro_bearish
 
         # 4. Generate strategy signals — grid ALWAYS, trend INDEPENDENTLY
         grid_signal: Optional[StrategySignal] = None
@@ -1053,6 +1106,16 @@ class TradingSystem:
                 old_state = self._trend_states.get(signal.symbol, TrendState.flat(signal.symbol))
                 new_state = self.trend_strategy.update_state(old_state, signal, fill_price)
                 self._trend_states[signal.symbol] = new_state
+                self.notifier.send_background(
+                    title=f"趋势开仓 {new_state.direction.value} · {signal.symbol}",
+                    body=(
+                        f"- 入场价: `{fill_price:.5f}`\n"
+                        f"- 止损价: `{new_state.stop_loss_price:.5f}`\n"
+                        f"- 数量: `{new_state.position_size:.2f}`\n"
+                        f"- 当前净值: `${self._cached_live_equity:.2f}`"
+                    ),
+                    level="SUCCESS",
+                )
 
             elif signal.action == SignalAction.MODIFY_POSITION:
                 old_state = self._trend_states.get(signal.symbol, TrendState.flat(signal.symbol))
@@ -1065,9 +1128,25 @@ class TradingSystem:
                 self._trend_states[signal.symbol] = TrendState.flat(signal.symbol)
                 pnl = signal.metadata.get("pnl_pct", 0.0)
                 self.risk_guard.register_trade_result(pnl)
+                self.notifier.send_background(
+                    title=f"趋势平仓 · {signal.symbol}",
+                    body=(
+                        f"- 原因: `{signal.metadata.get('exit_reason', 'signal')}`\n"
+                        f"- 收益率: `{pnl:+.2f}%`\n"
+                        f"- 当前净值: `${self._cached_live_equity:.2f}`"
+                    ),
+                    level="SUCCESS" if pnl >= 0 else "WARN",
+                )
 
             elif signal.action == SignalAction.STOP_GRID:
                 self._grid_configs.pop(signal.symbol, None)
+                if signal.metadata.get("liquidate_inventory"):
+                    self.notifier.send_background(
+                        title=f"宏观熊市清仓网格 · {signal.symbol}",
+                        body=f"- 原因: `{signal.metadata.get('reason', 'macro_bear')}`\n- 当前净值: `${self._cached_live_equity:.2f}`",
+                        level="WARN",
+                        dedup_key=f"macro_liq:{signal.symbol}",
+                    )
 
         except Exception as e:
             logger.error(f"Failed to dispatch signal {signal.signal_id}: {e}")

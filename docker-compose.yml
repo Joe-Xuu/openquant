@@ -1,37 +1,44 @@
-# ============================================================================
-# OpenQuant — PostgreSQL Database
-# ============================================================================
-# Start:    docker-compose up -d
-# Stop:     docker-compose down
-# Wipe:     docker-compose down -v
-# Connect:  psql -h localhost -U openquant -d openquant
-# ============================================================================
-
-version: "3.8"
-
 services:
-  postgres:
+  db:
     image: postgres:16-alpine
     container_name: openquant-db
     restart: unless-stopped
     environment:
-      POSTGRES_USER: openquant
-      POSTGRES_PASSWORD: ${PG_PASSWORD:?PG_PASSWORD is not set - copy .env.example to .env and fill it in}
-      POSTGRES_DB: openquant
-    ports:
-      - "5432:5432"
+      POSTGRES_USER: ${PG_USER:-openquant}
+      POSTGRES_PASSWORD: ${PG_PASSWORD:-openquant}
+      POSTGRES_DB: ${PG_DB:-openquant}
     volumes:
       - pgdata:/var/lib/postgresql/data
-    command: >
-      -c shared_buffers=256MB
-      -c effective_cache_size=1GB
-      -c wal_level=replica
-      -c max_wal_senders=5
-      -c wal_keep_size=256MB
-      -c synchronous_commit=on
-      -c max_connections=50
-      -c random_page_cost=1.1
-      -c effective_io_concurrency=200
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${PG_USER:-openquant} -d ${PG_DB:-openquant}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  openquant:
+    build: .
+    container_name: openquant-bot
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    env_file:
+      - .env
+    environment:
+      PG_HOST: db
+      PG_PORT: 5432
+      MONITOR_HOST: 0.0.0.0
+      MONITOR_PORT: ${MONITOR_PORT:-8080}
+    ports:
+      - "${MONITOR_PORT:-8080}:${MONITOR_PORT:-8080}"
+    volumes:
+      - ./logs:/app/logs
+      - ./config/settings.json:/app/config/settings.json:ro
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:${MONITOR_PORT:-8080}/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
 
 volumes:
   pgdata:
