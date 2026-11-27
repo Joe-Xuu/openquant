@@ -120,6 +120,7 @@ class RiskGuard:
         equity_provider: Callable[[], float],
         positions_provider: Callable[[], List[Dict[str, Any]]],
         trade_history_provider: Callable[[str], List[Dict[str, Any]]],
+        clock: Optional[Callable[[], datetime]] = None,
     ):
         """
         Initialize the risk guard.
@@ -128,9 +129,9 @@ class RiskGuard:
             config: Risk configuration dict (from settings.json → "risk").
             equity_provider: Callable that returns current total equity.
             positions_provider: Callable that returns list of open positions.
-            trade_history_provider: Callable that returns recent trades (for
-                                    drawdown/circuit breaker calculation).
-                                    Args: symbol (or "ALL").
+            trade_history_provider: Callable that returns recent trades.
+            clock: Optional UTC clock provider (defaults to datetime.now(timezone.utc);
+                   injected with bar timestamp in backtests).
         """
         self.max_drawdown_pct = config.get("max_drawdown_pct", 15.0)
         self.max_daily_loss_pct = config.get("max_daily_loss_pct", 5.0)
@@ -139,26 +140,41 @@ class RiskGuard:
         self.max_exposure_pct = config.get("max_exposure_pct", 80.0)
         self.stop_loss_pct = config.get("stop_loss_pct", 2.0)
         self.trailing_stop_pct = config.get("trailing_stop_pct", 1.5)
+        self.min_order_notional = config.get("min_order_notional", 1.0)
 
         cb_config = config.get("circuit_breaker", {})
         self.cb_consecutive_losses = cb_config.get("consecutive_losses", 5)
         self.cb_volatility_multiplier = cb_config.get("volatility_spike_multiplier", 3.0)
         self.cb_cooldown_minutes = cb_config.get("cooldown_minutes", 30)
 
-        # Dependency injection: ledger access
+        # Dependency injection: ledger access & clock
         self._equity_provider = equity_provider
         self._positions_provider = positions_provider
         self._trade_history_provider = trade_history_provider
+        self._clock = clock or (lambda: datetime.now(timezone.utc))
 
         # State tracking
         self._circuit_breaker = CircuitBreakerState(
             max_consecutive_losses=self.cb_consecutive_losses,
             cooldown_minutes=self.cb_cooldown_minutes,
         )
-        self._peak_equity: float = equity_provider()
-        self._initial_capital: float = equity_provider()
+        initial_eq = equity_provider()
+        self._peak_equity: float = initial_eq
+        self._initial_capital: float = initial_eq
+        self._daily_start_equity: float = initial_eq
         self._today_pnl: float = 0.0
-        self._today_date: str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        self._today_date: str = self._clock().strftime("%Y-%m-%d")
+
+    def sync_baseline(self, equity: float) -> None:
+        """
+        Sync baseline equity trackers after startup exchange balance sync.
+        """
+        if equity <= 0:
+            return
+        self._initial_capital = equity
+        self._daily_start_equity = equity
+        if equity > self._peak_equity or self._peak_equity <= 0:
+            self._peak_equity = equity
 
     # ------------------------------------------------------------------
     # Main Check Pipeline
@@ -176,8 +192,13 @@ class RiskGuard:
         Returns:
             RiskVerdict (APPROVED, BLOCKED, or MODIFIED).
         """
-        # Emergency signals ALWAYS pass (CLOSE_ALL, etc.)
-        if signal.is_emergency():
+        # Risk-reducing / emergency signals ALWAYS pass so exits & stops are never blocked
+        if signal.is_emergency() or signal.action in (
+            SignalAction.STOP_GRID,
+            SignalAction.STOP_TREND,
+            SignalAction.PAUSE_GRID,
+            SignalAction.MODIFY_POSITION,
+        ):
             return RiskVerdict.approve()
 
         # Neutral signals pass (no action to take)
@@ -185,8 +206,6 @@ class RiskGuard:
             return RiskVerdict.approve()
 
         # --- Pipeline of checks ---
-        # Each check returns None if OK, or a RiskVerdict if blocked/modified.
-
         verdict = self._check_circuit_breaker()
         if verdict and verdict.is_blocked:
             return verdict
@@ -199,17 +218,31 @@ class RiskGuard:
         if verdict and verdict.is_blocked:
             return verdict
 
+        modified_params: Optional[Dict[str, Any]] = None
+        modify_reasons: List[str] = []
+
         verdict = self._check_position_size(signal)
-        if verdict and verdict.is_blocked:
-            return verdict
-
-        verdict = self._check_exposure(signal)
-        if verdict and verdict.is_blocked:
-            return verdict
-
-        verdict = self._check_order_value(signal)
         if verdict:
-            return verdict  # May be MODIFIED (reduce size)
+            if verdict.is_blocked:
+                return verdict
+            if verdict.verdict == Verdict.MODIFIED and verdict.modified_params:
+                modified_params = dict(verdict.modified_params)
+                modify_reasons.append(verdict.reason)
+
+        verdict = self._check_exposure(signal, override_metadata=modified_params)
+        if verdict and verdict.is_blocked:
+            return verdict
+
+        verdict = self._check_order_value(signal, override_metadata=modified_params)
+        if verdict:
+            if verdict.is_blocked:
+                return verdict
+            if verdict.verdict == Verdict.MODIFIED and verdict.modified_params:
+                modified_params = dict(verdict.modified_params)
+                modify_reasons.append(verdict.reason)
+
+        if modified_params is not None:
+            return RiskVerdict.modify(modified_params, "; ".join(modify_reasons))
 
         return RiskVerdict.approve()
 
@@ -218,16 +251,6 @@ class RiskGuard:
     # ------------------------------------------------------------------
 
     def _check_circuit_breaker(self) -> Optional[RiskVerdict]:
-        """
-        Check if the circuit breaker is tripped.
-
-        The circuit breaker pauses trading when:
-            - N consecutive losing trades (configurable, default 5).
-            - Extreme volatility spike detected.
-
-        When tripped, all new positions are blocked for cooldown_minutes.
-        CLOSE_ALL signals still pass through.
-        """
         cb = self._circuit_breaker
 
         if not cb.triggered:
@@ -237,7 +260,7 @@ class RiskGuard:
         if cb.triggered_at:
             triggered_dt = datetime.fromisoformat(cb.triggered_at)
             cooldown_seconds = cb.cooldown_minutes * 60
-            elapsed = (datetime.now(timezone.utc) - triggered_dt).total_seconds()
+            elapsed = (self._clock() - triggered_dt).total_seconds()
             if elapsed >= cooldown_seconds:
                 # Reset circuit breaker
                 cb.triggered = False
@@ -258,18 +281,21 @@ class RiskGuard:
         """
         Check if daily loss limit has been exceeded.
 
-        Resets at midnight UTC.
+        Resets daily baseline at midnight UTC.
         """
-        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        current_equity = self._equity_provider()
+        today = self._clock().strftime("%Y-%m-%d")
         if today != self._today_date:
             self._today_date = today
             self._today_pnl = 0.0
+            self._daily_start_equity = current_equity
 
-        current_equity = self._equity_provider()
-        daily_pnl = current_equity - self._initial_capital
+        baseline = self._daily_start_equity if self._daily_start_equity > 0 else self._initial_capital
+        daily_pnl = current_equity - baseline
+        self._today_pnl = daily_pnl
 
-        if self._initial_capital > 0:
-            daily_loss_pct = -daily_pnl / self._initial_capital * 100
+        if baseline > 0:
+            daily_loss_pct = -daily_pnl / baseline * 100
         else:
             daily_loss_pct = 0.0
 
@@ -324,8 +350,14 @@ class RiskGuard:
 
         # Estimated notional value of this signal's position
         if signal.is_grid_signal():
-            total_capital = metadata.get("total_capital", 0)
-            position_notional = total_capital
+            levels = metadata.get("levels", [])
+            if levels:
+                position_notional = sum(
+                    lvl["price"] * lvl["quantity"]
+                    for lvl in levels if lvl.get("side") == "BUY"
+                )
+            else:
+                position_notional = metadata.get("total_capital", 0)
         elif signal.is_trend_signal():
             entry_price = metadata.get("entry_price", 0)
             position_size = metadata.get("position_size", 0)
@@ -366,21 +398,25 @@ class RiskGuard:
     # Check 5: Total Exposure
     # ------------------------------------------------------------------
 
-    def _check_exposure(self, signal: StrategySignal) -> Optional[RiskVerdict]:
+    def _check_exposure(
+        self,
+        signal: StrategySignal,
+        override_metadata: Optional[Dict[str, Any]] = None,
+    ) -> Optional[RiskVerdict]:
         """
         Check that total market exposure does not exceed max_exposure_pct.
         """
         current_equity = self._equity_provider()
         positions = self._positions_provider()
 
-        # Current exposure: use avg entry price (not stale mark price from ledger)
+        # Current exposure across all open positions
         current_exposure = sum(
-            abs(pos.get("quantity", 0)) * pos.get("avg_entry_price", 0)
-            for pos in positions if pos.get("symbol") == signal.symbol
+            abs(pos.get("quantity", 0)) * pos.get("current_price", pos.get("avg_entry_price", 0))
+            for pos in positions
         )
 
-        # New exposure from this signal
-        metadata = signal.metadata
+        # New exposure from this signal (respecting any prior MODIFIED params)
+        metadata = override_metadata if override_metadata is not None else signal.metadata
         if signal.is_grid_signal():
             # Only BUY levels create new exposure (use USDT).
             # SELL levels use existing inventory, not new capital.
@@ -413,24 +449,34 @@ class RiskGuard:
     # Check 6: Order Value (Dust Protection)
     # ------------------------------------------------------------------
 
-    def _check_order_value(self, signal: StrategySignal) -> Optional[RiskVerdict]:
+    def _check_order_value(
+        self,
+        signal: StrategySignal,
+        override_metadata: Optional[Dict[str, Any]] = None,
+    ) -> Optional[RiskVerdict]:
         """
-        Check that the order notional is above dust threshold and below
-        reasonable maximum.
+        Check that the order notional is above dust threshold.
         """
-        metadata = signal.metadata
+        metadata = override_metadata if override_metadata is not None else signal.metadata
 
-        # Grid dust filtering is handled per-level by order_manager ($1 minimum).
-        # Blocking the entire grid signal because one level is small prevents
-        # all other valid levels from being placed.
         if signal.is_trend_signal():
             entry_price = metadata.get("entry_price", 0)
             position_size = metadata.get("position_size", 0)
             notional = entry_price * position_size
-            if notional < 1.0:
+            if notional < self.min_order_notional:
                 return RiskVerdict.block(
-                    f"DUST_ORDER: notional={notional:.2f} < $1.00 minimum"
+                    f"DUST_ORDER: notional={notional:.2f} < ${self.min_order_notional:.2f} minimum"
                 )
+        elif signal.is_grid_signal():
+            levels = metadata.get("levels", [])
+            buy_levels = [lvl for lvl in levels if lvl.get("side") == "BUY"]
+            if buy_levels:
+                max_notional = max(lvl["price"] * lvl["quantity"] for lvl in buy_levels)
+                if max_notional < self.min_order_notional:
+                    return RiskVerdict.block(
+                        f"DUST_ORDER: all grid BUY levels below ${self.min_order_notional:.2f} "
+                        f"(max={max_notional:.2f})"
+                    )
 
         return None
 
@@ -457,16 +503,9 @@ class RiskGuard:
         if cb.consecutive_losses >= cb.max_consecutive_losses:
             cb.triggered = True
             cb.trigger_reason = f"{cb.consecutive_losses} consecutive losses"
-            cb.triggered_at = datetime.now(timezone.utc).isoformat()
+            cb.triggered_at = self._clock().isoformat()
 
     def register_volatility_spike(self, current_vol: float, historical_vol: float) -> None:
-        """
-        Check for volatility spikes and trip circuit breaker if detected.
-
-        Args:
-            current_vol: Current volatility (e.g., ATR/price %).
-            historical_vol: Average historical volatility.
-        """
         if historical_vol <= 0:
             return
 
@@ -477,7 +516,7 @@ class RiskGuard:
                 f"Volatility spike: {ratio:.1f}× average (current={current_vol:.4f}, "
                 f"avg={historical_vol:.4f})"
             )
-            self._circuit_breaker.triggered_at = datetime.now(timezone.utc).isoformat()
+            self._circuit_breaker.triggered_at = self._clock().isoformat()
 
     def update_peak_equity(self) -> None:
         """Update the peak equity tracker (called periodically)."""

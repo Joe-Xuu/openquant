@@ -552,3 +552,119 @@ def compute_all(
         relative_volume=rel_vol,
         vwap=vwap_val,
     )
+
+
+def adx_series(
+    ohlcv: List[Dict[str, float]],
+    period: int = 14,
+) -> Tuple[List[float], List[float], List[float]]:
+    """
+    Strictly causal O(N) series computation of (adx, plus_di, minus_di)
+    using Wilder's smoothing. Value at index i depends ONLY on ohlcv[0..i].
+    """
+    n = len(ohlcv)
+    adx_out = [0.0] * n
+    pdi_out = [0.0] * n
+    mdi_out = [0.0] * n
+    if n < period + 1:
+        return adx_out, pdi_out, mdi_out
+
+    tr_list = [0.0] * n
+    pdm_list = [0.0] * n
+    ndm_list = [0.0] * n
+
+    for i in range(1, n):
+        h, l = ohlcv[i]["high"], ohlcv[i]["low"]
+        ph, pl, pc = ohlcv[i - 1]["high"], ohlcv[i - 1]["low"], ohlcv[i - 1]["close"]
+        tr_list[i] = max(h - l, abs(h - pc), abs(l - pc))
+        up = h - ph
+        dn = pl - l
+        pdm_list[i] = up if (up > dn and up > 0) else 0.0
+        ndm_list[i] = dn if (dn > up and dn > 0) else 0.0
+
+    atr_s = sum(tr_list[1:period + 1]) / period
+    pdm_s = sum(pdm_list[1:period + 1]) / period
+    ndm_s = sum(ndm_list[1:period + 1]) / period
+
+    dx_buf: List[float] = []
+    adx_val = 0.0
+
+    for i in range(period, n):
+        if i > period:
+            atr_s = (atr_s * (period - 1) + tr_list[i]) / period
+            pdm_s = (pdm_s * (period - 1) + pdm_list[i]) / period
+            ndm_s = (ndm_s * (period - 1) + ndm_list[i]) / period
+
+        if atr_s > 0:
+            pdi = (pdm_s / atr_s) * 100.0
+            mdi = (ndm_s / atr_s) * 100.0
+            dx = abs(pdi - mdi) / (pdi + mdi) * 100.0 if (pdi + mdi) > 0 else 0.0
+        else:
+            pdi, mdi, dx = 0.0, 0.0, 0.0
+
+        dx_buf.append(dx)
+        if len(dx_buf) < period:
+            adx_val = sum(dx_buf) / len(dx_buf)
+        elif len(dx_buf) == period:
+            adx_val = sum(dx_buf) / period
+        else:
+            adx_val = (adx_val * (period - 1) + dx) / period
+
+        adx_out[i] = adx_val
+        pdi_out[i] = pdi
+        mdi_out[i] = mdi
+
+    return adx_out, pdi_out, mdi_out
+
+
+def compute_all_series(
+    symbol: str,
+    ohlcv: List[Dict[str, float]],
+    ema_fast_period: int = 12,
+    ema_slow_period: int = 26,
+    macd_signal_period: int = 9,
+    adx_period: int = 14,
+    atr_period: int = 14,
+    rsi_period: int = 14,
+) -> List[IndicatorBundle]:
+    """
+    Strictly causal O(N) computation of IndicatorBundle for every bar in ohlcv.
+    Used by BacktestEngine to achieve >100x speedup with zero look-ahead bias.
+    """
+    n = len(ohlcv)
+    if n == 0:
+        return []
+
+    closes = [c["close"] for c in ohlcv]
+    ef = ema(closes, ema_fast_period)
+    es = ema(closes, ema_slow_period)
+    ml, sl, mh = macd(closes, ema_fast_period, ema_slow_period, macd_signal_period)
+    adx_s, pdi_s, mdi_s = adx_series(ohlcv, adx_period)
+    atr_s = atr(ohlcv, atr_period)
+    rsi_s = rsi(closes, rsi_period)
+
+    has_macd = len(mh) == n
+    bundles: List[IndicatorBundle] = []
+    for i in range(n):
+        c = ohlcv[i]
+        bundles.append(IndicatorBundle(
+            symbol=symbol,
+            timestamp=c.get("timestamp", ""),
+            close=c["close"],
+            open=c["open"],
+            high=c["high"],
+            low=c["low"],
+            ema_fast=ef[i] if i < len(ef) else 0.0,
+            ema_slow=es[i] if i < len(es) else 0.0,
+            macd_line=ml[i] if has_macd else 0.0,
+            macd_signal=sl[i] if has_macd else 0.0,
+            macd_hist=mh[i] if has_macd else 0.0,
+            adx=adx_s[i],
+            plus_di=pdi_s[i],
+            minus_di=mdi_s[i],
+            atr=atr_s[i] if i < len(atr_s) else 0.0,
+            rsi=rsi_s[i] if i < len(rsi_s) else 50.0,
+            volume=c.get("volume", 0.0),
+        ))
+    return bundles
+

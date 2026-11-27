@@ -42,26 +42,35 @@ from typing import Dict, List, Optional
 from dotenv import load_dotenv
 load_dotenv()
 
+# --- Config ---
+from config.schema import AppConfig, load_app_config
+
 # --- Core ---
 from core.local_ledger import LedgerEngine, get_ledger
 from core.state_machine import StateTransition, SystemState, TradingStateMachine
 
 # --- Data ---
-from data.indicators import compute_all, IndicatorBundle
+from data.indicators import compute_all, ema as compute_ema, IndicatorBundle
 from data.market_data import MarketDataEngine
 
 # --- Strategy ---
 from strategy.signal import SignalAction, StrategySignal
 from strategy.grid_strategy import GridConfig, GridStatus, GridStrategy
 from strategy.trend_strategy import TrendState, TrendStrategy
-from strategy.regime_detector import MarketRegime, RegimeDetector, RegimeResult
+from strategy.regime_detector import (
+    MacroTrend,
+    MarketRegime,
+    RegimeDetector,
+    RegimeResult,
+    classify_macro_trend,
+)
 
 # --- Risk ---
 from risk.risk_guard import RiskGuard, RiskVerdict, Verdict
 
 # --- Execution ---
 from execution.exchange_client import ExchangeClient
-from execution.order_manager import OrderManager
+from execution.order_manager import OrderManager, GRID_BUY_PREFIXES
 
 # ---------------------------------------------------------------------------
 # Logging Setup
@@ -99,12 +108,9 @@ logger = logging.getLogger("main")
 # ---------------------------------------------------------------------------
 
 def load_config(config_path: str = "config/settings.json") -> dict:
-    """Load system configuration from JSON."""
-    path = Path(config_path)
-    if not path.exists():
-        raise FileNotFoundError(f"Config file not found: {config_path}")
-    with open(path, "r") as f:
-        return json.load(f)
+    """Load and validate system configuration (Pydantic schema → dict)."""
+    app_cfg = load_app_config(config_path)
+    return app_cfg.model_dump()
 
 
 # ---------------------------------------------------------------------------
@@ -120,7 +126,10 @@ class TradingSystem:
     """
 
     def __init__(self, config: dict):
-        self.config = config
+        self.app_config: AppConfig = (
+            config if isinstance(config, AppConfig) else AppConfig.model_validate(config)
+        )
+        self.config = self.app_config.model_dump()
         self.running = False
 
         # --- Initialize Core ---
@@ -128,15 +137,12 @@ class TradingSystem:
         self.state_machine = TradingStateMachine()
 
         # --- Initialize Data ---
-        data_cfg = config.get("data", {})
-        exchange_cfg = config.get("exchange", {})
-        use_testnet = os.getenv("BINANCE_TESTNET", "true").lower() == "true"
-        use_futures = os.getenv("BINANCE_MARKET", "spot").lower() == "futures"
+        data_cfg = self.app_config.data
+        exchange_cfg = self.app_config.exchange
+        use_testnet = exchange_cfg.testnet
+        use_futures = exchange_cfg.market == "futures"
 
-        # REST API: testnet for orders, mainnet for... actually testnet for orders
-        # WebSocket: ALWAYS use mainnet for market data (free, public, reliable)
-        # The testnet WebSocket is frequently unavailable — we get price data
-        # from the real market but execute orders on testnet.
+        # REST API: testnet for orders, mainnet for live; WebSocket market data uses mainnet
         if use_futures:
             rest_url = "https://testnet.binancefuture.com" if use_testnet else "https://fapi.binance.com"
             ws_url = "wss://fstream.binance.com/ws"
@@ -144,105 +150,107 @@ class TradingSystem:
             rest_url = "https://testnet.binance.vision" if use_testnet else "https://api.binance.com"
             ws_url = "wss://stream.binance.com:9443/ws"
 
+        self.primary_interval = data_cfg.primary_interval
+        self.trend_interval = data_cfg.trend_interval
+        self.grid_capital_pct = self.app_config.trading.grid_capital_pct
+        self.trend_capital_pct = self.app_config.trading.trend_capital_pct
+
         self.data_engine = MarketDataEngine(
-            symbols=config.get("trading", {}).get("symbols", ["BTCUSDT"]),
-            intervals=data_cfg.get("kline_intervals", ["1m", "5m", "1h"]),
-            primary_interval=data_cfg.get("primary_interval", "5m"),
-            max_klines_per_request=data_cfg.get("max_klines_per_request", 500),
-            ws_reconnect_delay=data_cfg.get("ws_reconnect_delay_seconds", 5),
+            symbols=self.app_config.trading.symbols,
+            intervals=data_cfg.kline_intervals,
+            primary_interval=self.primary_interval,
+            max_klines_per_request=data_cfg.max_klines_per_request,
+            ws_reconnect_delay=data_cfg.ws_reconnect_delay_seconds,
             testnet=use_testnet,
             rest_base_url=rest_url,
             ws_base_url=ws_url,
         )
 
         # --- Initialize Strategy ---
-        strategy_cfg = config.get("strategy", {})
-        grid_cfg = strategy_cfg.get("grid_trading", {})
-        trend_cfg = strategy_cfg.get("trend_following", {})
-        regime_cfg = strategy_cfg.get("regime_detection", {})
-        mf_cfg = strategy_cfg.get("multi_factor", {})
+        grid_cfg = self.app_config.strategy.grid_trading
+        trend_cfg = self.app_config.strategy.trend_following
+        regime_cfg = self.app_config.strategy.regime_detection
+        mf_cfg = self.app_config.strategy.multi_factor
 
-        # Grid uses 70% of capital so total exposure stays within risk limit (80%)
-        max_exposure_pct = config.get("risk", {}).get("max_exposure_pct", 80.0) / 100.0
-        grid_capital = config.get("trading", {}).get("fallback_equity", 1000.0) * 0.85  # only a placeholder; overwritten at startup with real exchange equity
+        # Placeholder capital; dynamically updated from live exchange equity at startup & every tick
+        fallback_eq = self.app_config.trading.fallback_equity
+        self._cached_live_equity: float = fallback_eq
+
+        self.macro_cfg = self.app_config.strategy.macro_filter
 
         self.grid_strategy = GridStrategy(
-            grid_type=grid_cfg.get("type", "geometric"),
-            upper_bound_pct=grid_cfg.get("upper_bound_pct", 5.0),
-            lower_bound_pct=grid_cfg.get("lower_bound_pct", 5.0),
-            grid_levels=grid_cfg.get("grid_levels", 10),
-            profit_per_grid_pct=grid_cfg.get("profit_per_grid_pct", 0.5),
-            total_capital=grid_capital,
-            rebalance_threshold_pct=grid_cfg.get("rebalance_threshold_pct", 3.0),
+            grid_type=grid_cfg.type,
+            upper_bound_pct=grid_cfg.upper_bound_pct,
+            lower_bound_pct=grid_cfg.lower_bound_pct,
+            grid_levels=grid_cfg.grid_levels,
+            profit_per_grid_pct=grid_cfg.profit_per_grid_pct,
+            total_capital=fallback_eq * self.grid_capital_pct,
+            rebalance_threshold_pct=grid_cfg.rebalance_threshold_pct,
+            spot_mode=(grid_cfg.spot_mode and not use_futures),
         )
+        self.grid_strategy.grid_stop_loss_pct = grid_cfg.stop_loss_pct
 
         self.trend_strategy = TrendStrategy(
-            ema_fast=trend_cfg.get("ema_fast", 12),
-            ema_slow=trend_cfg.get("ema_slow", 26),
-            macd_signal_period=trend_cfg.get("macd_signal", 9),
-            atr_period=trend_cfg.get("atr_period", 14),
-            atr_multiplier=trend_cfg.get("atr_multiplier", 2.0),
-            trailing_stop_atr_multiplier=trend_cfg.get("trailing_stop_atr_multiplier", 3.0),
+            ema_fast=trend_cfg.ema_fast,
+            ema_slow=trend_cfg.ema_slow,
+            macd_signal_period=trend_cfg.macd_signal,
+            atr_period=trend_cfg.atr_period,
+            atr_multiplier=trend_cfg.atr_multiplier,
+            trailing_stop_atr_multiplier=trend_cfg.trailing_stop_atr_multiplier,
+            risk_per_trade_pct=trend_cfg.risk_per_trade_pct,
+            min_adx=trend_cfg.min_adx,
+            require_macd_confirm=trend_cfg.require_macd_confirm,
+            exit_on_ema_cross=trend_cfg.exit_on_ema_cross,
+            allow_short=trend_cfg.allow_short,
         )
 
         self.regime_detector = RegimeDetector(
-            weights=mf_cfg.get("weights"),
-            adx_threshold=regime_cfg.get("adx_threshold", 25.0),
-            volatility_window=regime_cfg.get("volatility_window", 20),
-            volatility_percentile_low=regime_cfg.get("volatility_percentile_low", 25.0),
-            volatility_percentile_high=regime_cfg.get("volatility_percentile_high", 75.0),
-            lookback_periods=regime_cfg.get("lookback_periods", 100),
+            weights=mf_cfg.weights,
+            adx_threshold=regime_cfg.adx_threshold,
+            volatility_window=regime_cfg.volatility_window,
+            volatility_percentile_low=regime_cfg.volatility_percentile_low,
+            volatility_percentile_high=regime_cfg.volatility_percentile_high,
+            lookback_periods=regime_cfg.lookback_periods,
         )
 
         # --- Initialize Risk ---
-        risk_cfg = config.get("risk", {})
-        # Allow .env overrides for risk parameters
-        for key, env_key in [
-            ("max_drawdown_pct", "MAX_DRAWDOWN_PCT"),
-            ("max_daily_loss_pct", "MAX_DAILY_LOSS_PCT"),
-            ("max_position_size_pct", "MAX_POSITION_SIZE_PCT"),
-        ]:
-            env_val = os.getenv(env_key)
-            if env_val is not None:
-                risk_cfg[key] = float(env_val)
-
         self.risk_guard = RiskGuard(
-            config=risk_cfg,
+            config=self.app_config.risk.model_dump(),
             equity_provider=self._get_equity,
             positions_provider=self._get_positions,
             trade_history_provider=self._get_trade_history,
         )
 
         # --- Initialize Execution ---
-        # Load API credentials: env vars take priority over config file
-        use_testnet = os.getenv("BINANCE_TESTNET", "true").lower() == "true"
-        use_futures = os.getenv("BINANCE_MARKET", "spot").lower() == "futures"
-
         if use_futures:
             api_key = os.getenv("BINANCE_FUTURES_API_KEY", "") or os.getenv("BINANCE_TESTNET_API_KEY", "")
             api_secret = os.getenv("BINANCE_FUTURES_API_SECRET", "") or os.getenv("BINANCE_TESTNET_API_SECRET", "")
         else:
             api_key = os.getenv(
                 "BINANCE_TESTNET_API_KEY" if use_testnet else "BINANCE_API_KEY", ""
-            ) or exchange_cfg.get("testnet_api_key" if use_testnet else "api_key", "")
+            ) or (exchange_cfg.testnet_api_key if use_testnet else exchange_cfg.api_key)
             api_secret = os.getenv(
                 "BINANCE_TESTNET_API_SECRET" if use_testnet else "BINANCE_API_SECRET", ""
-            ) or exchange_cfg.get("testnet_api_secret" if use_testnet else "api_secret", "")
+            ) or (exchange_cfg.testnet_api_secret if use_testnet else exchange_cfg.api_secret)
 
-        if not api_key or api_key.startswith("your_"):
+        if not api_key or api_key.startswith("your_") or api_key.startswith("YOUR_"):
             logger.warning("  API keys not configured! Set them in .env file")
             logger.warning("  cp .env.example .env  →  edit .env with your keys")
 
-        market_type = "futures" if use_futures else "spot"
-        logger.info(f"  Market: {market_type} | Testnet: {use_testnet}")
+        market_type = exchange_cfg.market
+        logger.info(
+            f"  Market: {market_type} | Testnet: {use_testnet} | "
+            f"Grid={self.primary_interval} ({self.grid_capital_pct*100:.0f}%) | "
+            f"Trend={self.trend_interval} ({self.trend_capital_pct*100:.0f}%)"
+        )
 
         self.exchange_client = ExchangeClient(
             api_key=api_key,
             api_secret=api_secret,
             testnet=use_testnet,
             market=market_type,
-            recv_window=exchange_cfg.get("recv_window", 5000),
-            rate_limit_rps=exchange_cfg.get("rate_limit_rps", 10.0),
+            recv_window=exchange_cfg.recv_window,
+            rate_limit_rps=exchange_cfg.rate_limit_rps,
         )
 
         self.order_manager = OrderManager(
@@ -253,7 +261,10 @@ class TradingSystem:
             ledger_record_trade_open=self._ledger_record_trade_open,
             ledger_record_trade_close=self._ledger_record_trade_close,
             ledger_register_grid=self._ledger_register_grid,
-            grid_profit_pct=grid_cfg.get("profit_per_grid_pct", 0.5),
+            reconcile_interval=60.0,  # 60s REST fallback; primary fills come via User Data Stream WS
+            grid_profit_pct=grid_cfg.profit_per_grid_pct,
+            enable_user_stream=True,
+            symbols=self.app_config.trading.symbols,
             # Grid fill persistence callbacks
             ledger_grid_buy_fill=self._ledger_grid_buy_fill,
             ledger_grid_sell_placed=self._ledger_grid_sell_placed,
@@ -263,12 +274,17 @@ class TradingSystem:
             ledger_get_tp_attempted_tags=self._ledger_get_tp_attempted_tags,
             ledger_get_grid_fill_by_sell_order=self._ledger_get_grid_fill_by_sell_order,
             ledger_get_order_id_by_exchange=self._ledger_get_order_id_by_exchange,
+            on_trend_stop_filled=self._on_trend_stop_filled,
         )
 
         # --- Per-Symbol State ---
         self._trend_states: Dict[str, TrendState] = {}
         self._grid_configs: Dict[str, GridConfig] = {}
         self._current_regime: Dict[str, MarketRegime] = {}
+        self._trend_paused_grid: Dict[str, bool] = {}
+        self._macro_trend: Dict[str, MacroTrend] = {}
+        self._macro_paused_grid: Dict[str, bool] = {}
+        self._macro_liquidated: Dict[str, bool] = {}
 
         # --- Statistics ---
         self._tick_count = 0
@@ -280,29 +296,41 @@ class TradingSystem:
     # ------------------------------------------------------------------
 
     async def _get_equity_async(self) -> float:
-        """Return current total equity from exchange (live balances × prices)."""
+        """Return current total equity from exchange (live balances × prices) and refresh cache."""
         try:
             balances = await self.exchange_client.get_balances()
-            symbols = self.config.get("trading", {}).get("symbols", ["DOGEUSDT"])
             equity = 0.0
             for b in balances:
                 if b.asset == "USDT":
                     equity += b.total
                 else:
-                    # Look up price for this asset
                     sym = f"{b.asset}USDT"
                     try:
                         px = await self.exchange_client.get_ticker_price(sym)
                         equity += b.total * px
                     except Exception:
-                        pass  # skip assets we can't price
-            return equity if equity > 0 else self.ledger.get_total_equity()
+                        pass
+            if equity > 0:
+                self._cached_live_equity = equity
+                return equity
+            return self._cached_live_equity or self.ledger.get_total_equity()
         except Exception:
-            return self.ledger.get_total_equity()
+            return self._cached_live_equity or self.ledger.get_total_equity()
 
     def _get_equity(self) -> float:
-        """Sync wrapper: return equity from ledger (updated by async fetch)."""
+        """Sync wrapper for RiskGuard: returns latest live equity cache (or ledger fallback)."""
+        if self._cached_live_equity > 0:
+            return self._cached_live_equity
         return self.ledger.get_total_equity()
+
+    def _on_trend_stop_filled(self, symbol: str, fill_price: float, fill_qty: float) -> None:
+        """Called by OrderManager when an exchange-side trend_sl_* order executes."""
+        old_state = self._trend_states.get(symbol)
+        if old_state and old_state.is_active and old_state.entry_price > 0:
+            pnl_pct = (fill_price - old_state.entry_price) / old_state.entry_price * 100.0
+            self.risk_guard.register_trade_result(pnl_pct)
+        self._trend_states[symbol] = TrendState.flat(symbol)
+        logger.info(f"Trend state reset to FLAT for {symbol} after exchange stop-loss @ {fill_price}")
 
     def _get_positions(self) -> List[Dict]:
         """Return open positions from the ledger."""
@@ -332,7 +360,7 @@ class TradingSystem:
             for t in trades
         ]
 
-    def _ledger_record_order(self, trade_id, symbol, side, order_type, quantity, price=None, **kw):
+    def _ledger_record_order(self, trade_id, symbol, side, order_type, quantity, price=None, client_order_id=None, **kw):
         """Record an order in the ledger (before API dispatch)."""
         return self.ledger.record_order(
             trade_id=trade_id,
@@ -341,6 +369,7 @@ class TradingSystem:
             order_type=order_type,
             quantity=quantity,
             price=price,
+            client_order_id=client_order_id,
         )
 
     def _ledger_order_open(self, order_id, exchange_order_id):
@@ -384,7 +413,7 @@ class TradingSystem:
         self.ledger.grid_fill_reset_sell_placed(trade_id)
 
     def _ledger_get_pending_tp_fills(self, symbol=None):
-        """Query fills where sell_placed=FALSE."""
+        """Query fills where sell_filled=FALSE."""
         return self.ledger.get_pending_tp_fills(symbol)
 
     def _ledger_get_tp_attempted_tags(self, symbol=None):
@@ -396,7 +425,7 @@ class TradingSystem:
         return self.ledger.get_grid_fill_by_sell_order(sell_order_id)
 
     def _ledger_get_order_id_by_exchange(self, exchange_order_id):
-        """Look up order_id by exchange_order_id (replaces SQLite hack)."""
+        """Look up order_id by exchange_order_id."""
         return self.ledger.get_order_id_by_exchange_id(exchange_order_id)
 
     def _ledger_record_trade_open(self, trade_id, symbol, side, quantity, price, fee=0.0, slippage=0.0):
@@ -427,23 +456,26 @@ class TradingSystem:
     async def start(self):
         """Start all components and enter the main event loop."""
         logger.info("=" * 60)
-        logger.info(" QUANT TRADING SYSTEM v1.0 — Regime-Switching Model")
+        logger.info(" OPENQUANT v2.0 — Parallel Dual-Engine (Binance Spot)")
         logger.info("=" * 60)
         self._start_time = time.time()
 
-        # Start exchange client FIRST (needed for sync)
-        await self.exchange_client.start()
+        symbols = self.app_config.trading.symbols
 
-        # ---- FULL STARTUP SYNC: exchange balances → ledger ----
-        # Every restart, pull real balances from Binance and seed the ledger.
+        # 1. Start exchange client & cache real symbol filters (tick/lot/minNotional)
+        await self.exchange_client.start()
+        await self.exchange_client.load_symbol_info(symbols)
+        for sym in symbols:
+            self.ledger.ensure_symbol_accounts(sym)
+
+        # 2. Non-destructive startup sync: align ledger equity via adjustment entry
         try:
             balances = await self.exchange_client.get_balances()
-            symbols = self.config["trading"]["symbols"]
             usdt_bal = sum(b.total for b in balances if b.asset == "USDT")
             total_equity = usdt_bal
 
             for sym in symbols:
-                base = sym.replace("USDT", "")
+                base = self.exchange_client.get_symbol_info(sym).base_asset
                 try:
                     px = await self.exchange_client.get_ticker_price(sym)
                 except Exception:
@@ -452,77 +484,52 @@ class TradingSystem:
                 total_equity += qty * px
                 logger.info(f"  Exchange: {qty:.4f} {base} @ ${px:.5f} = ${qty*px:.2f}")
 
-            logger.info(f"  Exchange: ${usdt_bal:.2f} USDT")
-            logger.info(f"  Total equity from exchange: ${total_equity:.2f}")
+            logger.info(f"  Exchange: ${usdt_bal:.2f} USDT | Total equity: ${total_equity:.2f}")
 
-            # Reset ledger to match exchange reality.
-            # NOTE: grid_fills table is INTENTIONALLY NOT DELETED —
-            # it persists across restarts for TP recovery and audit trail.
-            import psycopg2
-            conn = psycopg2.connect(self.ledger._dsn)
-            conn.autocommit = True
-            with conn.cursor() as cur:
-                cur.execute("DELETE FROM orders")
-                cur.execute("DELETE FROM trades")
-                cur.execute("DELETE FROM journal_lines")
-                cur.execute("DELETE FROM journal_entries")
-                cur.execute("DELETE FROM positions")
-            conn.close()
-
-            # Seed correct capital
-            self.ledger.record_initial_capital(total_equity)
-            self.config.setdefault("trading", {})["fallback_equity"] = total_equity  # update in-memory config with real balance
-            self.grid_strategy.total_capital = total_equity * 0.85
-            logger.info(f"  Ledger synced to exchange: ${total_equity:.2f}")
-
+            if total_equity > 0:
+                self._cached_live_equity = total_equity
+                self.ledger.reconcile_equity(total_equity)
+                self.grid_strategy.total_capital = total_equity * self.grid_capital_pct
+                logger.info(
+                    f"  Ledger reconciled (history preserved): ${total_equity:.2f} "
+                    f"(grid budget=${self.grid_strategy.total_capital:.2f})"
+                )
         except Exception as e:
-            logger.warning(f"  Could not sync with exchange: {e}. Using ledger as-is.")
+            logger.warning(f"  Could not sync with exchange: {e}. Using ledger/fallback.")
             total_equity = self.ledger.get_total_equity()
             if total_equity <= 0:
-                total_equity = self.config.get("trading", {}).get("fallback_equity", 1000.0)
-                self.ledger.record_initial_capital(total_equity)
-                self.grid_strategy.total_capital = total_equity * 0.85
+                total_equity = self.app_config.trading.fallback_equity
+                self.ledger.reconcile_equity(total_equity)
+            self._cached_live_equity = total_equity
+            self.grid_strategy.total_capital = total_equity * self.grid_capital_pct
 
-        # Remember initial equity for hard stop-loss
-        self._initial_equity = await self._get_equity_async()
-        self._equity_stop_pct = float(os.getenv("MAX_DRAWDOWN_PCT", "15"))
-        logger.info(f"  Equity stop-loss: ${self._initial_equity:.2f} × "
-                     f"(1 - {self._equity_stop_pct}%) = ${self._initial_equity * (1 - self._equity_stop_pct/100):.2f}")
+        # 3. Sync RiskGuard baseline AFTER live equity is known
+        self._initial_equity = self._cached_live_equity
+        self._equity_stop_pct = self.app_config.risk.max_drawdown_pct
+        self.risk_guard.sync_baseline(self._initial_equity)
+        logger.info(
+            f"  Equity stop-loss: ${self._initial_equity:.2f} × "
+            f"(1 - {self._equity_stop_pct}%) = "
+            f"${self._initial_equity * (1 - self._equity_stop_pct/100):.2f}"
+        )
 
-        # Start order manager
-        await self.order_manager.start()
-
-        # Startup cleanup: only cancel old GRID orders (co_/rebuy_ prefix).
-        # Preserve tp_* stop-loss orders and any manual orders you placed.
+        # 4. Startup cleanup: cancel ONLY stale grid buy orders (grid_/co_/rebuy_)
         logger.info("Running startup cleanup...")
-        for symbol in self.config.get("trading", {}).get("symbols", []):
+        for symbol in symbols:
             try:
-                open_orders = await self.exchange_client.get_open_orders(symbol)
-                cancelled, preserved = 0, 0
-                for o in open_orders:
-                    cid = o.get("clientOrderId", "")
-                    if cid.startswith("co_") or cid.startswith("rebuy_"):
-                        try:
-                            await self.exchange_client.cancel_order(
-                                symbol, order_id=str(o.get("orderId", ""))
-                            )
-                            cancelled += 1
-                        except Exception:
-                            pass
-                    else:
-                        preserved += 1
+                cancelled, preserved = await self.order_manager._cancel_orders_by_prefix(
+                    symbol, GRID_BUY_PREFIXES
+                )
                 logger.info(
                     f"  Cleaned {symbol}: cancelled {cancelled} grid orders, "
-                    f"preserved {preserved} (TP + manual)"
+                    f"preserved {preserved} (TP + trend + manual)"
                 )
             except Exception as e:
                 logger.debug(f"  No old orders to clear for {symbol}: {e}")
         logger.info("Startup cleanup complete")
 
-        # ---- SYNC + RECOVER TP ORDERS ----
-        # First: verify all "placed" TP orders still exist on exchange.
-        # Some may have filled while reconcile was broken, or been cancelled.
-        # Reset stale flags so recovery can re-place them.
+        # 5. Sync TP status FIRST, then start OrderManager (seeds fresh cache + WS),
+        #    then recover any pending TP fills.
         logger.info("Syncing TP order status with exchange...")
         try:
             corrected = await self.order_manager.sync_tp_orders()
@@ -531,7 +538,8 @@ class TradingSystem:
         except Exception as e:
             logger.error(f"TP sync failed: {e}")
 
-        # Second: place TP orders for any fills that need them (sell_placed=FALSE).
+        await self.order_manager.start()
+
         logger.info("Recovering pending TP fills...")
         try:
             recovered = await self.order_manager.recover_pending_tp_fills()
@@ -540,13 +548,12 @@ class TradingSystem:
         except Exception as e:
             logger.error(f"TP recovery failed: {e}")
 
-        # Start data engine (fetches historical + opens WebSocket)
+        # 6. Start data engine (fetches historical + opens WebSocket)
         self.state_machine.transition(StateTransition.DATA_READY)
         await self.data_engine.start()
 
-        # Wait for data warm-up
         logger.info("Warming up indicators...")
-        await asyncio.sleep(5)  # Allow some candles to accumulate
+        await asyncio.sleep(5)
 
         self.running = True
         logger.info("Trading system started. Entering main loop.")
@@ -599,8 +606,7 @@ class TradingSystem:
             7. Dispatch to execution
             8. Record in ledger
         """
-        symbols = self.config.get("trading", {}).get("symbols", ["DOGEUSDT"])
-        self.grid_capital_pct = 0.60
+        symbols = self.app_config.trading.symbols
         tick_interval = self._get_tick_interval_seconds()
         self._last_tick_time = time.time()
 
@@ -635,7 +641,7 @@ class TradingSystem:
                 await self._log_status_async()
 
                 if self._tick_count % 60 == 0:
-                    self.ledger.take_snapshot()
+                    await asyncio.to_thread(self.ledger.take_snapshot)
                     self.risk_guard.update_peak_equity()
 
                 # Split sleep into 1-second chunks (Windows event-loop stability)
@@ -657,27 +663,27 @@ class TradingSystem:
         """
         Process one tick for one symbol: data → indicators → regime → signal.
         """
+        live_eq = await self._get_equity_async()
+        # Dynamically scale grid budget to live equity (flexible for $100 or $100k)
+        if live_eq > 0:
+            self.grid_strategy.total_capital = live_eq * self.grid_capital_pct
+
         # ---- HARD EQUITY STOP-LOSS ----
-        # If total equity drops below initial × (1 - stop%), halt everything.
         if hasattr(self, '_initial_equity') and self._initial_equity > 0:
-            try:
-                live_eq = await self._get_equity_async()
-                stop_line = self._initial_equity * (1 - self._equity_stop_pct / 100)
-                if live_eq > 0 and live_eq <= stop_line:
-                    logger.error(
-                        f"🛑 EQUITY STOP-LOSS TRIGGERED! "
-                        f"${live_eq:.2f} <= ${stop_line:.2f} "
-                        f"(-{(1 - live_eq/self._initial_equity)*100:.1f}%)"
-                    )
-                    # Cancel all orders and stop
-                    try:
-                        await self.exchange_client.cancel_all_orders(symbol)
-                    except Exception:
-                        pass
-                    self.running = False
-                    return
-            except Exception:
-                pass
+            stop_line = self._initial_equity * (1 - self._equity_stop_pct / 100)
+            if live_eq > 0 and live_eq <= stop_line:
+                logger.error(
+                    f"🛑 EQUITY STOP-LOSS TRIGGERED! "
+                    f"${live_eq:.2f} <= ${stop_line:.2f} "
+                    f"(-{(1 - live_eq/self._initial_equity)*100:.1f}%)"
+                )
+                try:
+                    await self.exchange_client.cancel_all_orders(symbol)
+                except Exception:
+                    pass
+                self.state_machine.emergency(reason="equity_stop_loss")
+                self.running = False
+                return
 
         # 0. Data freshness — warn if WebSocket data is stale, but continue
         data_age = self.data_engine.get_data_age(symbol)
@@ -691,15 +697,13 @@ class TradingSystem:
                 f"Proceeding with cached data."
             )
 
-        # 1. Get latest OHLCV data
-        ohlcv = await self.data_engine.get_ohlcv(symbol)
+        # 1. Get latest OHLCV data (primary interval for grid + regime)
+        ohlcv = await self.data_engine.get_ohlcv(symbol, interval=self.primary_interval)
         if len(ohlcv) < 30:
-            return  # Not enough data for reliable indicators
+            return
 
         # 2. Compute indicators
         indicators = compute_all(symbol, ohlcv)
-
-        # Skip if indicators are stale
         if indicators.atr <= 0 or indicators.close <= 0:
             return
 
@@ -716,19 +720,55 @@ class TradingSystem:
             atr=indicators.atr,
             volume=indicators.volume,
         )
-
-        # Update current regime
         self._current_regime[symbol] = regime_result.regime
+
+        # 3b. Macro trend filter (1h EMA50 vs EMA200 + EMA200 slope)
+        macro_trend = MacroTrend.NEUTRAL
+        macro_ema_slow_val = 0.0
+        macro_ema200_rising = True
+        if self.macro_cfg.enabled:
+            try:
+                macro_ohlcv = await self.data_engine.get_ohlcv(
+                    symbol, interval=self.macro_cfg.interval
+                )
+                if len(macro_ohlcv) >= self.macro_cfg.ema_slow:
+                    m_closes = [c["close"] for c in macro_ohlcv]
+                    m_fast_series = compute_ema(m_closes, self.macro_cfg.ema_fast)
+                    m_slow_series = compute_ema(m_closes, self.macro_cfg.ema_slow)
+                    macro_ema_slow_val = m_slow_series[-1]
+                    if len(m_slow_series) > 24:
+                        macro_ema200_rising = m_slow_series[-1] > m_slow_series[-25]
+                    macro_trend = classify_macro_trend(
+                        m_closes[-1], m_fast_series[-1], macro_ema_slow_val
+                    )
+            except Exception as e:
+                logger.debug(f"Macro filter fallback to NEUTRAL for {symbol}: {e}")
+        self._macro_trend[symbol] = macro_trend
 
         # 4. Generate strategy signals — grid ALWAYS, trend INDEPENDENTLY
         grid_signal: Optional[StrategySignal] = None
         trend_signal: Optional[StrategySignal] = None
         is_ranging = regime_result.is_ranging
+        sym_info = self.exchange_client.get_symbol_info(symbol)
+        min_notional = float(sym_info.min_notional)
 
-        # ---- GRID (always running) ----
+        # Dynamically scale available grid budget (total grid allocation minus held grid inventory)
+        if live_eq > 0:
+            try:
+                pending_grid = self._ledger_get_pending_tp_fills(symbol)
+                grid_inv_val = sum(
+                    float(f.get("buy_qty", 0.0)) * indicators.close for f in pending_grid
+                )
+            except Exception:
+                grid_inv_val = 0.0
+            self.grid_strategy.total_capital = max(
+                0.0, live_eq * self.grid_capital_pct - grid_inv_val
+            )
+
+        # ---- GRID (always running on primary_interval, gated by macro filter) ----
         current_grid = self._grid_configs.get(symbol)
 
-        # Stop-loss check first
+        # Stop-loss check first (FIXED: calls .emergency(), not nonexistent .emergency_stop())
         if current_grid is not None:
             if self.grid_strategy.check_stop_loss(indicators.close, current_grid):
                 logger.error(
@@ -739,7 +779,75 @@ class TradingSystem:
                     current_grid, reason="stop_loss"
                 )
                 self._grid_configs.pop(symbol, None)
-                self.state_machine.emergency_stop()
+                self.state_machine.emergency(reason=f"grid_stop_loss:{symbol}")
+
+        # ---- Macro-bear protection (two-tier: pause buys on BEAR; liquidate only on deep bear) ----
+        macro_bear = (
+            self.macro_cfg.enabled
+            and self.macro_cfg.pause_grid_in_bear
+            and macro_trend == MacroTrend.BEAR
+        )
+        was_macro_paused = self._macro_paused_grid.get(symbol, False)
+        if macro_bear:
+            depth_pct = self.macro_cfg.bear_exit_depth_pct
+            deep_bear_liq = (
+                self.macro_cfg.close_grid_in_bear
+                and not self._macro_liquidated.get(symbol, False)
+                and (
+                    depth_pct <= 0.0
+                    or (
+                        macro_ema_slow_val > 0
+                        and indicators.close <= macro_ema_slow_val * (1.0 - depth_pct / 100.0)
+                    )
+                )
+            )
+            if not was_macro_paused:
+                logger.warning(
+                    f"🐻 Macro BEAR detected for {symbol} ({self.macro_cfg.interval} "
+                    f"EMA{self.macro_cfg.ema_fast} < EMA{self.macro_cfg.ema_slow}). "
+                    f"Pausing new grid buys (deep-bear exit threshold={depth_pct:.1f}% below EMA200)."
+                )
+                self._macro_paused_grid[symbol] = True
+                if grid_signal is None and not deep_bear_liq:
+                    # Tier 1: cancel resting BUY orders only, let existing TP sells fill naturally
+                    if current_grid is not None:
+                        grid_signal = self.grid_strategy.generate_stop_signal(
+                            current_grid, reason="macro_bear_pause"
+                        )
+                        grid_signal.metadata["liquidate_inventory"] = False
+                        self._grid_configs.pop(symbol, None)
+                        current_grid = None
+            if grid_signal is None and deep_bear_liq:
+                # Tier 2: price broke deep below EMA200 -> liquidate grid inventory
+                logger.warning(
+                    f"🐻 Deep BEAR liquidation for {symbol}: price {indicators.close:.5f} "
+                    f"<= EMA200×(1-{depth_pct:.1f}%)"
+                )
+                self._macro_liquidated[symbol] = True
+                if current_grid is not None:
+                    grid_signal = self.grid_strategy.generate_stop_signal(
+                        current_grid, reason="macro_bear"
+                    )
+                    grid_signal.metadata["liquidate_inventory"] = True
+                    self._grid_configs.pop(symbol, None)
+                    current_grid = None
+                else:
+                    grid_signal = StrategySignal(
+                        action=SignalAction.STOP_GRID,
+                        symbol=symbol,
+                        confidence=1.0,
+                        metadata={
+                            "grid_id": "",
+                            "reason": "macro_bear",
+                            "liquidate_inventory": True,
+                        },
+                        source="GridStrategy",
+                    )
+        elif was_macro_paused:
+            logger.info(f"✓ Macro BEAR cleared for {symbol} ({macro_trend.value}) — resuming grid")
+            self._macro_paused_grid[symbol] = False
+            self._macro_liquidated[symbol] = False
+            current_grid = None  # force fresh deployment
 
         # ---- Consecutive buy circuit breaker ----
         cb_triggered = self.order_manager._consecutive_buys >= self.order_manager._consecutive_buy_limit
@@ -748,83 +856,106 @@ class TradingSystem:
                 f"🛑 CIRCUIT BREAKER: {self.order_manager._consecutive_buys} consecutive buys. "
                 f"Pausing new grid buys — possible one-sided market."
             )
-        elif not cb_triggered and self.order_manager._consecutive_buys == 0:
-            pass  # circuit breaker released naturally when a sell occurs
 
-        # ---- Trend gate: pause new grid buys in strong trends ----
-        # When the market is clearly trending, the grid keeps chasing price
-        # downhill, draining USDT into a falling knife. Pause new grid entries
-        # and let trend strategy handle the directional move. Existing TP
-        # orders are preserved by the order manager's rebalance logic.
+        # ---- Trend gate (per-symbol): pause new grid buys in strong trends ----
         strong_trend = regime_result.is_trending and regime_result.confidence > 0.80
-        was_trending = getattr(self, '_trend_paused_grid', False)
+        was_trending = self._trend_paused_grid.get(symbol, False)
         if strong_trend and not was_trending and current_grid is not None:
             logger.warning(
-                f"⚠ Strong trend detected (conf={regime_result.confidence:.2f}). "
+                f"⚠ Strong trend detected for {symbol} (conf={regime_result.confidence:.2f}). "
                 f"Pausing new grid buys — trend strategy takes over."
             )
-            self._trend_paused_grid = True
+            self._trend_paused_grid[symbol] = True
         elif not strong_trend and was_trending:
-            logger.info("✓ Trend subsided — resuming grid")
-            self._trend_paused_grid = False
+            logger.info(f"✓ Trend subsided for {symbol} — resuming grid")
+            self._trend_paused_grid[symbol] = False
             current_grid = None  # force fresh deployment
 
         if grid_signal is None:
-            # Grid frozen by trend OR circuit breaker
-            grid_frozen = (strong_trend or cb_triggered)
-            if grid_frozen and current_grid is not None:
-                pass  # hold existing positions, don't deploy new buys
-            elif current_grid is None:
+            grid_frozen = (macro_bear or strong_trend or cb_triggered)
+            if grid_frozen:
+                pass  # hold or stay flat, don't deploy new buys
+            elif current_grid is None and self.grid_strategy.total_capital >= min_notional:
                 ref_price = self.grid_strategy.compute_rebalance_price(ohlcv)
                 current_grid = self.grid_strategy.compute_grid(
                     reference_price=ref_price, symbol=symbol,
                     atr=indicators.atr, is_ranging=is_ranging,
+                    min_notional=min_notional,
                 )
                 self._grid_configs[symbol] = current_grid
                 grid_signal = self.grid_strategy.generate_signal(current_grid)
                 logger.info(
-                    f" Grid deployed: {symbol} {len(current_grid.levels)}lvls "
+                    f" Grid deployed: {symbol} {len(current_grid.buy_levels)} buy lvls "
                     f"@ {ref_price:.5f} sl={current_grid.stop_loss_price:.5f}"
                 )
                 self.state_machine.activate_grid()
 
-            # Force periodic rebalance every 144 ticks (~12h) to prevent grid decay
-            elif (self.grid_strategy.check_rebalance(indicators.close, current_grid)
-                  or self._tick_count % 144 == 0):
-                if self._tick_count % 144 == 0 and self._tick_count > 0:
+            elif current_grid is not None and (
+                self.grid_strategy.check_rebalance(indicators.close, current_grid)
+                or (self._tick_count > 0 and self._tick_count % 144 == 0)
+            ) and self.grid_strategy.total_capital >= min_notional:
+                if self._tick_count > 0 and self._tick_count % 144 == 0:
                     logger.info(f"  Periodic grid rebuild (tick #{self._tick_count})")
                 ref_price = self.grid_strategy.compute_rebalance_price(ohlcv)
                 new_grid = self.grid_strategy.compute_grid(
                     reference_price=ref_price, symbol=symbol,
                     atr=indicators.atr, is_ranging=is_ranging,
+                    min_notional=min_notional,
                 )
                 self._grid_configs[symbol] = new_grid
                 grid_signal = self.grid_strategy.generate_signal(new_grid)
                 logger.info(
                     f" Grid rebalanced: {symbol} @ {ref_price:.5f} "
-                    f"({len(new_grid.levels)}lvls)"
+                    f"({len(new_grid.buy_levels)} buy lvls)"
                 )
 
-        # ---- TREND (independently evaluated, only on strong signals) ----
-        # Startup cooldown: no trend trades for first 30 ticks (~2.5h) to let
-        # indicators stabilize and prevent insane position sizing at launch.
+        # ---- TREND (decoupled 1h trend_interval; active positions ALWAYS monitored!) ----
+        trend_state = self._trend_states.get(symbol, TrendState.flat(symbol))
+        if trend_state.is_active and indicators.close > trend_state.highest_price:
+            trend_state.highest_price = indicators.close
         trend_cooldown = self._tick_count < 30
-        if regime_result.is_trending and regime_result.confidence > 0.80 and not trend_cooldown:
-            trend_state = self._trend_states.get(symbol, TrendState.flat(symbol))
-            raw_trend = self.trend_strategy.evaluate(
-                symbol=symbol, current_price=indicators.close,
-                ema_fast_val=indicators.ema_fast, ema_slow_val=indicators.ema_slow,
-                macd_hist=indicators.macd_hist, atr=indicators.atr,
-                current_state=trend_state,
-                capital=await self._get_equity_async(),
+        should_eval_trend = trend_state.is_active or (not trend_cooldown)
+        if should_eval_trend:
+            trend_ohlcv = (
+                await self.data_engine.get_ohlcv(symbol, interval=self.trend_interval)
+                if self.trend_interval != self.primary_interval
+                else ohlcv
             )
-            if raw_trend is not None:
-                # Only accept ENTRY when flat, or EXIT when in position.
-                # Ignore "hold" signals that keep the same state.
-                if raw_trend.action == SignalAction.START_TREND and not trend_state.is_active:
-                    trend_signal = raw_trend
-                elif raw_trend.action == SignalAction.STOP_TREND and trend_state.is_active:
-                    trend_signal = raw_trend
+            if len(trend_ohlcv) >= 30:
+                t_ind = compute_all(symbol, trend_ohlcv)
+                if t_ind.atr > 0 and t_ind.close > 0:
+                    trend_capital = live_eq * self.trend_capital_pct
+                    macro_bull = (
+                        (macro_trend == MacroTrend.BULL)
+                        if self.macro_cfg.enabled
+                        else None
+                    )
+                    if (
+                        macro_bull
+                        and self.app_config.strategy.trend_following.require_ema200_rising
+                        and not macro_ema200_rising
+                    ):
+                        macro_bull = False
+                    raw_trend = self.trend_strategy.evaluate(
+                        symbol=symbol,
+                        current_price=indicators.close,  # latest mark price for stops
+                        ema_fast_val=t_ind.ema_fast,
+                        ema_slow_val=t_ind.ema_slow,
+                        macd_hist=t_ind.macd_hist,
+                        atr=t_ind.atr,
+                        current_state=trend_state,
+                        capital=trend_capital,
+                        adx=t_ind.adx,
+                        macro_bullish=macro_bull,
+                    )
+                    if raw_trend is not None:
+                        if raw_trend.action == SignalAction.START_TREND and not trend_state.is_active:
+                            trend_signal = raw_trend
+                        elif raw_trend.action in (
+                            SignalAction.STOP_TREND,
+                            SignalAction.MODIFY_POSITION,
+                        ) and trend_state.is_active:
+                            trend_signal = raw_trend
 
         # 5. Route signals — trend takes priority if both fire
         if trend_signal is not None:
@@ -835,23 +966,15 @@ class TradingSystem:
     async def _route_signal(self, signal: StrategySignal):
         """
         Route a signal through the risk guard and (if approved) to execution.
-
-        This is the "event bus" — the only place where strategy output
-        meets execution input.
         """
         self._signal_count += 1
 
-        # Skip expired signals
         if signal.is_expired():
             logger.debug(f"Discarded expired signal: {signal}")
             return
 
-        # Check circuit breaker for volatility spikes
-        # (would be computed from indicators in production)
-
         # --- Risk Check ---
         verdict = self.risk_guard.check_signal(signal)
-
         if verdict.verdict == Verdict.BLOCKED:
             logger.warning(f" SIGNAL BLOCKED by risk: {verdict.reason}")
             return
@@ -867,29 +990,31 @@ class TradingSystem:
                 f"Dispatched signal {signal.signal_id}: "
                 f"{signal.action.value} {signal.symbol} → {len(tracked_orders)} orders"
             )
-            # Grid is truly active only after successful dispatch (not just signal generation)
             if signal.action == SignalAction.START_GRID and len(tracked_orders) > 0:
                 self.order_manager.grid_active = True
                 self.order_manager.grid_deployed_at = time.time()
 
             # Update strategy state based on dispatch result
-            if signal.action == SignalAction.START_TREND:
+            if signal.action == SignalAction.START_TREND and len(tracked_orders) > 0:
                 fill_price = signal.metadata.get("entry_price", 0.0)
                 old_state = self._trend_states.get(signal.symbol, TrendState.flat(signal.symbol))
                 new_state = self.trend_strategy.update_state(old_state, signal, fill_price)
                 self._trend_states[signal.symbol] = new_state
 
+            elif signal.action == SignalAction.MODIFY_POSITION:
+                old_state = self._trend_states.get(signal.symbol, TrendState.flat(signal.symbol))
+                if old_state.is_active:
+                    self._trend_states[signal.symbol] = self.trend_strategy.update_state(
+                        old_state, signal, signal.metadata.get("current_price", old_state.entry_price)
+                    )
+
             elif signal.action == SignalAction.STOP_TREND:
                 self._trend_states[signal.symbol] = TrendState.flat(signal.symbol)
-
-            elif signal.action == SignalAction.STOP_GRID:
-                if signal.symbol in self._grid_configs:
-                    del self._grid_configs[signal.symbol]
-
-            # Update circuit breaker with trade results
-            if signal.action == SignalAction.STOP_TREND:
                 pnl = signal.metadata.get("pnl_pct", 0.0)
                 self.risk_guard.register_trade_result(pnl)
+
+            elif signal.action == SignalAction.STOP_GRID:
+                self._grid_configs.pop(signal.symbol, None)
 
         except Exception as e:
             logger.error(f"Failed to dispatch signal {signal.signal_id}: {e}")

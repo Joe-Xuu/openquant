@@ -307,6 +307,7 @@ class LedgerEngine:
             conn.commit()
         finally:
             self._pool.putconn(conn)
+            self._local.conn = None
 
     # ------------------------------------------------------------------
     # Connection Management
@@ -335,17 +336,67 @@ class LedgerEngine:
             self._local.conn = None
 
     def _seed_accounts(self, cur):
-        cur.execute("SELECT COUNT(*) FROM accounts")
-        if cur.fetchone()[0] == 0:
-            for code, info in CHART_OF_ACCOUNTS.items():
-                cur.execute(
-                    "INSERT INTO accounts (account_code, account_name, account_type, normal_balance, currency) VALUES (%s,%s,%s,%s,%s) ON CONFLICT DO NOTHING",
-                    (code, info["name"], info["type"].value, info["normal_balance"].value, info["currency"]),
-                )
+        for code, info in CHART_OF_ACCOUNTS.items():
+            cur.execute(
+                "INSERT INTO accounts (account_code, account_name, account_type, normal_balance, currency) "
+                "VALUES (%s,%s,%s,%s,%s) ON CONFLICT (account_code) DO NOTHING",
+                (code, info["name"], info["type"].value, info["normal_balance"].value, info["currency"]),
+            )
+
+    def ensure_symbol_accounts(self, symbol: str, cur=None) -> None:
+        """Ensure CASH-{BASE} and POS-{SYMBOL} accounts exist in the chart of accounts."""
+        sym = symbol.upper()
+        base = sym.replace("USDT", "") if sym.endswith("USDT") else sym
+        entries = [
+            (f"CASH-{base}", f"{base} Cash Balance", AccountType.ASSET.value, NormalBalance.DEBIT.value, base),
+            (f"POS-{sym}", f"{base}/USDT Open Position", AccountType.ASSET.value, NormalBalance.DEBIT.value, base),
+        ]
+        sql = (
+            "INSERT INTO accounts (account_code, account_name, account_type, normal_balance, currency) "
+            "VALUES (%s,%s,%s,%s,%s) ON CONFLICT (account_code) DO NOTHING"
+        )
+        if cur is not None:
+            for row in entries:
+                cur.execute(sql, row)
+        else:
+            with self._write_transaction(f"Ensure accounts {sym}") as conn:
+                with conn.cursor() as c:
+                    for row in entries:
+                        c.execute(sql, row)
 
     # ------------------------------------------------------------------
-    # Validation
+    # Validation & Consolidation
     # ------------------------------------------------------------------
+
+    @staticmethod
+    def _consolidate_lines(lines: List[JournalLine]) -> List[JournalLine]:
+        """
+        Merge multiple JournalLines targeting the same account_code into a single
+        net debit or credit line so UNIQUE(entry_id, account_code) is never violated.
+        """
+        acc: Dict[str, Dict[str, Any]] = {}
+        for l in lines:
+            if l.account_code not in acc:
+                acc[l.account_code] = {
+                    "net": 0.0,
+                    "currency": l.currency,
+                    "memos": [],
+                }
+            acc[l.account_code]["net"] += l.debit_amount - l.credit_amount
+            if l.memo:
+                acc[l.account_code]["memos"].append(l.memo)
+
+        consolidated: List[JournalLine] = []
+        for code, data in acc.items():
+            net = round(data["net"], 8)
+            if abs(net) < 1e-8:
+                continue
+            memo = "; ".join(data["memos"])
+            if net > 0:
+                consolidated.append(JournalLine(code, debit_amount=net, currency=data["currency"], memo=memo))
+            else:
+                consolidated.append(JournalLine(code, credit_amount=abs(net), currency=data["currency"], memo=memo))
+        return consolidated
 
     @staticmethod
     def _validate_balance(lines: List[JournalLine], entry_id: str):
@@ -417,8 +468,27 @@ class LedgerEngine:
         return balances
 
     def get_total_equity(self) -> float:
-        balances = self.get_all_balances()
-        return sum(v for k, v in balances.items() if k.startswith("EQUITY-"))
+        """
+        Fundamental accounting equation:
+            Total Equity = EQUITY accounts + INCOME accounts - EXPENSE accounts
+        """
+        rows = self._query(
+            """SELECT a.account_type, a.normal_balance,
+                      COALESCE(SUM(jl.debit_amount), 0) AS d,
+                      COALESCE(SUM(jl.credit_amount), 0) AS c
+               FROM accounts a
+               LEFT JOIN journal_lines jl ON a.account_code = jl.account_code
+               WHERE a.account_type IN ('EQUITY', 'INCOME', 'EXPENSE')
+               GROUP BY a.account_code"""
+        )
+        equity = 0.0
+        for row in rows:
+            bal = float(row["d"] - row["c"]) if row["normal_balance"] == "DEBIT" else float(row["c"] - row["d"])
+            if row["account_type"] in ("EQUITY", "INCOME"):
+                equity += bal
+            elif row["account_type"] == "EXPENSE":
+                equity -= bal
+        return equity
 
     # ------------------------------------------------------------------
     # Journal Entries
@@ -428,6 +498,9 @@ class LedgerEngine:
                              description: str = "", trade_id: str = None, order_id: str = None) -> str:
         entry_id = uuid.uuid4().hex
         if entry_date is None: entry_date = datetime.now(timezone.utc).isoformat()
+        lines = self._consolidate_lines(lines)
+        if not lines:
+            return entry_id
         self._validate_balance(lines, entry_id)
 
         with self._write_transaction(f"JE {entry_id}") as conn:
@@ -448,8 +521,12 @@ class LedgerEngine:
     def register_grid_trade(self, trade_id: str, symbol: str) -> str:
         with self._write_transaction(f"Grid {trade_id}") as conn:
             with conn.cursor() as cur:
-                cur.execute("INSERT INTO trades (trade_id, symbol, side, quantity, status) VALUES (%s,%s,'BUY',0,'NEW')",
-                            (trade_id, symbol))
+                self.ensure_symbol_accounts(symbol, cur=cur)
+                cur.execute(
+                    "INSERT INTO trades (trade_id, symbol, side, quantity, status) "
+                    "VALUES (%s,%s,'BUY',0,'NEW') ON CONFLICT (trade_id) DO NOTHING",
+                    (trade_id, symbol),
+                )
         return trade_id
 
     def record_trade_open(self, symbol: str, side: str, quantity: float, price: float, fee: float = 0.0,
@@ -472,14 +549,17 @@ class LedgerEngine:
                 JournalLine(pos_account, credit_amount=notional, memo=f"Deliver {quantity} {base_asset}"),
             ]
         if fee > 0:
-            lines.append(JournalLine("FEES-TRADING", debit_amount=fee))
-            lines.append(JournalLine(cash_account, credit_amount=fee))
+            lines.append(JournalLine("FEES-TRADING", debit_amount=fee, memo="Entry fee"))
+            lines.append(JournalLine(cash_account, credit_amount=fee, memo="Pay entry fee"))
         if slippage > 0:
-            lines.append(JournalLine("SLIPPAGE", debit_amount=slippage))
-            lines.append(JournalLine(cash_account, credit_amount=slippage))
+            lines.append(JournalLine("SLIPPAGE", debit_amount=slippage, memo="Entry slippage"))
+            lines.append(JournalLine(cash_account, credit_amount=slippage, memo="Pay entry slippage"))
+
+        lines = self._consolidate_lines(lines)
 
         with self._write_transaction(f"Trade open {trade_id}") as conn:
             with conn.cursor() as cur:
+                self.ensure_symbol_accounts(symbol, cur=cur)
                 cur.execute(
                     "INSERT INTO trades (trade_id, symbol, side, strategy_id, quantity, quantity_filled, entry_price_avg, fee_total, slippage_total, status, entry_time) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,'FILLED',%s)",
                     (trade_id, symbol, side.upper(), strategy_id, quantity, quantity, price, fee, slippage, entry_time),
@@ -511,6 +591,7 @@ class LedgerEngine:
                     raise ValueError(f"Trade {trade_id} already {trade['status']}")
 
                 symbol = trade["symbol"]; side = trade["side"]
+                self.ensure_symbol_accounts(symbol, cur=cur)
                 quantity = float(trade["quantity"]); entry_price = float(trade["entry_price_avg"] or 0)
                 pos_account = f"POS-{symbol}"; cash_account = "CASH-USDT"
                 base_asset = symbol.replace("USDT", "")
@@ -523,35 +604,42 @@ class LedgerEngine:
                 realized_pnl_pct = (realized_pnl / entry_notional * 100) if entry_notional > 0 else 0.0
 
                 lines: List[JournalLine] = []
-                if side == "BUY":
-                    lines.append(JournalLine(cash_account, debit_amount=exit_notional))
-                    lines.append(JournalLine(pos_account, credit_amount=exit_notional))
-                else:
-                    lines.append(JournalLine(pos_account, debit_amount=exit_notional))
-                    lines.append(JournalLine(cash_account, credit_amount=exit_notional))
-                if realized_pnl >= 0:
-                    lines.append(JournalLine("EQUITY-RETAINED", debit_amount=realized_pnl))
-                    lines.append(JournalLine("PNL-REALIZED", credit_amount=realized_pnl))
-                else:
-                    loss = abs(realized_pnl)
-                    lines.append(JournalLine("PNL-REALIZED", debit_amount=loss))
-                    lines.append(JournalLine("EQUITY-RETAINED", credit_amount=loss))
-                if fee > 0:
-                    lines.append(JournalLine("FEES-TRADING", debit_amount=fee))
-                    lines.append(JournalLine(cash_account, credit_amount=fee))
-                if slippage > 0:
-                    lines.append(JournalLine("SLIPPAGE", debit_amount=slippage))
-                    lines.append(JournalLine(cash_account, credit_amount=slippage))
+                if entry_notional > 0 or exit_notional > 0:
+                    if side == "BUY":
+                        # Receive exit proceeds, derecognize position at cost basis, book gross PnL
+                        if exit_notional > 0:
+                            lines.append(JournalLine(cash_account, debit_amount=exit_notional, memo="Close proceeds"))
+                        if entry_notional > 0:
+                            lines.append(JournalLine(pos_account, credit_amount=entry_notional, memo="Release cost basis"))
+                    else:
+                        if entry_notional > 0:
+                            lines.append(JournalLine(pos_account, debit_amount=entry_notional, memo="Cover short basis"))
+                        if exit_notional > 0:
+                            lines.append(JournalLine(cash_account, credit_amount=exit_notional, memo="Pay cover cost"))
 
-                entry_id = uuid.uuid4().hex
-                self._validate_balance(lines, entry_id)
-                cur.execute("INSERT INTO journal_entries (entry_id, entry_date, description) VALUES (%s,%s,%s)",
-                            (entry_id, exit_time, f"Trade CLOSE: {symbol} @ {exit_price}, PnL={realized_pnl:.4f}"))
-                for l in lines:
-                    cur.execute(
-                        "INSERT INTO journal_lines (entry_id, account_code, debit_amount, credit_amount, currency, trade_id, memo) VALUES (%s,%s,%s,%s,%s,%s,%s)",
-                        (entry_id, l.account_code, l.debit_amount, l.credit_amount, l.currency, trade_id, l.memo),
-                    )
+                    if gross_pnl > 0:
+                        lines.append(JournalLine("PNL-REALIZED", credit_amount=gross_pnl, memo="Realized gain"))
+                    elif gross_pnl < 0:
+                        lines.append(JournalLine("PNL-REALIZED", debit_amount=abs(gross_pnl), memo="Realized loss"))
+
+                if fee > 0:
+                    lines.append(JournalLine("FEES-TRADING", debit_amount=fee, memo="Exit fee"))
+                    lines.append(JournalLine(cash_account, credit_amount=fee, memo="Pay exit fee"))
+                if slippage > 0:
+                    lines.append(JournalLine("SLIPPAGE", debit_amount=slippage, memo="Exit slippage"))
+                    lines.append(JournalLine(cash_account, credit_amount=slippage, memo="Pay exit slippage"))
+
+                lines = self._consolidate_lines(lines)
+                if lines:
+                    entry_id = uuid.uuid4().hex
+                    self._validate_balance(lines, entry_id)
+                    cur.execute("INSERT INTO journal_entries (entry_id, entry_date, description) VALUES (%s,%s,%s)",
+                                (entry_id, exit_time, f"Trade CLOSE: {symbol} @ {exit_price}, PnL={realized_pnl:.4f}"))
+                    for l in lines:
+                        cur.execute(
+                            "INSERT INTO journal_lines (entry_id, account_code, debit_amount, credit_amount, currency, trade_id, memo) VALUES (%s,%s,%s,%s,%s,%s,%s)",
+                            (entry_id, l.account_code, l.debit_amount, l.credit_amount, l.currency, trade_id, l.memo),
+                        )
                 cur.execute(
                     """UPDATE trades SET exit_price_avg=%s, pnl_realized=%s, pnl_realized_pct=%s,
                        fee_total=fee_total+%s, slippage_total=slippage_total+%s, status='CLOSED',
@@ -612,6 +700,37 @@ class LedgerEngine:
             description=f"Initial capital: {amount} {currency}",
         )
 
+    def reconcile_equity(self, exchange_equity: float, currency: str = "USDT") -> Optional[str]:
+        """
+        Align ledger equity with live exchange equity WITHOUT wiping history.
+        Seeds initial capital if ledger is empty; otherwise posts a balancing
+        reconciliation adjustment to EQUITY-RETAINED.
+        """
+        if exchange_equity <= 0:
+            return None
+        current = self.get_total_equity()
+        if abs(current) < 1e-6:
+            return self.record_initial_capital(exchange_equity, currency=currency)
+        diff = round(exchange_equity - current, 8)
+        if abs(diff) < 0.01:
+            return None
+        cash = f"CASH-{currency}"
+        if diff > 0:
+            lines = [
+                JournalLine(cash, debit_amount=diff, memo="Exchange sync adjustment (+)"),
+                JournalLine("EQUITY-RETAINED", credit_amount=diff, memo="Exchange sync adjustment (+)"),
+            ]
+        else:
+            amt = abs(diff)
+            lines = [
+                JournalLine("EQUITY-RETAINED", debit_amount=amt, memo="Exchange sync adjustment (-)"),
+                JournalLine(cash, credit_amount=amt, memo="Exchange sync adjustment (-)"),
+            ]
+        return self.record_journal_entry(
+            lines,
+            description=f"Startup exchange equity reconciliation: {current:.4f} -> {exchange_equity:.4f}",
+        )
+
     def take_snapshot(self, timestamp: str = None) -> int:
         if timestamp is None: timestamp = datetime.now(timezone.utc).isoformat()
         balances = self.get_all_balances()
@@ -670,15 +789,18 @@ class LedgerEngine:
         with self._write_lock:
             conn = self._get_conn()
             try:
-                with conn.cursor() as cur:
+                with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
                     for sym, px in prices.items():
-                        cur.execute("SELECT * FROM positions WHERE symbol=%s AND quantity>0", (sym,))
+                        cur.execute("SELECT quantity, avg_entry_price FROM positions WHERE symbol=%s AND quantity>0", (sym,))
                         row = cur.fetchone()
                         if row:
-                            qty = float(row[2]); avg = float(row[3])
+                            qty = float(row["quantity"])
+                            avg = float(row["avg_entry_price"])
                             upnl = (px - avg) * qty
-                            cur.execute("UPDATE positions SET current_mark_price=%s, unrealized_pnl=%s, updated_at=NOW() WHERE symbol=%s",
-                                        (px, upnl, sym))
+                            cur.execute(
+                                "UPDATE positions SET current_mark_price=%s, unrealized_pnl=%s, updated_at=NOW() WHERE symbol=%s",
+                                (px, upnl, sym),
+                            )
                 conn.commit()
             except Exception:
                 conn.rollback()

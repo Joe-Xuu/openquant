@@ -26,24 +26,25 @@ python -c "import os, psycopg2; from dotenv import load_dotenv; load_dotenv(); c
 ## Architecture (Hard Rules)
 
 1. **strategy/ never imports execution/ or core/** — signals flow through main.py as StrategySignal dataclasses
-2. **Grid always runs, trend is opportunistic** — parallel, not regime-switched
-3. **Reconciliation is poll-based (5s)** — not event-driven, fills detected via GET /myTrades
-4. **TP orders are auto-placed by reconciliation**, not by the strategy layer
+2. **Grid always runs, trend is opportunistic** — parallel, not regime-switched; prefix-isolated (`grid_`/`tp_`/`rebuy_` vs `trend_`/`trend_sl_`)
+3. **Dual-path fill detection** — Binance User Data Stream WebSocket (`executionReport`) for real-time fills + 60s REST `GET /myTrades` fallback reconciliation
+4. **TP orders are auto-placed by OrderManager**, strictly capped to `min(available_base, net_fill_qty)` and rounded via cached `SymbolInfo`
 
 ## Key Files
 
 | File | Role |
 |------|------|
-| `main.py` | Event bus, main loop (5-min ticks with 1s sleep chunks) |
-| `strategy/grid_strategy.py` | Grid computation (geometric, pyramid, adaptive, tracking reference) |
-| `strategy/trend_strategy.py` | Trend signals (EMA cross + MACD + ATR stops) |
-| `strategy/regime_detector.py` | 5-factor scoring (ADX/vol/momentum/volume/microstructure) |
-| `execution/order_manager.py` | Order dispatch, reconciliation loop, TP auto-placement |
-| `execution/exchange_client.py` | Binance REST API (time-synced, recvWindow retry) |
+| `main.py` | Event bus, main loop (5-min grid ticks, configurable `trend_interval`) |
+| `config/schema.py` | Pydantic v2 validated configuration schema (`.env` overlays `settings.json`) |
+| `strategy/grid_strategy.py` | Grid computation (geometric, arithmetic, adaptive, tracking reference) |
+| `strategy/trend_strategy.py` | Trend signals (EMA + MACD + ATR stops, Spot long-only guard, full precision) |
+| `strategy/regime_detector.py` | Price-scale-invariant 5-factor scoring (ADX/vol/momentum/volume/microstructure) |
+| `execution/order_manager.py` | Prefix-isolated order dispatch, User Data Stream WS, fallback reconciliation, TP recovery |
+| `execution/exchange_client.py` | Binance REST API (TokenBucket rate limiter, `SymbolInfo` cache, `listenKey`, time-sync) |
 | `data/market_data.py` | WebSocket K-line ingestion (combined-stream format) |
-| `core/local_ledger.py` | PostgreSQL double-entry ledger |
-| `config/settings.json` | Grid + trading parameters |
-| `backtest.py` | Backtest engine with dual-engine support |
+| `core/local_ledger.py` | PostgreSQL ACID double-entry ledger (dynamic accounts, non-destructive startup reconciliation) |
+| `config/settings.json` | Grid + trend + risk + capital allocation parameters |
+| `backtest.py` | Conservative event-driven Spot backtest engine (zero look-ahead, shared RiskGuard & SymbolInfo) |
 
 ## Common Issues & Fixes
 

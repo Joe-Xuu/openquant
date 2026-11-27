@@ -28,19 +28,160 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
-from collections import defaultdict
-
-import aiohttp
 import hmac
 import json
 import logging
+import math
 import time
 import uuid
+from collections import defaultdict
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from decimal import Decimal, ROUND_DOWN, ROUND_HALF_UP
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
+import aiohttp
+
 logger = logging.getLogger("execution.exchange_client")
+
+
+# ---------------------------------------------------------------------------
+# Rate Limiter (Token Bucket)
+# ---------------------------------------------------------------------------
+
+class AsyncTokenBucket:
+    """
+    Async token-bucket rate limiter enforcing a true requests-per-second cap.
+    """
+
+    def __init__(self, rate: float, capacity: Optional[float] = None):
+        if rate <= 0:
+            raise ValueError(f"rate must be > 0, got {rate}")
+        self.rate = float(rate)
+        self.capacity = float(capacity if capacity is not None else max(1.0, rate))
+        self._tokens = self.capacity
+        self._last_refill = time.monotonic()
+        self._lock = asyncio.Lock()
+
+    async def acquire(self, tokens: float = 1.0) -> None:
+        while True:
+            async with self._lock:
+                now = time.monotonic()
+                elapsed = now - self._last_refill
+                if elapsed > 0:
+                    self._tokens = min(self.capacity, self._tokens + elapsed * self.rate)
+                    self._last_refill = now
+                if self._tokens >= tokens:
+                    self._tokens -= tokens
+                    return
+                wait_time = (tokens - self._tokens) / self.rate
+            await asyncio.sleep(wait_time)
+
+    async def __aenter__(self) -> AsyncTokenBucket:
+        await self.acquire(1.0)
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb) -> None:
+        return None
+
+
+# ---------------------------------------------------------------------------
+# Exchange Symbol Rules (Precision & Filters)
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class SymbolInfo:
+    """Normalized Binance symbol trading filters (PRICE_FILTER, LOT_SIZE, NOTIONAL)."""
+
+    symbol: str
+    base_asset: str
+    quote_asset: str
+    tick_size: Decimal
+    step_size: Decimal
+    min_qty: Decimal
+    min_notional: Decimal
+
+    @classmethod
+    def from_exchange_filter(cls, raw: Dict[str, Any]) -> SymbolInfo:
+        symbol = raw["symbol"].upper()
+        base_asset = raw.get("baseAsset", symbol.replace("USDT", ""))
+        quote_asset = raw.get("quoteAsset", "USDT")
+        tick_size = Decimal("0.00001")
+        step_size = Decimal("1")
+        min_qty = Decimal("0")
+        min_notional = Decimal("5.0")
+
+        for f in raw.get("filters", []):
+            ftype = f.get("filterType")
+            if ftype == "PRICE_FILTER" and f.get("tickSize"):
+                tick_size = Decimal(str(f["tickSize"])).normalize()
+            elif ftype == "LOT_SIZE":
+                if f.get("stepSize"):
+                    step_size = Decimal(str(f["stepSize"])).normalize()
+                if f.get("minQty"):
+                    min_qty = Decimal(str(f["minQty"])).normalize()
+            elif ftype in ("NOTIONAL", "MIN_NOTIONAL") and f.get("minNotional"):
+                min_notional = Decimal(str(f["minNotional"])).normalize()
+
+        return cls(
+            symbol=symbol,
+            base_asset=base_asset,
+            quote_asset=quote_asset,
+            tick_size=tick_size,
+            step_size=step_size,
+            min_qty=min_qty,
+            min_notional=min_notional,
+        )
+
+    @classmethod
+    def default_for(cls, symbol: str) -> SymbolInfo:
+        """Reasonable fallback defaults when offline / in unit tests."""
+        sym = symbol.upper()
+        defaults = {
+            "BTCUSDT": ("BTC", "USDT", "0.01", "0.00001", "0.00001", "5.0"),
+            "ETHUSDT": ("ETH", "USDT", "0.01", "0.0001", "0.0001", "5.0"),
+            "SOLUSDT": ("SOL", "USDT", "0.01", "0.01", "0.01", "5.0"),
+            "BNBUSDT": ("BNB", "USDT", "0.1", "0.001", "0.001", "5.0"),
+            "DOGEUSDT": ("DOGE", "USDT", "0.00001", "1", "1", "1.0"),
+        }
+        base, quote, tick, step, min_q, min_n = defaults.get(
+            sym, (sym.replace("USDT", ""), "USDT", "0.0001", "0.001", "0.001", "5.0")
+        )
+        return cls(
+            symbol=sym,
+            base_asset=base,
+            quote_asset=quote,
+            tick_size=Decimal(tick),
+            step_size=Decimal(step),
+            min_qty=Decimal(min_q),
+            min_notional=Decimal(min_n),
+        )
+
+    def round_price(self, price: float) -> float:
+        """Round price to the nearest valid tick_size."""
+        if price <= 0 or self.tick_size <= 0:
+            return 0.0
+        d = Decimal(str(price))
+        rounded = (d / self.tick_size).quantize(Decimal("1"), rounding=ROUND_HALF_UP) * self.tick_size
+        return float(rounded)
+
+    def floor_qty(self, qty: float) -> float:
+        """Floor quantity to a valid multiple of step_size (never oversells)."""
+        if qty <= 0 or self.step_size <= 0:
+            return 0.0
+        d = Decimal(str(qty))
+        floored = (d / self.step_size).quantize(Decimal("1"), rounding=ROUND_DOWN) * self.step_size
+        return float(floored)
+
+    def is_valid_order(self, price: float, qty: float) -> bool:
+        """Check min_qty and min_notional constraints."""
+        if price <= 0 or qty <= 0:
+            return False
+        if Decimal(str(qty)) < self.min_qty:
+            return False
+        if Decimal(str(price)) * Decimal(str(qty)) < self.min_notional:
+            return False
+        return True
 
 
 # ---------------------------------------------------------------------------
@@ -52,7 +193,7 @@ class OrderRequest:
     """Normalized order request sent to the exchange."""
     symbol: str
     side: str  # BUY or SELL
-    order_type: str  # LIMIT, MARKET, STOP_LOSS, TAKE_PROFIT
+    order_type: str  # LIMIT, MARKET, STOP_LOSS, STOP_LOSS_LIMIT, TAKE_PROFIT
     quantity: float
     price: Optional[float] = None
     stop_price: Optional[float] = None
@@ -62,9 +203,9 @@ class OrderRequest:
 
     def validate(self) -> Tuple[bool, str]:
         """Validate order parameters before dispatch."""
-        if self.order_type in ("LIMIT", "STOP_LOSS", "TAKE_PROFIT") and self.price is None:
+        if self.order_type in ("LIMIT", "STOP_LOSS_LIMIT", "TAKE_PROFIT_LIMIT") and self.price is None:
             return False, f"Price required for {self.order_type} order"
-        if self.order_type in ("STOP_LOSS", "TAKE_PROFIT") and self.stop_price is None:
+        if self.order_type in ("STOP_LOSS", "STOP_LOSS_LIMIT", "TAKE_PROFIT", "TAKE_PROFIT_LIMIT") and self.stop_price is None:
             return False, f"Stop price required for {self.order_type} order"
         if self.quantity <= 0:
             return False, f"Quantity must be positive, got {self.quantity}"
@@ -157,18 +298,29 @@ class ExchangeClient:
                 "https://testnet.binancefuture.com" if testnet
                 else "https://fapi.binance.com"
             )
+            self._ws_base = (
+                "wss://stream.binancefuture.com/ws" if testnet
+                else "wss://fstream.binance.com/ws"
+            )
             self._api_prefix = "/fapi/v1"
+            self._user_stream_endpoint = "/fapi/v1/listenKey"
         else:
             self._rest_base = (
                 "https://testnet.binance.vision" if testnet
                 else "https://api.binance.com"
             )
+            self._ws_base = (
+                "wss://stream.testnet.binance.vision/ws" if testnet
+                else "wss://stream.binance.com:9443/ws"
+            )
             self._api_prefix = "/api/v3"
+            self._user_stream_endpoint = "/api/v3/userDataStream"
 
         self._session: Optional[aiohttp.ClientSession] = None
-        self._rate_limiter = asyncio.Semaphore(int(rate_limit_rps))
+        self._rate_limiter = AsyncTokenBucket(rate=rate_limit_rps, capacity=max(1.0, rate_limit_rps))
         self._order_locks: Dict[str, asyncio.Lock] = defaultdict(asyncio.Lock)
         self._time_offset_ms: float = 0.0  # server time – local time (ms)
+        self._symbol_info_cache: Dict[str, SymbolInfo] = {}
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -333,7 +485,7 @@ class ExchangeClient:
                 params["price"] = request.price
             if request.stop_price is not None:
                 params["stopPrice"] = request.stop_price
-            if request.order_type == "LIMIT":
+            if request.order_type in ("LIMIT", "STOP_LOSS_LIMIT", "TAKE_PROFIT_LIMIT"):
                 params["timeInForce"] = request.time_in_force
 
             logger.info(
@@ -408,6 +560,65 @@ class ExchangeClient:
             params["symbol"] = symbol.upper()
         return await self._signed_request("GET", f"{self._api_prefix}/openOrders", params)
 
+    async def get_my_trades(
+        self,
+        symbol: str,
+        limit: int = 50,
+        start_time: Optional[int] = None,
+        from_id: Optional[int] = None,
+    ) -> List[Dict[str, Any]]:
+        """Fetch recent account trades (fills) for a symbol."""
+        params: Dict[str, Any] = {"symbol": symbol.upper(), "limit": limit}
+        if start_time is not None:
+            params["startTime"] = start_time
+        if from_id is not None:
+            params["fromId"] = from_id
+        return await self._signed_request("GET", f"{self._api_prefix}/myTrades", params)
+
+    # ------------------------------------------------------------------
+    # User Data Stream (listenKey)
+    # ------------------------------------------------------------------
+
+    async def create_listen_key(self) -> str:
+        """Create a Binance User Data Stream listenKey."""
+        url = f"{self._rest_base}{self._user_stream_endpoint}"
+        headers = {"X-MBX-APIKEY": self.api_key}
+        timeout = aiohttp.ClientTimeout(total=10)
+        async with self._rate_limiter:
+            async with self._session.post(url, headers=headers, timeout=timeout) as resp:
+                data = await resp.json()
+                if resp.status >= 400:
+                    raise BinanceAPIError(resp.status, data.get("msg", str(data)), data)
+                return data["listenKey"]
+
+    async def keepalive_listen_key(self, listen_key: str) -> None:
+        """Extend the validity of a listenKey (call every ~30 minutes)."""
+        url = f"{self._rest_base}{self._user_stream_endpoint}"
+        headers = {"X-MBX-APIKEY": self.api_key}
+        params = {"listenKey": listen_key}
+        timeout = aiohttp.ClientTimeout(total=10)
+        async with self._rate_limiter:
+            async with self._session.put(url, headers=headers, params=params, timeout=timeout) as resp:
+                if resp.status >= 400:
+                    data = await resp.json()
+                    raise BinanceAPIError(resp.status, data.get("msg", str(data)), data)
+
+    async def close_listen_key(self, listen_key: str) -> None:
+        """Close an active listenKey on shutdown."""
+        url = f"{self._rest_base}{self._user_stream_endpoint}"
+        headers = {"X-MBX-APIKEY": self.api_key}
+        params = {"listenKey": listen_key}
+        timeout = aiohttp.ClientTimeout(total=10)
+        try:
+            async with self._session.delete(url, headers=headers, params=params, timeout=timeout):
+                pass
+        except Exception:
+            pass
+
+    def get_user_stream_ws_url(self, listen_key: str) -> str:
+        """Build the WebSocket URL for the User Data Stream."""
+        return f"{self._ws_base}/{listen_key}"
+
     # ------------------------------------------------------------------
     # Account Information
     # ------------------------------------------------------------------
@@ -436,14 +647,15 @@ class ExchangeClient:
         return BalanceInfo(asset=asset.upper(), free=0.0, locked=0.0)
 
     # ------------------------------------------------------------------
-    # Market Data
+    # Market Data & Symbol Info Cache
     # ------------------------------------------------------------------
 
     async def get_ticker_price(self, symbol: str) -> float:
         """Get the current price for a symbol (no auth needed)."""
         url = f"{self._rest_base}{self._api_prefix}/ticker/price"
         params = {"symbol": symbol.upper()}
-        async with self._session.get(url, params=params, timeout=10) as resp:
+        timeout = aiohttp.ClientTimeout(total=10)
+        async with self._session.get(url, params=params, timeout=timeout) as resp:
             data = await resp.json()
             return float(data["price"])
 
@@ -453,8 +665,31 @@ class ExchangeClient:
         params = {}
         if symbol:
             params["symbol"] = symbol.upper()
-        async with self._session.get(url, params=params, timeout=10) as resp:
+        timeout = aiohttp.ClientTimeout(total=10)
+        async with self._session.get(url, params=params, timeout=timeout) as resp:
             return await resp.json()
+
+    async def load_symbol_info(self, symbols: List[str]) -> Dict[str, SymbolInfo]:
+        """Fetch and cache SymbolInfo filters for the requested symbols."""
+        for sym in symbols:
+            key = sym.upper()
+            try:
+                info = await self.get_exchange_info(key)
+                for s in info.get("symbols", []):
+                    if s.get("symbol", "").upper() == key:
+                        self._symbol_info_cache[key] = SymbolInfo.from_exchange_filter(s)
+                        break
+            except Exception as e:
+                logger.warning(f"Failed to load exchangeInfo for {key}: {e}. Using defaults.")
+                self._symbol_info_cache.setdefault(key, SymbolInfo.default_for(key))
+        return dict(self._symbol_info_cache)
+
+    def get_symbol_info(self, symbol: str) -> SymbolInfo:
+        """Return cached SymbolInfo for a symbol (falling back to safe defaults)."""
+        key = symbol.upper()
+        if key not in self._symbol_info_cache:
+            self._symbol_info_cache[key] = SymbolInfo.default_for(key)
+        return self._symbol_info_cache[key]
 
     # ------------------------------------------------------------------
     # Server Time Sync
@@ -463,7 +698,8 @@ class ExchangeClient:
     async def get_server_time(self) -> int:
         """Get the exchange server time in milliseconds."""
         url = f"{self._rest_base}{self._api_prefix}/time"
-        async with self._session.get(url, timeout=5) as resp:
+        timeout = aiohttp.ClientTimeout(total=5)
+        async with self._session.get(url, timeout=timeout) as resp:
             data = await resp.json()
             return data["serverTime"]
 
