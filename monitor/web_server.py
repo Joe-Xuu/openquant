@@ -31,7 +31,7 @@ from aiohttp import web
 logger = logging.getLogger("monitor.web_server")
 
 
-DASHBOARD_HTML = """<!DOCTYPE html>
+DASHBOARD_HTML = r"""<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
   <meta charset="UTF-8" />
