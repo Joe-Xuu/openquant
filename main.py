@@ -341,11 +341,104 @@ class TradingSystem:
     def _on_trend_stop_filled(self, symbol: str, fill_price: float, fill_qty: float) -> None:
         """Called by OrderManager when an exchange-side trend_sl_* order executes."""
         old_state = self._trend_states.get(symbol)
+        pnl_pct = 0.0
         if old_state and old_state.is_active and old_state.entry_price > 0:
-            pnl_pct = (fill_price - old_state.entry_price) / old_state.entry_price * 100.0
+            if old_state.direction.value == "SHORT":
+                pnl_pct = (old_state.entry_price - fill_price) / old_state.entry_price * 100.0
+            else:
+                pnl_pct = (fill_price - old_state.entry_price) / old_state.entry_price * 100.0
             self.risk_guard.register_trade_result(pnl_pct)
         self._trend_states[symbol] = TrendState.flat(symbol)
         logger.info(f"Trend state reset to FLAT for {symbol} after exchange stop-loss @ {fill_price}")
+        self.notifier.send_background(
+            title=f"趋势止损成交 · {symbol}",
+            body=(
+                f"- 成交价: `{fill_price:.5f}`\n"
+                f"- 数量: `{fill_qty}`\n"
+                f"- 估算盈亏: `{pnl_pct:+.2f}%`\n"
+                f"- 当前净值: `${self._cached_live_equity:.2f}`"
+            ),
+            level="SUCCESS" if pnl_pct >= 0 else "WARN",
+        )
+
+    def _build_monitor_snapshot(self) -> Dict:
+        """Build a JSON-serializable live status snapshot for MonitorWebServer."""
+        eq = self._cached_live_equity or self.ledger.get_total_equity()
+        init_eq = getattr(self, "_initial_equity", eq) or eq
+        pnl_usd = eq - init_eq
+        pnl_pct = (pnl_usd / init_eq * 100.0) if init_eq > 0 else 0.0
+        uptime = (time.time() - self._start_time) if self._start_time else 0.0
+
+        sym_rows = []
+        for sym in self.app_config.trading.symbols:
+            ts = self._trend_states.get(sym, TrendState.flat(sym))
+            eff_stop = 0.0
+            if ts.is_active:
+                if ts.direction.value == "LONG":
+                    eff_stop = max(ts.stop_loss_price, ts.trailing_stop_price)
+                else:
+                    cands = [p for p in (ts.stop_loss_price, ts.trailing_stop_price) if p > 0]
+                    eff_stop = min(cands) if cands else 0.0
+            sym_rows.append({
+                "symbol": sym,
+                "price": self._last_prices.get(sym, 0.0),
+                "regime": self._current_regime.get(sym, MarketRegime.RANGING).value,
+                "macro_1h": self._macro_trend.get(sym, MacroTrend.NEUTRAL).value,
+                "short_macro_bear": self._short_macro_bearish.get(sym, False),
+                "trend_direction": ts.direction.value,
+                "trend_entry": ts.entry_price,
+                "trend_stop": eff_stop,
+                "trend_qty": ts.position_size,
+                "grid_active": sym in self._grid_configs,
+                "grid_paused": self._macro_paused_grid.get(sym, False) or self._trend_paused_grid.get(sym, False),
+            })
+
+        recent_trades = []
+        try:
+            for t in self.ledger.get_trade_history(limit=25):
+                recent_trades.append({
+                    "entry_time": str(t.entry_time or ""),
+                    "symbol": t.symbol,
+                    "side": t.side,
+                    "entry_price": float(t.entry_price or 0.0),
+                    "exit_price": float(t.exit_price or 0.0),
+                    "quantity": float(t.quantity or 0.0),
+                    "pnl_realized": float(t.pnl_realized or 0.0),
+                    "status": t.status,
+                })
+        except Exception:
+            pass
+
+        eq_history = []
+        try:
+            snaps = self.ledger.get_equity_curve(limit=120)
+            eq_history = [
+                {"ts": str(s.get("timestamp", "")), "equity": float(s.get("total_equity", eq))}
+                for s in snaps
+            ]
+        except Exception:
+            pass
+
+        return {
+            "running": self.running,
+            "state": self.state_machine.state.value,
+            "market": self.app_config.exchange.market,
+            "testnet": self.app_config.exchange.testnet,
+            "leverage": self.app_config.trading.leverage,
+            "equity": round(eq, 4),
+            "initial_equity": round(init_eq, 4),
+            "pnl_usd": round(pnl_usd, 4),
+            "pnl_pct": round(pnl_pct, 3),
+            "uptime_sec": int(uptime),
+            "tick_count": self._tick_count,
+            "signal_count": self._signal_count,
+            "wechat_enabled": self.notifier.enabled,
+            "server_time": datetime.now(timezone.utc).isoformat(),
+            "risk": self.risk_guard.get_risk_summary(),
+            "symbols": sym_rows,
+            "recent_trades": recent_trades,
+            "equity_history": eq_history,
+        }
 
     def _get_positions(self) -> List[Dict]:
         """Return open positions from the ledger."""
