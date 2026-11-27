@@ -182,15 +182,22 @@ DASHBOARD_HTML = """<!DOCTYPE html>
           <span class="pill ${d.wechat_enabled ? "green" : ""}">微信推送: ${d.wechat_enabled ? "已开启" : "未配置"}</span>
         `;
 
-        const pnlCls = d.pnl_usd >= 0 ? "pos" : "neg";
-        const cbTxt = d.risk.circuit_breaker_triggered ? "已触发熔断" : "正常";
+        const rk = d.risk || {};
+        const n = (v, dft = 0) => Number(v ?? dft);
+        const ddPct = n(rk.drawdown_pct ?? rk.current_drawdown_pct);
+        const maxDd = n(rk.max_drawdown_pct, 15);
+        const expPct = n(rk.exposure_pct);
+        const maxDaily = n(rk.daily_loss_pct_max ?? rk.max_daily_loss_pct, 5);
+        const consLoss = n(rk.consecutive_losses);
+        const pnlCls = n(d.pnl_usd) >= 0 ? "pos" : "neg";
+        const cbTxt = rk.circuit_breaker_triggered ? "已触发熔断" : "正常";
         document.getElementById("kpis").innerHTML = [
-          { l: "账户实时总净值", v: `$${d.equity.toFixed(2)}`, s: `初始 $${d.initial_equity.toFixed(2)}`, c: "" },
-          { l: "本次运行盈亏", v: `${d.pnl_usd >= 0 ? "+" : ""}$${d.pnl_usd.toFixed(2)}`, s: `${d.pnl_pct >= 0 ? "+" : ""}${d.pnl_pct.toFixed(2)}%`, c: pnlCls },
-          { l: "当前回撤 / 上限", v: `${d.risk.current_drawdown_pct.toFixed(2)}%`, s: `上限 ${d.risk.max_drawdown_pct}%`, c: "warn-txt" },
-          { l: "今日亏损 / 上限", v: `${d.risk.daily_loss_pct.toFixed(2)}%`, s: `上限 ${d.risk.max_daily_loss_pct}%`, c: "" },
-          { l: "风控熔断器", v: cbTxt, s: `连亏 ${d.risk.consecutive_losses} 笔`, c: d.risk.circuit_breaker_triggered ? "neg" : "pos" },
-          { l: "累计信号 / Ticks", v: `${d.signal_count}`, s: `Ticks: ${d.tick_count}`, c: "" },
+          { l: "账户实时总净值", v: `$${n(d.equity).toFixed(2)}`, s: `初始 $${n(d.initial_equity).toFixed(2)}`, c: "" },
+          { l: "本次运行盈亏", v: `${n(d.pnl_usd) >= 0 ? "+" : ""}$${n(d.pnl_usd).toFixed(2)}`, s: `${n(d.pnl_pct) >= 0 ? "+" : ""}${n(d.pnl_pct).toFixed(2)}%`, c: pnlCls },
+          { l: "当前回撤 / 上限", v: `${ddPct.toFixed(2)}%`, s: `上限 ${maxDd.toFixed(1)}%`, c: "warn-txt" },
+          { l: "当前敞口 / 日亏上限", v: `${expPct.toFixed(1)}%`, s: `单日亏损上限 ${maxDaily.toFixed(1)}%`, c: "" },
+          { l: "风控熔断器", v: cbTxt, s: `连亏 ${consLoss} 笔`, c: rk.circuit_breaker_triggered ? "neg" : "pos" },
+          { l: "累计信号 / Ticks", v: `${n(d.signal_count)}`, s: `Ticks: ${n(d.tick_count)}`, c: "" },
         ].map(k => `<div class="card"><div class="lbl">${k.l}</div><div class="val ${k.c}">${k.v}</div><div class="sub">${k.s}</div></div>`).join("");
 
         document.getElementById("tickInfo").textContent = `每 5 秒自动刷新`;
