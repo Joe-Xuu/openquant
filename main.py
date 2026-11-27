@@ -737,11 +737,12 @@ class TradingSystem:
         )
         self._current_regime[symbol] = regime_result.regime
 
-        # 3b. Macro trend filter (1h EMA50 vs EMA200 + EMA200 slope)
+        # 3b. Macro trend filter (1h EMA50/200 for LONG/grid; 4h EMA50/200 for SHORT)
         macro_trend = MacroTrend.NEUTRAL
         macro_ema_slow_val = 0.0
         macro_ema200_rising = True
         macro_ema200_falling = True
+        short_macro_bearish = False
         if self.macro_cfg.enabled:
             try:
                 macro_ohlcv = await self.data_engine.get_ohlcv(
@@ -758,6 +759,31 @@ class TradingSystem:
                     macro_trend = classify_macro_trend(
                         m_closes[-1], m_fast_series[-1], macro_ema_slow_val
                     )
+
+                short_iv = self.macro_cfg.short_interval
+                if short_iv == self.macro_cfg.interval:
+                    short_macro_bearish = (
+                        macro_trend == MacroTrend.BEAR
+                        and (
+                            not self.app_config.strategy.trend_following.require_ema200_rising
+                            or macro_ema200_falling
+                        )
+                    )
+                else:
+                    sm_ohlcv = await self.data_engine.get_ohlcv(symbol, interval=short_iv)
+                    if len(sm_ohlcv) >= self.macro_cfg.ema_slow:
+                        sm_closes = [c["close"] for c in sm_ohlcv]
+                        sm_fast = compute_ema(sm_closes, self.macro_cfg.ema_fast)
+                        sm_slow = compute_ema(sm_closes, self.macro_cfg.ema_slow)
+                        sm_trend = classify_macro_trend(sm_closes[-1], sm_fast[-1], sm_slow[-1])
+                        sm_falling = (sm_slow[-1] < sm_slow[-7]) if len(sm_slow) > 6 else True
+                        short_macro_bearish = (
+                            sm_trend == MacroTrend.BEAR
+                            and (
+                                not self.app_config.strategy.trend_following.require_ema200_rising
+                                or sm_falling
+                            )
+                        )
             except Exception as e:
                 logger.debug(f"Macro filter fallback to NEUTRAL for {symbol}: {e}")
         self._macro_trend[symbol] = macro_trend
@@ -955,16 +981,13 @@ class TradingSystem:
                         if self.macro_cfg.enabled
                         else None
                     )
-                    macro_bear_gate = (
-                        (macro_trend == MacroTrend.BEAR)
-                        if self.macro_cfg.enabled
-                        else None
-                    )
-                    if self.app_config.strategy.trend_following.require_ema200_rising:
-                        if macro_bull and not macro_ema200_rising:
-                            macro_bull = False
-                        if macro_bear_gate and not macro_ema200_falling:
-                            macro_bear_gate = False
+                    if (
+                        macro_bull
+                        and self.app_config.strategy.trend_following.require_ema200_rising
+                        and not macro_ema200_rising
+                    ):
+                        macro_bull = False
+                    macro_bear_gate = short_macro_bearish if self.macro_cfg.enabled else None
                     raw_trend = self.trend_strategy.evaluate(
                         symbol=symbol,
                         current_price=indicators.close,  # latest mark price for stops

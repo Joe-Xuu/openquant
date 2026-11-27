@@ -51,6 +51,7 @@
         "macro_filter": {
             "enabled": true,
             "interval": "1h",
+            "short_interval": "4h",
             "ema_fast": 50,
             "ema_slow": 200,
             "pause_grid_in_bear": true,

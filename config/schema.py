@@ -86,6 +86,7 @@ class RegimeDetectionConfig(BaseModel):
 class MacroFilterConfig(BaseModel):
     enabled: bool = True
     interval: str = "1h"
+    short_interval: str = "4h"
     ema_fast: int = Field(default=50, ge=5)
     ema_slow: int = Field(default=200, ge=20)
     pause_grid_in_bear: bool = True
@@ -211,9 +212,10 @@ class AppConfig(BaseModel):
             self.risk.max_exposure_pct = max(
                 self.risk.max_exposure_pct, 100.0 * self.trading.leverage
             )
-        macro_iv = self.strategy.macro_filter.interval
-        if self.strategy.macro_filter.enabled and macro_iv not in self.data.kline_intervals:
-            self.data.kline_intervals.append(macro_iv)
+        if self.strategy.macro_filter.enabled:
+            for iv in (self.strategy.macro_filter.interval, self.strategy.macro_filter.short_interval):
+                if iv and iv not in self.data.kline_intervals:
+                    self.data.kline_intervals.append(iv)
         return self
 
 

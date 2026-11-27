@@ -100,6 +100,7 @@ class BacktestConfig:
     trend_require_macd: bool = True
     trend_exit_on_ema_cross: bool = False
     trend_require_ema200_rising: bool = True
+    short_macro_interval: str = "4h"     # Macro timeframe for SHORT entries ("1h" or "4h")
     trend_gate_by_regime: bool = False  # When False, 1h macro + ADX/MACD gate trend directly
     allow_short: bool = False    # Spot default: long-only; True in Futures
     consecutive_buy_limit: int = 5
@@ -463,6 +464,17 @@ class BacktestEngine:
         macro_ef = compute_ema(closes_1h, self.cfg.macro_ema_fast)
         macro_es = compute_ema(closes_1h, self.cfg.macro_ema_slow)
 
+        # Optional slower macro timeframe for SHORT entries (e.g. 4h EMA50/200)
+        short_macro_mins = _interval_to_minutes(self.cfg.short_macro_interval)
+        short_macro_factor = max(1, short_macro_mins // max(1, _interval_to_minutes(self.cfg.interval)))
+        if short_macro_factor != macro_factor:
+            bars_sm = resample_ohlcv(ohlcv, short_macro_factor)
+            closes_sm = [b["close"] for b in bars_sm]
+            sm_ef = compute_ema(closes_sm, self.cfg.macro_ema_fast)
+            sm_es = compute_ema(closes_sm, self.cfg.macro_ema_slow)
+        else:
+            sm_ef, sm_es = macro_ef, macro_es
+
         for i in range(self.cfg.warmup_candles, n):
             bar = ohlcv[i]
             self._last_close = bar["close"]
@@ -541,6 +553,7 @@ class BacktestEngine:
             self._cur_macro_es: float = 0.0
             self._cur_macro_es_rising: bool = True
             self._cur_macro_es_falling: bool = True
+            self._cur_short_macro_bearish: bool = False
             if self.cfg.use_macro_filter:
                 m_idx = (i // macro_factor) - (0 if (i + 1) % macro_factor == 0 else 1)
                 if m_idx >= self.cfg.macro_ema_fast:
@@ -553,6 +566,22 @@ class BacktestEngine:
                     )
                 else:
                     macro_trend = MacroTrend.NEUTRAL
+
+                # Separate (potentially slower, e.g. 4h) macro bear classification for SHORTs
+                if short_macro_factor == macro_factor:
+                    self._cur_short_macro_bearish = (
+                        macro_trend == MacroTrend.BEAR
+                        and (not self.cfg.trend_require_ema200_rising or self._cur_macro_es_falling)
+                    )
+                else:
+                    sm_idx = (i // short_macro_factor) - (0 if (i + 1) % short_macro_factor == 0 else 1)
+                    if sm_idx >= self.cfg.macro_ema_fast:
+                        sm_trend = classify_macro_trend(bar["close"], sm_ef[sm_idx], sm_es[sm_idx])
+                        sm_falling = (sm_es[sm_idx] < sm_es[sm_idx - 6]) if sm_idx >= 6 else True
+                        self._cur_short_macro_bearish = (
+                            sm_trend == MacroTrend.BEAR
+                            and (not self.cfg.trend_require_ema200_rising or sm_falling)
+                        )
             else:
                 macro_trend = MacroTrend.NEUTRAL
 
@@ -857,12 +886,9 @@ class BacktestEngine:
         macro_bearish: Optional[bool] = None
         if self.cfg.use_macro_filter:
             macro_bullish = (macro_trend == MacroTrend.BULL)
-            macro_bearish = (macro_trend == MacroTrend.BEAR)
-            if self.cfg.trend_require_ema200_rising:
-                if not self._cur_macro_es_rising:
-                    macro_bullish = False
-                if not self._cur_macro_es_falling:
-                    macro_bearish = False
+            if self.cfg.trend_require_ema200_rising and not self._cur_macro_es_rising:
+                macro_bullish = False
+            macro_bearish = self._cur_short_macro_bearish
 
         lev = self.cfg.effective_leverage
         trend_cap = live_eq * (1.0 if mode == "trend_only" else self.cfg.trend_capital_pct)
