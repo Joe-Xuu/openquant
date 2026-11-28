@@ -240,13 +240,13 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
     </div>
 
     <div class="card">
-      <h2><span>最近成交记录</span><span id="tradeMeta" class="sub"></span></h2>
+      <h2><span>最近成交记录（交易所实时成交）</span><span id="tradeMeta" class="sub">加载中...</span></h2>
       <div class="scroll">
         <table>
           <thead>
-            <tr><th>时间</th><th>币种</th><th>方向</th><th class="num">开仓价</th><th class="num">平仓价</th><th class="num">数量</th><th class="num">实现盈亏 ($)</th><th>状态</th></tr>
+            <tr><th>时间</th><th>币种</th><th>方向</th><th class="num">成交价</th><th class="num">数量</th><th class="num">成交额 ($)</th><th class="num">实现盈亏 ($)</th><th class="num">手续费</th></tr>
           </thead>
-          <tbody id="tradeBody"></tbody>
+          <tbody id="tradeBody"><tr><td colspan="8" style="color:var(--muted)">等待拉取成交记录...</td></tr></tbody>
         </table>
       </div>
     </div>
@@ -678,32 +678,44 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
           `;
         }).join("") || `<tr><td colspan="10" style="color:var(--muted)">等待行情预热...</td></tr>`;
 
-        const trades = d.recent_trades || [];
-        document.getElementById("tradeMeta").textContent = `最近 ${trades.length} 笔`;
-        document.getElementById("tradeBody").innerHTML = trades.map(t => {
-          const p = n(t.pnl_realized);
-          return `
-            <tr>
-              <td>${(t.entry_time || "").slice(0, 19).replace("T", " ")}</td>
-              <td>${t.symbol}</td>
-              <td>${t.side}</td>
-              <td class="num">${fmtPx(t.entry_price)}</td>
-              <td class="num">${fmtPx(t.exit_price)}</td>
-              <td class="num">${n(t.quantity).toFixed(2)}</td>
-              <td class="num ${p >= 0 ? "pos" : "neg"}">${p >= 0 ? "+" : ""}$${p.toFixed(3)}</td>
-              <td>${t.status}</td>
-            </tr>
-          `;
-        }).join("") || `<tr><td colspan="8" style="color:var(--muted)">暂无成交记录</td></tr>`;
-
         const logs = d.recent_logs || [];
         document.getElementById("logBox").textContent = logs.length ? logs.join("\n") : "暂无日志...";
         drawSpark(d.equity_history || []);
         refreshKlines();
         refreshOrders(false);
+        refreshTrades();
       } catch (e) {
         document.getElementById("statusDot").className = "dot err";
         document.getElementById("subInfo").textContent = "连接失败: " + e.message;
+      }
+    }
+
+    async function refreshTrades() {
+      try {
+        const r = await fetch("/api/trades" + authSuffix);
+        if (!r.ok) return;
+        const data = await r.json();
+        const trades = data.trades || [];
+        document.getElementById("tradeMeta").textContent = `最近 ${trades.length} 笔`;
+        document.getElementById("tradeBody").innerHTML = trades.map(t => {
+          const p = Number(t.realized_pnl || 0);
+          const sideCls = t.side === "BUY" ? "green" : "red";
+          const quoteQty = Number(t.quote_qty || (Number(t.price || 0) * Number(t.qty || 0)));
+          return `
+            <tr>
+              <td>${(t.time || "").slice(5, 19).replace("T", " ")}</td>
+              <td style="font-weight:700">${t.symbol}</td>
+              <td><span class="pill ${sideCls}">${t.side}</span></td>
+              <td class="num">${fmtPx(Number(t.price || 0))}</td>
+              <td class="num">${Number(t.qty || 0).toFixed(2)}</td>
+              <td class="num">$${quoteQty.toFixed(2)}</td>
+              <td class="num ${p > 0 ? "pos" : (p < 0 ? "neg" : "")}">${p === 0 ? "—" : ((p > 0 ? "+" : "") + "$" + p.toFixed(4))}</td>
+              <td class="num">${Number(t.commission || 0).toFixed(4)} ${t.commission_asset || ""}</td>
+            </tr>
+          `;
+        }).join("") || `<tr><td colspan="8" style="color:var(--muted)">暂无交易所成交记录</td></tr>`;
+      } catch (e) {
+        document.getElementById("tradeMeta").textContent = "拉取成交失败";
       }
     }
     refresh();
@@ -729,6 +741,7 @@ class MonitorWebServer:
         orders_provider: Optional[Callable[[bool], Awaitable[List[Dict[str, Any]]]]] = None,
         cancel_order_handler: Optional[Callable[[Dict[str, Any]], Awaitable[Dict[str, Any]]]] = None,
         klines_provider: Optional[Callable[[str, str, int], Awaitable[Dict[str, Any]]]] = None,
+        trades_provider: Optional[Callable[[], Awaitable[List[Dict[str, Any]]]]] = None,
         host: Optional[str] = None,
         port: Optional[int] = None,
         token: Optional[str] = None,
@@ -739,6 +752,7 @@ class MonitorWebServer:
         self._orders_provider = orders_provider
         self._cancel_order_handler = cancel_order_handler
         self._klines_provider = klines_provider
+        self._trades_provider = trades_provider
         self.host = host or os.getenv("MONITOR_HOST", "0.0.0.0")
         self.port = int(port if port is not None else os.getenv("MONITOR_PORT", "8080"))
         self.token = (token if token is not None else os.getenv("MONITOR_TOKEN", "")).strip()
@@ -748,6 +762,7 @@ class MonitorWebServer:
         self._app.router.add_get("/api/status", self._handle_status)
         self._app.router.add_get("/api/klines", self._handle_klines)
         self._app.router.add_get("/api/orders", self._handle_orders)
+        self._app.router.add_get("/api/trades", self._handle_trades)
         self._app.router.add_post("/api/orders/cancel", self._handle_cancel_order)
         self._app.router.add_post("/api/control", self._handle_control)
         self._app.router.add_post("/api/params", self._handle_params)
@@ -804,6 +819,18 @@ class MonitorWebServer:
             return web.json_response({"error": str(e)}, status=400)
         except Exception as e:
             logger.error(f"Monitor klines error: {e}")
+            return web.json_response({"error": str(e)}, status=500)
+
+    async def _handle_trades(self, request: web.Request) -> web.Response:
+        if not self._is_authorized(request):
+            return web.json_response({"error": "unauthorized"}, status=401)
+        if self._trades_provider is None:
+            return web.json_response({"trades": []})
+        try:
+            trades = await self._trades_provider()
+            return web.json_response({"trades": trades})
+        except Exception as e:
+            logger.error(f"Monitor trades error: {e}")
             return web.json_response({"error": str(e)}, status=500)
 
     async def _handle_orders(self, request: web.Request) -> web.Response:

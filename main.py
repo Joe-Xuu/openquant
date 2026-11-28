@@ -314,6 +314,8 @@ class TradingSystem:
         self._manual_paused: bool = False
         self._open_orders_cache: List[Dict[str, Any]] = []
         self._open_orders_cache_ts: float = 0.0
+        self._trades_cache: List[Dict[str, Any]] = []
+        self._trades_cache_ts: float = 0.0
         self._klines_cache: Dict[tuple, tuple] = {}
         self.notifier = WeChatNotifier()
         self._monitor_enabled = os.getenv("MONITOR_ENABLED", "true").lower() == "true"
@@ -325,6 +327,7 @@ class TradingSystem:
                 orders_provider=self._fetch_open_orders,
                 cancel_order_handler=self._handle_web_cancel_order,
                 klines_provider=self._fetch_live_klines,
+                trades_provider=self._fetch_recent_trades,
             )
             if self._monitor_enabled
             else None
@@ -845,6 +848,48 @@ class TradingSystem:
         }
         self._klines_cache[cache_key] = (now, payload)
         return payload
+
+    async def _fetch_recent_trades(self) -> List[Dict[str, Any]]:
+        """Fetch recent real fills directly from Binance (Futures userTrades / Spot myTrades)."""
+        now = time.time()
+        if (now - self._trades_cache_ts) < 5.0:
+            return self._trades_cache
+
+        rows: List[Dict[str, Any]] = []
+        for sym in self.app_config.trading.symbols:
+            try:
+                raw = await self.exchange_client.get_my_trades(sym, limit=30)
+            except Exception as e:
+                logger.debug(f"Failed to fetch my_trades for {sym}: {e}")
+                continue
+            for t in raw:
+                ts_ms = int(t.get("time") or 0)
+                t_str = (
+                    datetime.fromtimestamp(ts_ms / 1000.0, tz=timezone.utc).isoformat()
+                    if ts_ms
+                    else ""
+                )
+                side = str(t.get("side") or ("BUY" if t.get("isBuyer") else "SELL")).upper()
+                px = float(t.get("price") or 0.0)
+                qty = float(t.get("qty") or 0.0)
+                quote_qty = float(t.get("quoteQty") or (px * qty))
+                rows.append({
+                    "time_ms": ts_ms,
+                    "time": t_str,
+                    "symbol": str(t.get("symbol", sym)),
+                    "side": side,
+                    "price": px,
+                    "qty": qty,
+                    "quote_qty": quote_qty,
+                    "realized_pnl": float(t.get("realizedPnl") or 0.0),
+                    "commission": float(t.get("commission") or 0.0),
+                    "commission_asset": str(t.get("commissionAsset") or ""),
+                })
+
+        rows.sort(key=lambda r: r["time_ms"], reverse=True)
+        self._trades_cache = rows[:30]
+        self._trades_cache_ts = now
+        return self._trades_cache
 
     def _get_positions(self) -> List[Dict]:
         """Return open positions from the ledger."""

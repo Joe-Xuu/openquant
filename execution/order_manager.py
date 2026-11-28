@@ -373,13 +373,13 @@ class OrderManager:
                 continue
 
             sym_info = self._get_symbol_info(symbol)
+            is_futures = getattr(self._client, "market", "spot") == "futures"
 
-            # Cap sell_qty at min(available_base, buy_qty) floored to step_size
+            # Cap sell_qty at min(available_long, buy_qty) floored to step_size
             try:
-                bal = await self._client.get_asset_balance(sym_info.base_asset)
-                available = bal.free
+                available = await self._get_available_long_qty(symbol, sym_info)
                 if available <= 0:
-                    logger.debug(f"  Recovery: no {sym_info.base_asset} free for trade {trade_id}")
+                    logger.debug(f"  Recovery: no {sym_info.base_asset} long/free for trade {trade_id}")
                     continue
                 sell_qty = sym_info.floor_qty(min(available, buy_qty))
             except Exception:
@@ -412,6 +412,7 @@ class OrderManager:
                     symbol=symbol, side="SELL", order_type="LIMIT",
                     price=sell_price, quantity=sell_qty,
                     time_in_force="GTC", client_order_id=tp_tag,
+                    reduce_only=is_futures,
                 )
                 tp_resp = await self._client.place_order(tp_req)
                 self._tp_attempted.add(tp_tag)
@@ -615,8 +616,9 @@ class OrderManager:
                 pending_qty = sum(float(f.get("buy_qty", 0.0)) for f in pending_fills)
                 if pending_qty > 0:
                     sym_info = self._get_symbol_info(signal.symbol)
-                    bal = await self._client.get_asset_balance(sym_info.base_asset)
-                    sell_qty = sym_info.floor_qty(min(pending_qty, float(bal.free)))
+                    is_futures = getattr(self._client, "market", "spot") == "futures"
+                    available = await self._get_available_long_qty(signal.symbol, sym_info)
+                    sell_qty = sym_info.floor_qty(min(pending_qty, available))
                     px = await self._client.get_ticker_price(signal.symbol)
                     if sym_info.is_valid_order(px, sell_qty):
                         exit_cid = f"grid_exit_{uuid.uuid4().hex[:14]}"
@@ -627,6 +629,7 @@ class OrderManager:
                                 order_type="MARKET",
                                 quantity=sell_qty,
                                 client_order_id=exit_cid,
+                                reduce_only=is_futures,
                             )
                         )
                         fill_px = (
@@ -1155,10 +1158,29 @@ class OrderManager:
             elif event.side == "SELL" and event.qty > 0:
                 await self._handle_sell_fill(event, sym_info)
 
+    async def _get_available_long_qty(self, symbol: str, sym_info: SymbolInfo) -> float:
+        """Return available long base qty: Futures open long positionAmt, or Spot free base balance."""
+        is_futures = getattr(self._client, "market", "spot") == "futures"
+        if is_futures:
+            try:
+                positions = await self._client.get_futures_positions(symbol)
+                long_amt = sum(
+                    float(p.get("positionAmt", 0.0))
+                    for p in positions
+                    if str(p.get("symbol", "")).upper() == symbol.upper()
+                    and float(p.get("positionAmt", 0.0)) > 0
+                )
+                return max(0.0, long_amt)
+            except Exception:
+                return float("inf")
+        bal = await self._client.get_asset_balance(sym_info.base_asset)
+        return float(bal.free)
+
     async def _place_tp_for_buy_fill(self, event: FillEvent, sym_info: SymbolInfo) -> None:
         tp_tag = f"{GRID_TP_PREFIX}{event.trade_id}"
         if tp_tag in self._tp_attempted:
             return
+        is_futures = getattr(self._client, "market", "spot") == "futures"
 
         # Net base asset received after commission (if fee was charged in base asset)
         base_fee = event.commission if event.commission_asset == sym_info.base_asset else 0.0
@@ -1187,13 +1209,13 @@ class OrderManager:
             self._tp_attempted.add(tp_tag)
             return
 
-        # CRITICAL: Cap sell_qty at min(available_base, net_base_qty), NEVER dump entire account!
+        # CRITICAL: Cap sell_qty at min(available_long, net_base_qty), NEVER dump entire account!
         try:
-            bal = await self._client.get_asset_balance(sym_info.base_asset)
-            if bal.free <= 0:
-                logger.debug(f"No free {sym_info.base_asset} to place TP for {event.trade_id}")
+            available = await self._get_available_long_qty(event.symbol, sym_info)
+            if available <= 0:
+                logger.debug(f"No available {sym_info.base_asset} long/free to place TP for {event.trade_id}")
                 return
-            sell_qty = sym_info.floor_qty(min(bal.free, net_base_qty))
+            sell_qty = sym_info.floor_qty(min(available, net_base_qty))
         except Exception:
             sell_qty = sym_info.floor_qty(net_base_qty)
 
@@ -1223,6 +1245,7 @@ class OrderManager:
                 quantity=sell_qty,
                 time_in_force="GTC",
                 client_order_id=tp_tag,
+                reduce_only=is_futures,
             )
             tp_resp = await self._client.place_order(tp_req)
             self._tp_attempted.add(tp_tag)
