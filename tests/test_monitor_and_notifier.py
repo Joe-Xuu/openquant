@@ -339,6 +339,95 @@ class TestMonitorWebServer:
         finally:
             await srv.stop()
 
+    @pytest.mark.asyncio
+    async def test_readonly_token_and_logs_endpoint(self, tmp_path):
+        # Create sample rotated + active log files
+        (tmp_path / "trading_system.log.2026-11-28_14").write_text(
+            "2026-11-28 14:00:01 [INFO   ] main: TICK #1\n"
+            "2026-11-28 14:00:02 [INFO   ] aiohttp.access: GET /api/status?token=admin_secret HTTP/1.1\n"
+            "2026-11-28 14:00:03 [ERROR  ] main: sample error with ?token=admin_secret\n",
+            encoding="utf-8",
+        )
+        (tmp_path / "trading_system.log").write_text(
+            "2026-11-28 15:00:01 [INFO   ] main: TICK #2\n",
+            encoding="utf-8",
+        )
+
+        async def fake_control(action, payload):
+            return {"ok": True, "action": action}
+
+        async def fake_params(payload):
+            return {"ok": True}
+
+        async def fake_cancel(payload):
+            return {"ok": True}
+
+        async def fake_trades(limit=30):
+            return [{"id": i} for i in range(limit)]
+
+        srv = MonitorWebServer(
+            status_provider=lambda: {"state": "ACTIVE_TREND"},
+            control_handler=fake_control,
+            params_handler=fake_params,
+            cancel_order_handler=fake_cancel,
+            trades_provider=fake_trades,
+            host="127.0.0.1",
+            port=0,
+            token="admin_secret",
+            readonly_token="ro_secret",
+            log_dir=str(tmp_path),
+        )
+        await srv.start()
+        try:
+            port = srv._site._server.sockets[0].getsockname()[1]
+            base = f"http://127.0.0.1:{port}"
+            ro_hdr = {"X-Monitor-Token": "ro_secret"}
+            admin_hdr = {"X-Monitor-Token": "admin_secret"}
+
+            async with aiohttp.ClientSession() as sess:
+                # Read-only token can GET status (with controls_enabled=False), trades(?limit), logs
+                async with sess.get(f"{base}/api/status", headers=ro_hdr) as r:
+                    assert r.status == 200
+                    d = await r.json()
+                    assert d["controls_enabled"] is False
+
+                async with sess.get(f"{base}/api/trades?limit=5", headers=ro_hdr) as r:
+                    assert r.status == 200
+                    assert len((await r.json())["trades"]) == 5
+
+                async with sess.get(f"{base}/api/logs?lines=50", headers=ro_hdr) as r:
+                    assert r.status == 200
+                    d = await r.json()
+                    # aiohttp.access excluded by default; token redacted
+                    assert all("aiohttp.access" not in ln for ln in d["lines"])
+                    assert all("admin_secret" not in ln for ln in d["lines"])
+                    assert any("token=***" in ln for ln in d["lines"])
+                    assert d["lines"][-1].endswith("TICK #2")
+
+                async with sess.get(f"{base}/api/logs?level=ERROR", headers=ro_hdr) as r:
+                    assert r.status == 200
+                    d = await r.json()
+                    assert d["count"] == 1
+                    assert "sample error" in d["lines"][0]
+
+                # Read-only token MUST get HTTP 403 on ALL mutating endpoints
+                for path, body in (
+                    ("/api/control", {"action": "pause"}),
+                    ("/api/params", {"max_drawdown_pct": 12}),
+                    ("/api/orders/cancel", {"cancel_all": True}),
+                ):
+                    async with sess.post(f"{base}{path}", json=body, headers=ro_hdr) as r:
+                        assert r.status == 403
+
+                # Full admin token still works on both GET (controls_enabled=True) and POST
+                async with sess.get(f"{base}/api/status", headers=admin_hdr) as r:
+                    assert r.status == 200
+                    assert (await r.json())["controls_enabled"] is True
+                async with sess.post(f"{base}/api/control", json={"action": "pause"}, headers=admin_hdr) as r:
+                    assert r.status == 200
+        finally:
+            await srv.stop()
+
 
 class TestRiskGuardReset:
     def test_reset_risk_state_clears_circuit_breaker(self):

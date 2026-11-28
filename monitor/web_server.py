@@ -22,8 +22,12 @@ SECURITY:
 
 from __future__ import annotations
 
+from collections import deque
+import hmac
+import inspect
 import logging
 import os
+from pathlib import Path
 import re
 from typing import Any, Awaitable, Callable, Dict, List, Optional
 
@@ -52,6 +56,61 @@ class TokenRedactFilter(logging.Filter):
         except Exception:
             pass
         return True
+
+
+def read_sanitized_log_tail(
+    log_dir: str = "logs",
+    lines: int = 200,
+    hours: int = 6,
+    level: str = "",
+    query: str = "",
+    include_access: bool = False,
+) -> Dict[str, Any]:
+    """
+    Safely read the tail of rotated trading_system.log* files (read-only),
+    filtering out noisy aiohttp.access heartbeats by default and redacting tokens.
+    """
+    max_lines = max(1, min(1000, int(lines)))
+    max_files = max(1, min(72, int(hours)))
+    lvl_filter = level.strip().upper()
+    q_filter = query.strip().lower()
+
+    base = Path(log_dir)
+    if not base.exists() or not base.is_dir():
+        return {"lines": [], "count": 0, "files": []}
+
+    # Chronological order: oldest rotated files first, active trading_system.log last
+    candidates = [
+        p for p in base.iterdir()
+        if p.is_file() and (p.name == "trading_system.log" or p.name.startswith("trading_system.log."))
+    ]
+    candidates.sort(key=lambda p: (p.stat().st_mtime, p.name))
+    selected = candidates[-max_files:]
+
+    buf: deque[str] = deque(maxlen=max_lines)
+    for path in selected:
+        try:
+            with path.open("r", encoding="utf-8", errors="replace") as fh:
+                for raw in fh:
+                    line = raw.rstrip("\r\n")
+                    if not line:
+                        continue
+                    if not include_access and "aiohttp.access:" in line:
+                        continue
+                    if lvl_filter and f"[{lvl_filter}" not in line.upper():
+                        continue
+                    if q_filter and q_filter not in line.lower():
+                        continue
+                    buf.append(redact_tokens(line))
+        except Exception as e:
+            logger.debug(f"Could not read log file {path.name}: {e}")
+
+    out = list(buf)
+    return {
+        "lines": out,
+        "count": len(out),
+        "files": [p.name for p in selected],
+    }
 
 
 DASHBOARD_HTML = r"""<!DOCTYPE html>
@@ -764,10 +823,12 @@ class MonitorWebServer:
         orders_provider: Optional[Callable[[bool], Awaitable[List[Dict[str, Any]]]]] = None,
         cancel_order_handler: Optional[Callable[[Dict[str, Any]], Awaitable[Dict[str, Any]]]] = None,
         klines_provider: Optional[Callable[[str, str, int], Awaitable[Dict[str, Any]]]] = None,
-        trades_provider: Optional[Callable[[], Awaitable[List[Dict[str, Any]]]]] = None,
+        trades_provider: Optional[Callable[..., Awaitable[List[Dict[str, Any]]]]] = None,
         host: Optional[str] = None,
         port: Optional[int] = None,
         token: Optional[str] = None,
+        readonly_token: Optional[str] = None,
+        log_dir: str = "logs",
     ):
         self._status_provider = status_provider
         self._control_handler = control_handler
@@ -779,6 +840,10 @@ class MonitorWebServer:
         self.host = host or os.getenv("MONITOR_HOST", "0.0.0.0")
         self.port = int(port if port is not None else os.getenv("MONITOR_PORT", "8080"))
         self.token = (token if token is not None else os.getenv("MONITOR_TOKEN", "")).strip()
+        self.readonly_token = (
+            readonly_token if readonly_token is not None else os.getenv("MONITOR_READONLY_TOKEN", "")
+        ).strip()
+        self.log_dir = log_dir
 
         self._app = web.Application()
         self._app.router.add_get("/", self._handle_index)
@@ -786,6 +851,7 @@ class MonitorWebServer:
         self._app.router.add_get("/api/klines", self._handle_klines)
         self._app.router.add_get("/api/orders", self._handle_orders)
         self._app.router.add_get("/api/trades", self._handle_trades)
+        self._app.router.add_get("/api/logs", self._handle_logs)
         self._app.router.add_post("/api/orders/cancel", self._handle_cancel_order)
         self._app.router.add_post("/api/control", self._handle_control)
         self._app.router.add_post("/api/params", self._handle_params)
@@ -793,23 +859,50 @@ class MonitorWebServer:
         self._runner: Optional[web.AppRunner] = None
         self._site: Optional[web.TCPSite] = None
 
-    def _is_authorized(self, request: web.Request) -> bool:
+    @staticmethod
+    def _extract_tokens(request: web.Request) -> tuple[str, str]:
+        return (
+            request.headers.get("X-Monitor-Token", ""),
+            request.query.get("token", ""),
+        )
+
+    @staticmethod
+    def _matches_secret(candidates: tuple[str, str], secret: str) -> bool:
+        if not secret:
+            return False
+        return any(bool(c) and hmac.compare_digest(c, secret) for c in candidates)
+
+    def _is_write_authorized(self, request: web.Request) -> bool:
         if not self.token:
+            return False
+        return self._matches_secret(self._extract_tokens(request), self.token)
+
+    def _is_readonly_token(self, request: web.Request) -> bool:
+        if not self.readonly_token:
+            return False
+        return self._matches_secret(self._extract_tokens(request), self.readonly_token)
+
+    def _is_authorized(self, request: web.Request) -> bool:
+        """Read-access check: accepts full MONITOR_TOKEN or scoped MONITOR_READONLY_TOKEN."""
+        if not self.token and not self.readonly_token:
             return True
-        q_tok = request.query.get("token", "")
-        h_tok = request.headers.get("X-Monitor-Token", "")
-        return q_tok == self.token or h_tok == self.token
+        return self._is_write_authorized(request) or self._is_readonly_token(request)
 
     def _check_write_access(self, request: web.Request) -> Optional[web.Response]:
-        """Enforce strict token protection on all mutating endpoints."""
+        """Enforce strict write-token protection on all mutating endpoints (never allows readonly_token)."""
         if not self.token:
             return web.json_response(
                 {"error": "Read-only mode: set MONITOR_TOKEN in .env to enable remote controls"},
                 status=403,
             )
-        if not self._is_authorized(request):
-            return web.json_response({"error": "unauthorized"}, status=401)
-        return None
+        if self._is_write_authorized(request):
+            return None
+        if self._is_readonly_token(request):
+            return web.json_response(
+                {"error": "Forbidden: read-only token cannot invoke write/control endpoints"},
+                status=403,
+            )
+        return web.json_response({"error": "unauthorized"}, status=401)
 
     async def _handle_index(self, request: web.Request) -> web.Response:
         if not self._is_authorized(request):
@@ -821,7 +914,9 @@ class MonitorWebServer:
             return web.json_response({"error": "unauthorized"}, status=401)
         try:
             data = self._status_provider()
-            data["controls_enabled"] = bool(self.token and self._control_handler is not None)
+            data["controls_enabled"] = bool(
+                self._is_write_authorized(request) and self._control_handler is not None
+            )
             return web.json_response(data)
         except Exception as e:
             logger.error(f"Monitor status error: {e}")
@@ -850,8 +945,16 @@ class MonitorWebServer:
         if self._trades_provider is None:
             return web.json_response({"trades": []})
         try:
-            trades = await self._trades_provider()
+            limit_raw = request.query.get("limit")
+            sig = inspect.signature(self._trades_provider)
+            if limit_raw is not None and len(sig.parameters) >= 1:
+                limit = max(1, min(200, int(limit_raw)))
+                trades = await self._trades_provider(limit)
+            else:
+                trades = await self._trades_provider()
             return web.json_response({"trades": trades})
+        except ValueError as e:
+            return web.json_response({"error": str(e)}, status=400)
         except Exception as e:
             logger.error(f"Monitor trades error: {e}")
             return web.json_response({"error": str(e)}, status=500)
@@ -867,6 +970,31 @@ class MonitorWebServer:
             return web.json_response({"orders": orders})
         except Exception as e:
             logger.error(f"Monitor orders error: {e}")
+            return web.json_response({"error": str(e)}, status=500)
+
+    async def _handle_logs(self, request: web.Request) -> web.Response:
+        """Read-only endpoint returning sanitized tail of trading_system.log* files."""
+        if not self._is_authorized(request):
+            return web.json_response({"error": "unauthorized"}, status=401)
+        try:
+            lines = int(request.query.get("lines", "200"))
+            hours = int(request.query.get("hours", "6"))
+            level = request.query.get("level", "")
+            query = request.query.get("q", "")
+            include_access = request.query.get("include_access", "") in ("1", "true", "yes")
+            data = read_sanitized_log_tail(
+                log_dir=self.log_dir,
+                lines=lines,
+                hours=hours,
+                level=level,
+                query=query,
+                include_access=include_access,
+            )
+            return web.json_response(data)
+        except ValueError as e:
+            return web.json_response({"error": str(e)}, status=400)
+        except Exception as e:
+            logger.error(f"Monitor logs error: {e}")
             return web.json_response({"error": str(e)}, status=500)
 
     async def _handle_cancel_order(self, request: web.Request) -> web.Response:
@@ -929,7 +1057,14 @@ class MonitorWebServer:
         await self._runner.setup()
         self._site = web.TCPSite(self._runner, self.host, self.port)
         await self._site.start()
-        auth_note = "token-protected (read+control)" if self.token else "read-only (set MONITOR_TOKEN to enable control)"
+        if self.token and self.readonly_token:
+            auth_note = "token-protected (read+control, +scoped readonly token)"
+        elif self.token:
+            auth_note = "token-protected (read+control)"
+        elif self.readonly_token:
+            auth_note = "readonly-token protected (controls disabled)"
+        else:
+            auth_note = "read-only (set MONITOR_TOKEN to enable control)"
         logger.info(f"MonitorWebServer listening on http://{self.host}:{self.port} ({auth_note})")
 
     async def stop(self) -> None:

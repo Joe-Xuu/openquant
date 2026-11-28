@@ -876,16 +876,17 @@ class TradingSystem:
         self._klines_cache[cache_key] = (now, payload)
         return payload
 
-    async def _fetch_recent_trades(self) -> List[Dict[str, Any]]:
+    async def _fetch_recent_trades(self, limit: int = 30) -> List[Dict[str, Any]]:
         """Fetch recent real fills directly from Binance (Futures userTrades / Spot myTrades)."""
+        limit = max(1, min(200, int(limit)))
         now = time.time()
-        if (now - self._trades_cache_ts) < 5.0:
-            return self._trades_cache
+        if limit <= 30 and (now - self._trades_cache_ts) < 5.0 and len(self._trades_cache) >= 0 and self._trades_cache_ts > 0:
+            return self._trades_cache[:limit]
 
         rows: List[Dict[str, Any]] = []
         for sym in self.app_config.trading.symbols:
             try:
-                raw = await self.exchange_client.get_my_trades(sym, limit=30)
+                raw = await self.exchange_client.get_my_trades(sym, limit=limit)
             except Exception as e:
                 logger.debug(f"Failed to fetch my_trades for {sym}: {e}")
                 continue
@@ -896,7 +897,7 @@ class TradingSystem:
                     if ts_ms
                     else ""
                 )
-                side = str(t.get("side") or ("BUY" if t.get("isBuyer") else "SELL")).upper()
+                side = str(t.get("side") or ("BUY" if t.get("isBuyer") or t.get("buyer") else "SELL")).upper()
                 px = float(t.get("price") or 0.0)
                 qty = float(t.get("qty") or 0.0)
                 quote_qty = float(t.get("quoteQty") or (px * qty))
@@ -914,9 +915,10 @@ class TradingSystem:
                 })
 
         rows.sort(key=lambda r: r["time_ms"], reverse=True)
-        self._trades_cache = rows[:30]
-        self._trades_cache_ts = now
-        return self._trades_cache
+        if limit <= 30:
+            self._trades_cache = rows[:30]
+            self._trades_cache_ts = now
+        return rows[:limit]
 
     def _get_positions(self) -> List[Dict]:
         """Return open positions (live Futures exchange positions when synced, else ledger)."""
