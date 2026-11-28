@@ -443,6 +443,7 @@ class TradingSystem:
                 "grid_active": sym in self._grid_configs,
                 "grid_paused": (
                     self._manual_paused
+                    or (ts.is_active and ts.direction.value == "SHORT")
                     or self._macro_paused_grid.get(sym, False)
                     or self._trend_paused_grid.get(sym, False)
                 ),
@@ -1514,8 +1515,17 @@ class TradingSystem:
             self._trend_paused_grid[symbol] = False
             current_grid = None  # force fresh deployment
 
+        trend_state = self._trend_states.get(symbol, TrendState.flat(symbol))
+        active_short = trend_state.is_active and trend_state.direction.value == "SHORT"
+
         if grid_signal is None:
-            grid_frozen = (self._manual_paused or macro_bear or strong_trend or cb_triggered)
+            grid_frozen = (
+                self._manual_paused
+                or active_short
+                or macro_bear
+                or strong_trend
+                or cb_triggered
+            )
             if grid_frozen:
                 pass  # hold or stay flat, don't deploy new buys
             elif current_grid is None and self.grid_strategy.total_capital >= min_notional:
@@ -1553,7 +1563,6 @@ class TradingSystem:
                 )
 
         # ---- TREND (decoupled 1h trend_interval; active positions ALWAYS monitored!) ----
-        trend_state = self._trend_states.get(symbol, TrendState.flat(symbol))
         if trend_state.is_active:
             if indicators.close > trend_state.highest_price:
                 trend_state.highest_price = indicators.close
@@ -1607,6 +1616,16 @@ class TradingSystem:
                             and not trend_state.is_active
                             and not self._manual_paused
                         ):
+                            # Cap notional strictly at allocated trend_capital (never overshoot on tight ATR)
+                            ep = float(raw_trend.metadata.get("entry_price") or indicators.close)
+                            ps = float(raw_trend.metadata.get("position_size") or 0.0)
+                            if ep > 0 and trend_capital > 0 and ps * ep > trend_capital:
+                                capped = round(trend_capital / ep, 8)
+                                logger.info(
+                                    f"Capping {symbol} trend size to trend_capital "
+                                    f"(${trend_capital:.2f}): {ps:.2f} → {capped:.2f}"
+                                )
+                                raw_trend.metadata["position_size"] = capped
                             trend_signal = raw_trend
                         elif raw_trend.action in (
                             SignalAction.STOP_TREND,
@@ -1614,7 +1633,37 @@ class TradingSystem:
                         ) and trend_state.is_active:
                             trend_signal = raw_trend
 
-        # 5. Route signals — trend takes priority if both fire
+        # 5. Route signals — Futures One-Way Mode mutex: clear Grid LONG before opening Trend SHORT
+        if (
+            trend_signal is not None
+            and trend_signal.action == SignalAction.START_TREND
+            and trend_signal.metadata.get("direction") == "SHORT"
+            and self.app_config.exchange.market == "futures"
+        ):
+            logger.warning(
+                f"🔀 Futures One-Way mutex for {symbol}: pausing & clearing Grid LONG "
+                f"before opening Trend SHORT"
+            )
+            grid_signal = None
+            mutex_stop = StrategySignal(
+                action=SignalAction.STOP_GRID,
+                symbol=symbol,
+                confidence=1.0,
+                metadata={
+                    "grid_id": self._grid_configs[symbol].grid_id if symbol in self._grid_configs else "",
+                    "reason": "trend_short_mutex",
+                    "liquidate_inventory": True,
+                },
+                source="FuturesMutex",
+            )
+            await self.order_manager.dispatch_signal(mutex_stop)
+            self._grid_configs.pop(symbol, None)
+            # Also cancel any residual grid TP sells so they don't collide with the SHORT
+            try:
+                await self.order_manager._cancel_orders_by_prefix(symbol, GRID_BUY_PREFIXES + ("tp_",))
+            except Exception as e:
+                logger.debug(f"Pre-SHORT grid order cleanup warning for {symbol}: {e}")
+
         if trend_signal is not None:
             await self._route_signal(trend_signal)
         if grid_signal is not None:

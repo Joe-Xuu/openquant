@@ -457,15 +457,20 @@ class ExchangeClient:
     # Order Management
     # ------------------------------------------------------------------
 
+    _FUTURES_ALGO_TYPES = {
+        "STOP_MARKET",
+        "TAKE_PROFIT_MARKET",
+        "STOP",
+        "TAKE_PROFIT",
+        "TRAILING_STOP_MARKET",
+    }
+
     async def place_order(self, request: OrderRequest) -> OrderResponse:
         """
         Place a new order on the exchange.
 
-        Args:
-            request: Normalized order request.
-
-        Returns:
-            OrderResponse with exchange order ID and status.
+        Routes Futures conditional orders (STOP_MARKET, etc.) to Binance's
+        POST /fapi/v1/algoOrder endpoint automatically.
         """
         valid, error = request.validate()
         if not valid:
@@ -476,10 +481,51 @@ class ExchangeClient:
             if request.client_order_id is None:
                 request.client_order_id = f"co_{uuid.uuid4().hex[:16]}"
 
+            otype = request.order_type.upper()
+
+            if self.market == "futures" and otype in self._FUTURES_ALGO_TYPES:
+                algo_params: Dict[str, Any] = {
+                    "algoType": "CONDITIONAL",
+                    "symbol": request.symbol.upper(),
+                    "side": request.side.upper(),
+                    "type": otype,
+                    "quantity": request.quantity,
+                    "clientAlgoId": request.client_order_id,
+                }
+                if request.stop_price is not None:
+                    algo_params["triggerPrice"] = request.stop_price
+                if request.price is not None:
+                    algo_params["price"] = request.price
+                if request.reduce_only:
+                    algo_params["reduceOnly"] = "true"
+
+                logger.info(
+                    f"Placing Futures algo order: {request.symbol} {request.side} "
+                    f"{otype} qty={request.quantity} trigger={request.stop_price}"
+                    + (" [reduceOnly]" if request.reduce_only else "")
+                )
+                response = await self._signed_request("POST", "/fapi/v1/algoOrder", algo_params)
+                return OrderResponse(
+                    order_id=request.client_order_id,
+                    exchange_order_id=str(response.get("algoId", response.get("orderId", ""))),
+                    client_order_id=request.client_order_id,
+                    symbol=response.get("symbol", request.symbol),
+                    side=response.get("side", request.side),
+                    order_type=response.get("orderType", otype),
+                    status=response.get("algoStatus", response.get("status", "NEW")),
+                    price=float(response.get("triggerPrice") or request.stop_price or 0),
+                    quantity=float(response.get("quantity") or request.quantity),
+                    executed_qty=0.0,
+                    cummulative_quote_qty=0.0,
+                    created_at=datetime.now(timezone.utc).isoformat(),
+                    updated_at=datetime.now(timezone.utc).isoformat(),
+                    raw_response=response,
+                )
+
             params = {
                 "symbol": request.symbol.upper(),
                 "side": request.side.upper(),
-                "type": request.order_type.upper(),
+                "type": otype,
                 "quantity": request.quantity,
                 "newClientOrderId": request.client_order_id,
                 "newOrderRespType": "RESULT" if self.market == "futures" else "FULL",
@@ -489,14 +535,14 @@ class ExchangeClient:
                 params["price"] = request.price
             if request.stop_price is not None:
                 params["stopPrice"] = request.stop_price
-            if request.order_type in ("LIMIT", "STOP_LOSS_LIMIT", "TAKE_PROFIT_LIMIT"):
+            if otype in ("LIMIT", "STOP_LOSS_LIMIT", "TAKE_PROFIT_LIMIT"):
                 params["timeInForce"] = request.time_in_force
             if request.reduce_only and self.market == "futures":
                 params["reduceOnly"] = "true"
 
             logger.info(
                 f"Placing order: {request.symbol} {request.side} "
-                f"{request.order_type} qty={request.quantity}"
+                f"{otype} qty={request.quantity}"
                 + (f" @ {request.price}" if request.price else "")
                 + (" [reduceOnly]" if request.reduce_only and self.market == "futures" else "")
             )
@@ -509,7 +555,7 @@ class ExchangeClient:
                 client_order_id=request.client_order_id,
                 symbol=response.get("symbol", request.symbol),
                 side=response.get("side", request.side),
-                order_type=response.get("type", request.order_type),
+                order_type=response.get("type", otype),
                 status=response.get("status", "UNKNOWN"),
                 price=float(response.get("avgPrice") or response.get("price") or 0),
                 quantity=float(response.get("origQty", 0)),
@@ -526,14 +572,7 @@ class ExchangeClient:
                            client_order_id: Optional[str] = None) -> Dict[str, Any]:
         """
         Cancel an order by exchange order ID or client order ID.
-
-        Args:
-            symbol: Trading pair.
-            order_id: Binance order ID.
-            client_order_id: Our client order ID.
-
-        Returns:
-            Cancellation response.
+        In Futures mode, falls back to DELETE /fapi/v1/algoOrder for conditional stops.
         """
         if not order_id and not client_order_id:
             raise ValueError("Either order_id or client_order_id is required")
@@ -544,12 +583,28 @@ class ExchangeClient:
         if client_order_id:
             params["origClientOrderId"] = client_order_id
 
-        return await self._signed_request("DELETE", f"{self._api_prefix}/order", params)
+        try:
+            return await self._signed_request("DELETE", f"{self._api_prefix}/order", params)
+        except BinanceAPIError:
+            if self.market != "futures":
+                raise
+            algo_params: Dict[str, Any] = {}
+            if order_id:
+                algo_params["algoId"] = order_id
+            elif client_order_id:
+                algo_params["clientAlgoId"] = client_order_id
+            return await self._signed_request("DELETE", "/fapi/v1/algoOrder", algo_params)
 
     async def cancel_all_orders(self, symbol: str) -> List[Dict[str, Any]]:
-        """Cancel all open orders for a symbol."""
+        """Cancel all open orders (and Futures open algo/conditional orders) for a symbol."""
         params = {"symbol": symbol.upper()}
-        return await self._signed_request("DELETE", f"{self._api_prefix}/openOrders", params)
+        res = await self._signed_request("DELETE", f"{self._api_prefix}/openOrders", params)
+        if self.market == "futures":
+            try:
+                await self._signed_request("DELETE", "/fapi/v1/algoOpenOrders", params)
+            except Exception as e:
+                logger.debug(f"cancel algoOpenOrders ({symbol}) non-fatal: {e}")
+        return res
 
     async def get_order_status(self, symbol: str, order_id: Optional[str] = None,
                                client_order_id: Optional[str] = None) -> Dict[str, Any]:
@@ -563,11 +618,37 @@ class ExchangeClient:
         return await self._signed_request("GET", f"{self._api_prefix}/order", params)
 
     async def get_open_orders(self, symbol: Optional[str] = None) -> List[Dict[str, Any]]:
-        """Get all currently open orders."""
+        """Get all currently open orders (including Futures conditional algo orders)."""
         params = {}
         if symbol:
             params["symbol"] = symbol.upper()
-        return await self._signed_request("GET", f"{self._api_prefix}/openOrders", params)
+        orders = await self._signed_request("GET", f"{self._api_prefix}/openOrders", params)
+        if not isinstance(orders, list):
+            orders = []
+
+        if self.market == "futures":
+            try:
+                algo_raw = await self._signed_request("GET", "/fapi/v1/openAlgoOrders", params)
+                algo_list = algo_raw if isinstance(algo_raw, list) else algo_raw.get("orders", []) if isinstance(algo_raw, dict) else []
+                for a in algo_list:
+                    orders.append({
+                        "symbol": a.get("symbol", symbol or ""),
+                        "orderId": str(a.get("algoId", "")),
+                        "clientOrderId": str(a.get("clientAlgoId", "")),
+                        "side": a.get("side", ""),
+                        "type": a.get("orderType", a.get("type", "STOP_MARKET")),
+                        "price": str(a.get("price") or a.get("triggerPrice") or "0"),
+                        "stopPrice": str(a.get("triggerPrice") or "0"),
+                        "origQty": str(a.get("quantity", "0")),
+                        "executedQty": "0",
+                        "reduceOnly": bool(a.get("reduceOnly", False)),
+                        "time": a.get("createTime", a.get("updateTime", 0)),
+                        "_is_algo": True,
+                    })
+            except Exception as e:
+                logger.debug(f"get openAlgoOrders non-fatal: {e}")
+
+        return orders
 
     async def get_my_trades(
         self,
