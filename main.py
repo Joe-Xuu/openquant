@@ -52,7 +52,7 @@ from core.notifier import WeChatNotifier
 from core.state_machine import StateTransition, SystemState, TradingStateMachine
 
 # --- Monitor ---
-from monitor.web_server import MonitorWebServer
+from monitor.web_server import MonitorWebServer, TokenRedactFilter, redact_tokens
 
 # --- Data ---
 from data.indicators import compute_all, ema as compute_ema, IndicatorBundle
@@ -61,7 +61,7 @@ from data.market_data import MarketDataEngine
 # --- Strategy ---
 from strategy.signal import SignalAction, StrategySignal
 from strategy.grid_strategy import GridConfig, GridStatus, GridStrategy
-from strategy.trend_strategy import TrendState, TrendStrategy
+from strategy.trend_strategy import TrendDirection, TrendState, TrendStrategy
 from strategy.regime_detector import (
     MacroTrend,
     MarketRegime,
@@ -94,12 +94,16 @@ class _MemoryLogHandler(logging.Handler):
 
     def emit(self, record: logging.LogRecord) -> None:
         try:
-            RECENT_LOGS.append(self.format(record))
+            RECENT_LOGS.append(redact_tokens(self.format(record)))
         except Exception:
             pass
 
 
 _log_formatter = logging.Formatter("%(asctime)s [%(levelname)-7s] %(name)s: %(message)s")
+_token_filter = TokenRedactFilter()
+
+_stdout_handler = logging.StreamHandler(sys.stdout)
+_stdout_handler.addFilter(_token_filter)
 
 file_handler = TimedRotatingFileHandler(
     filename="logs/trading_system.log",
@@ -109,15 +113,17 @@ file_handler = TimedRotatingFileHandler(
     encoding="utf-8",
 )
 file_handler.setFormatter(_log_formatter)
+file_handler.addFilter(_token_filter)
 
 memory_handler = _MemoryLogHandler()
 memory_handler.setFormatter(_log_formatter)
+memory_handler.addFilter(_token_filter)
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)-7s] %(name)s: %(message)s",
     handlers=[
-        logging.StreamHandler(sys.stdout),
+        _stdout_handler,
         file_handler,
         memory_handler,
     ],
@@ -164,10 +170,11 @@ class TradingSystem:
         use_testnet = exchange_cfg.testnet
         use_futures = exchange_cfg.market == "futures"
 
-        # MarketDataEngine uses mainnet public endpoints (matches mainnet WS; avoids testnet 202/empty history)
+        # MarketDataEngine uses mainnet public endpoints (matches mainnet WS; avoids testnet 202/empty history).
+        # Binance USD-M Futures 2026 WS migration routes klines exclusively through /market.
         if use_futures:
             data_rest_url = "https://fapi.binance.com"
-            ws_url = "wss://fstream.binance.com/ws"
+            ws_url = "wss://fstream.binance.com/market/ws"
         else:
             data_rest_url = "https://api.binance.com"
             ws_url = "wss://stream.binance.com:9443/ws"
@@ -309,6 +316,8 @@ class TradingSystem:
         self._macro_liquidated: Dict[str, bool] = {}
         self._short_macro_bearish: Dict[str, bool] = {}
         self._last_prices: Dict[str, float] = {}
+        self._cached_futures_positions: List[Dict[str, Any]] = []
+        self._futures_positions_synced: bool = False
 
         # --- Notifications & Live Web Monitor ---
         self._manual_paused: bool = False
@@ -353,9 +362,26 @@ class TradingSystem:
                 try:
                     positions = await self.exchange_client.get_futures_positions()
                     configured = {s.upper() for s in self.app_config.trading.symbols}
+                    live_pos: List[Dict[str, Any]] = []
                     for p in positions:
-                        if str(p.get("symbol", "")).upper() in configured:
-                            unrealized += float(p.get("unRealizedProfit", 0.0))
+                        sym_u = str(p.get("symbol", "")).upper()
+                        if sym_u not in configured:
+                            continue
+                        upnl = float(p.get("unRealizedProfit", 0.0) or 0.0)
+                        unrealized += upnl
+                        amt = float(p.get("positionAmt", 0.0) or 0.0)
+                        if abs(amt) > 1e-12:
+                            entry_px = float(p.get("entryPrice", 0.0) or 0.0)
+                            mark_px = float(p.get("markPrice", 0.0) or entry_px)
+                            live_pos.append({
+                                "symbol": sym_u,
+                                "quantity": amt,
+                                "avg_entry_price": entry_px,
+                                "current_price": mark_px,
+                                "unrealized_pnl": upnl,
+                            })
+                    self._cached_futures_positions = live_pos
+                    self._futures_positions_synced = True
                 except Exception:
                     pass
                 equity = usdt_total + unrealized
@@ -561,7 +587,7 @@ class TradingSystem:
                         stop_sig = StrategySignal(
                             action=SignalAction.STOP_TREND,
                             symbol=sym,
-                            confidence=1.0,
+                            score=1.0,
                             metadata={
                                 "direction": ts.direction.value,
                                 "position_size": ts.position_size,
@@ -569,7 +595,7 @@ class TradingSystem:
                                 "exit_reason": "web_emergency_stop",
                                 "pnl_pct": 0.0,
                             },
-                            source="WebControl",
+                            strategy_id="WebControl",
                         )
                         await self.order_manager.dispatch_signal(stop_sig)
                         self._trend_states[sym] = TrendState.flat(sym)
@@ -581,13 +607,13 @@ class TradingSystem:
                     grid_sig = StrategySignal(
                         action=SignalAction.STOP_GRID,
                         symbol=sym,
-                        confidence=1.0,
+                        score=1.0,
                         metadata={
                             "grid_id": self._grid_configs[sym].grid_id if sym in self._grid_configs else "",
                             "reason": "web_emergency_stop",
                             "liquidate_inventory": True,
                         },
-                        source="WebControl",
+                        strategy_id="WebControl",
                     )
                     await self.order_manager.dispatch_signal(grid_sig)
                     self._grid_configs.pop(sym, None)
@@ -893,7 +919,9 @@ class TradingSystem:
         return self._trades_cache
 
     def _get_positions(self) -> List[Dict]:
-        """Return open positions from the ledger."""
+        """Return open positions (live Futures exchange positions when synced, else ledger)."""
+        if self.app_config.exchange.market == "futures" and self._futures_positions_synced:
+            return list(self._cached_futures_positions)
         positions = self.ledger.get_all_positions()
         return [
             {
@@ -1013,10 +1041,162 @@ class TradingSystem:
     # Lifecycle
     # ------------------------------------------------------------------
 
+    async def _sync_futures_positions_on_startup(self) -> None:
+        """
+        Reconcile existing Binance Futures open positions on startup:
+          - Recovers open SHORT (or Trend LONG) positions into self._trend_states so
+            a restart NEVER loses track of an active position or double-opens on top of it.
+          - When exchange holds no LONG position (flat or net SHORT), settles any stale
+            pending grid_fills whose reduceOnly TP sells expired on flip/close.
+        """
+        if self.app_config.exchange.market != "futures":
+            return
+
+        try:
+            positions = await self.exchange_client.get_futures_positions()
+        except Exception as e:
+            logger.warning(f"  Futures startup position sync failed: {e}")
+            return
+
+        configured = {s.upper() for s in self.app_config.trading.symbols}
+        pos_by_sym: Dict[str, Dict[str, float]] = {}
+        live_pos_cache: List[Dict[str, Any]] = []
+
+        for p in positions:
+            sym_u = str(p.get("symbol", "")).upper()
+            if sym_u not in configured:
+                continue
+            amt = float(p.get("positionAmt", 0.0) or 0.0)
+            entry_px = float(p.get("entryPrice", 0.0) or 0.0)
+            mark_px = float(p.get("markPrice", 0.0) or entry_px)
+            upnl = float(p.get("unRealizedProfit", 0.0) or 0.0)
+            prev = pos_by_sym.get(sym_u)
+            if prev is None:
+                pos_by_sym[sym_u] = {
+                    "amt": amt,
+                    "entry_px": entry_px,
+                    "mark_px": mark_px,
+                    "upnl": upnl,
+                }
+            else:
+                prev["amt"] += amt
+                prev["upnl"] += upnl
+                if mark_px > 0:
+                    prev["mark_px"] = mark_px
+                if entry_px > 0 and prev["entry_px"] <= 0:
+                    prev["entry_px"] = entry_px
+            if abs(amt) > 1e-12:
+                live_pos_cache.append({
+                    "symbol": sym_u,
+                    "quantity": amt,
+                    "avg_entry_price": entry_px,
+                    "current_price": mark_px,
+                    "unrealized_pnl": upnl,
+                })
+
+        self._cached_futures_positions = live_pos_cache
+        self._futures_positions_synced = True
+
+        fallback_sl_pct = max(float(self.app_config.risk.stop_loss_pct), 3.0)
+        now_iso = datetime.now(timezone.utc).isoformat()
+
+        for sym in self.app_config.trading.symbols:
+            sym_u = sym.upper()
+            info = pos_by_sym.get(sym_u, {"amt": 0.0, "entry_px": 0.0, "mark_px": 0.0, "upnl": 0.0})
+            pos_amt = info["amt"]
+            entry_px = info["entry_px"]
+            mark_px = info["mark_px"] or entry_px
+
+            # Inspect open orders for any surviving trend_sl_* conditional stop
+            sl_price = 0.0
+            sl_qty = 0.0
+            sl_side = ""
+            try:
+                open_orders = await self.exchange_client.get_open_orders(sym)
+                for o in open_orders:
+                    cid = str(o.get("clientOrderId", ""))
+                    if cid.startswith("trend_sl_"):
+                        cand_px = float(o.get("stopPrice") or o.get("price") or 0.0)
+                        if cand_px > 0:
+                            sl_price = cand_px
+                            sl_qty = float(o.get("origQty") or 0.0)
+                            sl_side = str(o.get("side", "")).upper()
+                            break
+            except Exception as e:
+                logger.debug(f"  Could not inspect open trend_sl_ orders for {sym}: {e}")
+
+            if pos_amt <= 0:
+                # No open LONG inventory on exchange -> clear any ghost grid_fills
+                await self.order_manager.reconcile_futures_stale_grid_fills(
+                    sym, open_long_qty=0.0, mark_price=mark_px
+                )
+
+            if pos_amt < -1e-12 and entry_px > 0:
+                short_qty = abs(pos_amt)
+                ref_high = max(entry_px, mark_px) if mark_px > 0 else entry_px
+                ref_low = min(entry_px, mark_px) if mark_px > 0 else entry_px
+                recovered_sl = (
+                    sl_price
+                    if (sl_price > 0 and sl_side in ("BUY", ""))
+                    else round(ref_high * (1.0 + fallback_sl_pct / 100.0), 8)
+                )
+                self._trend_states[sym] = TrendState(
+                    symbol=sym,
+                    direction=TrendDirection.SHORT,
+                    entry_price=entry_px,
+                    position_size=short_qty,
+                    stop_loss_price=recovered_sl,
+                    trailing_stop_price=recovered_sl,
+                    entry_time=now_iso,
+                    highest_price=ref_high,
+                    lowest_price=ref_low,
+                )
+                sl_note = (
+                    f"exchange trend_sl={recovered_sl:.5f}"
+                    if (sl_price > 0 and sl_side in ("BUY", ""))
+                    else f"NO exchange trend_sl found — armed fallback stop={recovered_sl:.5f}"
+                )
+                logger.warning(
+                    f"  ♻ Recovered open Futures SHORT for {sym}: "
+                    f"qty={short_qty:.2f} @ {entry_px:.5f} (uPnL={info['upnl']:+.2f}, {sl_note}). "
+                    f"Grid LONG stays frozen until SHORT closes."
+                )
+            elif pos_amt > 1e-12 and entry_px > 0:
+                sym_info = self.exchange_client.get_symbol_info(sym)
+                pending_grid = self._ledger_get_pending_tp_fills(sym)
+                pending_grid_qty = sum(float(f.get("buy_qty", 0.0)) for f in pending_grid)
+                has_long_sl = sl_price > 0 and sl_side in ("SELL", "")
+                notional = pos_amt * (mark_px or entry_px)
+                if has_long_sl or (pending_grid_qty <= 0 and notional >= float(sym_info.min_notional)):
+                    trend_qty = sl_qty if (has_long_sl and 0 < sl_qty <= pos_amt) else pos_amt
+                    ref_high = max(entry_px, mark_px) if mark_px > 0 else entry_px
+                    ref_low = min(entry_px, mark_px) if mark_px > 0 else entry_px
+                    recovered_sl = (
+                        sl_price
+                        if has_long_sl
+                        else round(ref_low * (1.0 - fallback_sl_pct / 100.0), 8)
+                    )
+                    self._trend_states[sym] = TrendState(
+                        symbol=sym,
+                        direction=TrendDirection.LONG,
+                        entry_price=entry_px,
+                        position_size=trend_qty,
+                        stop_loss_price=recovered_sl,
+                        trailing_stop_price=recovered_sl,
+                        entry_time=now_iso,
+                        highest_price=ref_high,
+                        lowest_price=ref_low,
+                    )
+                    logger.warning(
+                        f"  ♻ Recovered open Futures LONG for {sym}: "
+                        f"qty={trend_qty:.2f} @ {entry_px:.5f} (stop={recovered_sl:.5f})"
+                    )
+
     async def start(self):
         """Start all components and enter the main event loop."""
+        market_label = "Binance Futures" if self.app_config.exchange.market == "futures" else "Binance Spot"
         logger.info("=" * 60)
-        logger.info(" OPENQUANT v2.0 — Parallel Dual-Engine (Binance Spot)")
+        logger.info(f" OPENQUANT v2.0 — Parallel Dual-Engine ({market_label})")
         logger.info("=" * 60)
         self._start_time = time.time()
 
@@ -1049,17 +1229,44 @@ class TradingSystem:
             usdt_bal = sum(b.total for b in balances if b.asset == "USDT")
             total_equity = usdt_bal
 
-            for sym in symbols:
-                base = self.exchange_client.get_symbol_info(sym).base_asset
+            if self.app_config.exchange.market == "futures":
+                unrealized = 0.0
                 try:
-                    px = await self.exchange_client.get_ticker_price(sym)
-                except Exception:
-                    px = 0.0
-                qty = sum(b.total for b in balances if b.asset == base)
-                total_equity += qty * px
-                logger.info(f"  Exchange: {qty:.4f} {base} @ ${px:.5f} = ${qty*px:.2f}")
+                    positions = await self.exchange_client.get_futures_positions()
+                    configured = {s.upper() for s in symbols}
+                    for p in positions:
+                        sym_u = str(p.get("symbol", "")).upper()
+                        if sym_u not in configured:
+                            continue
+                        amt = float(p.get("positionAmt", 0.0) or 0.0)
+                        upnl = float(p.get("unRealizedProfit", 0.0) or 0.0)
+                        unrealized += upnl
+                        if abs(amt) > 1e-12:
+                            entry_px = float(p.get("entryPrice", 0.0) or 0.0)
+                            side_lbl = "LONG" if amt > 0 else "SHORT"
+                            logger.info(
+                                f"  Futures pos: {sym_u} {side_lbl} {abs(amt):.4f} "
+                                f"@ ${entry_px:.5f} (uPnL={upnl:+.2f})"
+                            )
+                except Exception as e:
+                    logger.warning(f"  Could not fetch Futures positions for startup equity: {e}")
+                total_equity = usdt_bal + unrealized
+                logger.info(
+                    f"  Exchange: ${usdt_bal:.2f} USDT (uPnL={unrealized:+.2f}) | "
+                    f"Total equity: ${total_equity:.2f}"
+                )
+            else:
+                for sym in symbols:
+                    base = self.exchange_client.get_symbol_info(sym).base_asset
+                    try:
+                        px = await self.exchange_client.get_ticker_price(sym)
+                    except Exception:
+                        px = 0.0
+                    qty = sum(b.total for b in balances if b.asset == base)
+                    total_equity += qty * px
+                    logger.info(f"  Exchange: {qty:.4f} {base} @ ${px:.5f} = ${qty*px:.2f}")
 
-            logger.info(f"  Exchange: ${usdt_bal:.2f} USDT | Total equity: ${total_equity:.2f}")
+                logger.info(f"  Exchange: ${usdt_bal:.2f} USDT | Total equity: ${total_equity:.2f}")
 
             if total_equity > 0:
                 self._cached_live_equity = total_equity
@@ -1103,6 +1310,9 @@ class TradingSystem:
                 logger.debug(f"  No old orders to clear for {symbol}: {e}")
         logger.info("Startup cleanup complete")
 
+        # 4b. Futures startup position sync (recover open trend positions & clear ghost grid_fills)
+        await self._sync_futures_positions_on_startup()
+
         # 5. Sync TP status FIRST, then start OrderManager (seeds fresh cache + WS),
         #    then recover any pending TP fills.
         logger.info("Syncing TP order status with exchange...")
@@ -1125,6 +1335,8 @@ class TradingSystem:
 
         # 6. Start data engine (fetches historical + opens WebSocket)
         self.state_machine.transition(StateTransition.DATA_READY)
+        if any(ts.is_active for ts in self._trend_states.values()):
+            self.state_machine.activate_trend()
         await self.data_engine.start()
 
         # 7. Start WeChat notifier & live web monitor dashboard
@@ -1479,13 +1691,13 @@ class TradingSystem:
                     grid_signal = StrategySignal(
                         action=SignalAction.STOP_GRID,
                         symbol=symbol,
-                        confidence=1.0,
+                        score=1.0,
                         metadata={
                             "grid_id": "",
                             "reason": "macro_bear",
                             "liquidate_inventory": True,
                         },
-                        source="GridStrategy",
+                        strategy_id="GridStrategy",
                     )
         elif was_macro_paused:
             logger.info(f"✓ Macro BEAR cleared for {symbol} ({macro_trend.value}) — resuming grid")
@@ -1648,13 +1860,13 @@ class TradingSystem:
             mutex_stop = StrategySignal(
                 action=SignalAction.STOP_GRID,
                 symbol=symbol,
-                confidence=1.0,
+                score=1.0,
                 metadata={
                     "grid_id": self._grid_configs[symbol].grid_id if symbol in self._grid_configs else "",
                     "reason": "trend_short_mutex",
                     "liquidate_inventory": True,
                 },
-                source="FuturesMutex",
+                strategy_id="FuturesMutex",
             )
             await self.order_manager.dispatch_signal(mutex_stop)
             self._grid_configs.pop(symbol, None)
@@ -1782,32 +1994,23 @@ class TradingSystem:
     async def _print_order_summary(self):
         """Print a clean minutely summary: open orders table + real P&L."""
         try:
-            # Fetch open orders and account from exchange
+            # Fetch open orders and unified live equity from exchange
             orders = await self.exchange_client.get_open_orders()
-            balances = await self.exchange_client.get_balances()
+            equity = await self._get_equity_async()
 
             buys = []
             sells = []
             for o in orders:
-                if o.get("side") == "BUY":
-                    buys.append((float(o["price"]), float(o["origQty"])))
+                px = float(o.get("price") or o.get("stopPrice") or 0.0)
+                qty = float(o.get("origQty") or 0.0)
+                is_sl = bool(o.get("_is_algo")) or "STOP" in str(o.get("type", "")).upper()
+                if str(o.get("side", "")).upper() == "BUY":
+                    buys.append((px, qty, is_sl))
                 else:
-                    sells.append((float(o["price"]), float(o["origQty"])))
+                    sells.append((px, qty, is_sl))
 
             buys.sort(key=lambda x: x[0], reverse=True)
             sells.sort(key=lambda x: x[0])
-
-            # Real equity from exchange
-            usdt = sum(b.total for b in balances if b.asset == "USDT")
-            equity = usdt
-            for sym in self.config["trading"]["symbols"]:
-                try:
-                    px = await self.exchange_client.get_ticker_price(sym)
-                except Exception:
-                    px = 0
-                base = sym.replace("USDT", "")
-                qty = sum(b.total for b in balances if b.asset == base)
-                equity += qty * px
 
             initial = getattr(self, '_initial_equity', 0.0)
             if initial <= 0:
@@ -1825,8 +2028,16 @@ class TradingSystem:
             lines.append("├─────────────────┼────────────────────────────────┤")
             max_rows = max(len(buys), len(sells), 1)
             for i in range(max_rows):
-                buy_str = f"{buys[i][1]:.0f} @ {buys[i][0]:.5f}" if i < len(buys) else ""
-                sell_str = f"{sells[i][1]:.0f} @ {sells[i][0]:.5f}" if i < len(sells) else ""
+                if i < len(buys):
+                    tag = " SL" if buys[i][2] else ""
+                    buy_str = f"{buys[i][1]:.0f}@{buys[i][0]:.5f}{tag}" if tag else f"{buys[i][1]:.0f} @ {buys[i][0]:.5f}"
+                else:
+                    buy_str = ""
+                if i < len(sells):
+                    tag = " [SL]" if sells[i][2] else ""
+                    sell_str = f"{sells[i][1]:.0f} @ {sells[i][0]:.5f}{tag}"
+                else:
+                    sell_str = ""
                 lines.append(f"│ {buy_str:<15} │ {sell_str:<30} │")
             lines.append("├─────────────────┴────────────────────────────────┤")
             lines.append(f"│ Equity: ${equity:.4f}  |  P&L: {pnl:+.4f} ({pnl_pct:+.2f}%)  │")
@@ -1840,7 +2051,8 @@ class TradingSystem:
         """Log current system status with live exchange equity."""
         sm = self.state_machine.snapshot()
         equity = await self._get_equity_async()
-        positions = len(self.ledger.get_all_positions())
+        self.risk_guard.update_peak_equity()
+        positions = len(self._get_positions())
         risk = self.risk_guard.get_risk_summary()
 
         logger.info(

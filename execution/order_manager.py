@@ -343,6 +343,41 @@ class OrderManager:
             logger.info(f"  TP sync complete: corrected {corrected} stale flags")
         return corrected
 
+    async def reconcile_futures_stale_grid_fills(
+        self, symbol: str, open_long_qty: float, mark_price: float = 0.0
+    ) -> int:
+        """
+        In Futures mode, if exchange holds no open LONG position (flat or net SHORT),
+        any pending grid_fills (sell_filled=FALSE) are stale ghosts whose reduceOnly
+        TP sells expired when the position was closed or flipped. Mark them settled so
+        they stop eating grid budget and cannot spawn phantom TPs later.
+        """
+        if open_long_qty > 0:
+            return 0
+        pending = self._ledger_get_pending_tp_fills(symbol)
+        if not pending:
+            return 0
+
+        now_iso = datetime.now(timezone.utc).isoformat()
+        cleared = 0
+        for fill in pending:
+            tid = fill.get("trade_id")
+            if not tid:
+                continue
+            settle_px = mark_price if mark_price > 0 else float(fill.get("buy_price", 0.0))
+            try:
+                self._ledger_grid_sell_filled(tid, settle_px, now_iso)
+                self._tp_attempted.discard(f"{GRID_TP_PREFIX}{tid}")
+                cleared += 1
+            except Exception as e:
+                logger.debug(f"Could not clear stale grid fill {tid}: {e}")
+
+        if cleared:
+            logger.warning(
+                f"  Cleared {cleared} stale {symbol} grid_fills (Futures open_long_qty=0)"
+            )
+        return cleared
+
     async def recover_pending_tp_fills(self) -> int:
         """
         Recover TP orders for BUY fills where sell_placed=FALSE.
@@ -728,28 +763,48 @@ class OrderManager:
             tracked_orders.append(tracked)
             self._active_trend_trade_id[signal.symbol] = trade_id
 
-            if response.executed_qty > 0:
-                fill_price = (
-                    response.cummulative_quote_qty / response.executed_qty
-                    if response.cummulative_quote_qty > 0
-                    else entry_px
-                )
+            exec_qty = response.executed_qty
+            cum_quote = response.cummulative_quote_qty
+            if exec_qty <= 0 and response.status in ("NEW", "PARTIALLY_FILLED"):
+                try:
+                    await asyncio.sleep(0.25)
+                    st = await self._client.get_order_status(
+                        signal.symbol, order_id=response.exchange_order_id
+                    )
+                    exec_qty = float(st.get("executedQty", 0) or 0)
+                    cum_quote = float(st.get("cumQuote") or st.get("cummulativeQuoteQty") or 0)
+                    if exec_qty > 0:
+                        tracked.filled_quantity = exec_qty
+                        tracked.status = str(st.get("status", tracked.status))
+                except Exception as poll_err:
+                    logger.debug(f"Post-entry order status poll skipped: {poll_err}")
+
+            if exec_qty > 0:
+                fill_price = (cum_quote / exec_qty) if cum_quote > 0 else entry_px
                 self._ledger_update_fill(
                     order_id=order_id,
                     exchange_order_id=response.exchange_order_id,
-                    filled_quantity=response.executed_qty,
+                    filled_quantity=exec_qty,
                     fill_price=fill_price,
                 )
 
-                # Place exchange-side STOP_LOSS_LIMIT (Spot Binance requires STOP_LOSS_LIMIT with limit price)
-                if raw_stop > 0:
+            stop_qty = exec_qty if exec_qty > 0 else (
+                position_size
+                if getattr(self._client, "market", "spot") == "futures"
+                and response.status in ("NEW", "PARTIALLY_FILLED", "FILLED")
+                else 0.0
+            )
+            if raw_stop > 0 and stop_qty > 0:
+                try:
                     await self._place_trend_stop_order(
                         symbol=signal.symbol,
                         direction=direction,
                         stop_price=raw_stop,
-                        quantity=response.executed_qty,
+                        quantity=stop_qty,
                         trade_id=trade_id,
                     )
+                except Exception as sl_err:
+                    logger.error(f"Failed to place trend stop-loss for {signal.symbol}: {sl_err}")
 
             logger.info(f"Trend entry placed: {signal.symbol} {direction} qty={position_size}")
 
@@ -1034,9 +1089,27 @@ class OrderManager:
                 logger.error(f"Reconciliation error: {e}", exc_info=True)
                 await asyncio.sleep(min(self.reconcile_interval, 10.0))
 
+    @staticmethod
+    def _parse_trade_side(trade: Dict[str, Any]) -> str:
+        """
+        Parse trade direction across Binance Spot (/myTrades) and Futures (/userTrades).
+
+        - Futures `/fapi/v1/userTrades` returns `"side": "BUY"|"SELL"` and `"buyer": bool`
+          (it does NOT include `"isBuyer"`!).
+        - Spot `/api/v3/myTrades` returns `"isBuyer": bool`.
+        """
+        raw_side = str(trade.get("side") or "").strip().upper()
+        if raw_side in ("BUY", "SELL"):
+            return raw_side
+        if "isBuyer" in trade:
+            return "BUY" if bool(trade.get("isBuyer")) else "SELL"
+        if "buyer" in trade:
+            return "BUY" if bool(trade.get("buyer")) else "SELL"
+        return "SELL"
+
     async def reconcile(self) -> None:
         """
-        Sync local order state with exchange via GET /myTrades.
+        Sync local order state with exchange via GET /myTrades (or Futures /userTrades).
         Processes EVERY trade_id (no dropping 2nd partial fill of an order).
         """
         symbols = set(self._symbols) | {o.symbol.upper() for o in self._orders.values() if o.symbol}
@@ -1048,18 +1121,25 @@ class OrderManager:
                     if not trade_id:
                         continue
                     ex_order_id = str(trade.get("orderId", ""))
-                    # Look up client_order_id from tracked orders if known
+                    # Look up client_order_id from tracked orders (or persisted TP record)
                     cid = ""
                     for o in self._orders.values():
                         if o.exchange_order_id == ex_order_id:
                             cid = o.client_order_id or ""
                             break
+                    if not cid:
+                        try:
+                            gf = self._ledger_get_grid_fill_by_sell_order(ex_order_id)
+                            if gf and gf.get("sell_client_order_id"):
+                                cid = str(gf["sell_client_order_id"])
+                        except Exception:
+                            pass
                     event = FillEvent(
                         trade_id=trade_id,
                         exchange_order_id=ex_order_id,
                         client_order_id=cid,
                         symbol=symbol.upper(),
-                        side="BUY" if trade.get("isBuyer", False) else "SELL",
+                        side=self._parse_trade_side(trade),
                         price=float(trade.get("price", 0)),
                         qty=float(trade.get("qty", 0)),
                         commission=float(trade.get("commission", 0)),
@@ -1267,6 +1347,7 @@ class OrderManager:
 
     async def _handle_sell_fill(self, event: FillEvent, sym_info: SymbolInfo) -> None:
         # Mark matching grid_fills row as filled
+        gf = None
         try:
             gf = self._ledger_get_grid_fill_by_sell_order(event.exchange_order_id)
             if gf:
@@ -1283,9 +1364,38 @@ class OrderManager:
         if rebuy_tag in self._rebuy_attempted:
             return
 
+        # Only auto-cycle verified Grid TP sells (never Trend SHORT entries or manual sells)
+        is_grid_tp = (gf is not None) or event.client_order_id.startswith(GRID_TP_PREFIX)
+        if not is_grid_tp:
+            return
+
+        # Never replenish grid buys when grid is paused/stopped (e.g. macro bear or SHORT mutex)
+        if not self.grid_active:
+            logger.debug(f"  Rebuy skipped for {event.symbol}: grid is inactive")
+            self._rebuy_attempted.add(rebuy_tag)
+            return
+
         entry_price = sym_info.round_price(event.price / self._grid_profit_mult)
         if entry_price <= 0:
             return
+
+        # Deduplicate against nearby open BUY orders (prevents 1-tick stacking after grid rebalance)
+        min_gap = max(float(sym_info.tick_size) * 2.0, entry_price * 0.003)
+        try:
+            open_orders = await self._client.get_open_orders(event.symbol)
+            for o in open_orders:
+                if str(o.get("side", "")).upper() != "BUY":
+                    continue
+                open_px = float(o.get("price") or 0.0)
+                if open_px > 0 and abs(open_px - entry_price) <= min_gap:
+                    logger.info(
+                        f"  ↻ Grid cycle rebuy skipped @ ${entry_price:.5f}: "
+                        f"nearby BUY already open @ ${open_px:.5f}"
+                    )
+                    self._rebuy_attempted.add(rebuy_tag)
+                    return
+        except Exception as e:
+            logger.debug(f"  Rebuy proximity check skipped: {e}")
 
         try:
             quote_bal = await self._client.get_asset_balance(sym_info.quote_asset)

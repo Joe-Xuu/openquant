@@ -547,7 +547,7 @@ class RiskGuard:
         current_equity = self._equity_provider()
         positions = self._positions_provider()
         drawdown = (
-            (self._peak_equity - current_equity) / self._peak_equity * 100
+            max(0.0, (self._peak_equity - current_equity) / self._peak_equity * 100)
             if self._peak_equity > 0
             else 0.0
         )

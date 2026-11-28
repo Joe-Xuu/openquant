@@ -24,11 +24,34 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 from typing import Any, Awaitable, Callable, Dict, List, Optional
 
 from aiohttp import web
 
 logger = logging.getLogger("monitor.web_server")
+
+_TOKEN_QUERY_RE = re.compile(r"([?&]token=)[^&\s\"']+", re.IGNORECASE)
+
+
+def redact_tokens(text: str) -> str:
+    """Mask query-string monitor tokens (?token=... or &token=...) in log text."""
+    return _TOKEN_QUERY_RE.sub(r"\1***", text)
+
+
+class TokenRedactFilter(logging.Filter):
+    """Logging filter that strips ?token=... secrets from aiohttp access logs."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        try:
+            rendered = record.getMessage()
+            redacted = redact_tokens(rendered)
+            if redacted != rendered:
+                record.msg = redacted
+                record.args = ()
+        except Exception:
+            pass
+        return True
 
 
 DASHBOARD_HTML = r"""<!DOCTYPE html>
@@ -899,6 +922,9 @@ class MonitorWebServer:
         return web.json_response({"status": "ok"})
 
     async def start(self) -> None:
+        access_logger = logging.getLogger("aiohttp.access")
+        if not any(isinstance(f, TokenRedactFilter) for f in access_logger.filters):
+            access_logger.addFilter(TokenRedactFilter())
         self._runner = web.AppRunner(self._app)
         await self._runner.setup()
         self._site = web.TCPSite(self._runner, self.host, self.port)

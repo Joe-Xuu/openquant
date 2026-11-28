@@ -344,12 +344,26 @@ class MarketDataEngine:
     # WebSocket: Real-Time Stream
     # ------------------------------------------------------------------
 
+    def _build_combined_stream_url(self) -> tuple[str, list[str]]:
+        """Build Binance combined-stream WebSocket URL preserving routed paths like /market."""
+        stream_names = [
+            f"{symbol.lower()}@kline_{interval}"
+            for symbol in self.symbols
+            for interval in self.intervals
+        ]
+        base = self.ws_base_url.rstrip("/")
+        if base.endswith("/ws"):
+            base = base[:-3]
+        ws_url = f"{base}/stream?streams={'/'.join(stream_names)}"
+        return ws_url, stream_names
+
     async def _websocket_loop(self) -> None:
         """
         Maintain a persistent WebSocket connection with auto-reconnect.
 
         Binance WebSocket stream format:
-        wss://stream.binance.com:9443/ws/<stream_names>
+        - Spot:    wss://stream.binance.com:9443/stream?streams=<stream_names>
+        - Futures: wss://fstream.binance.com/market/stream?streams=<stream_names>
 
         Stream name for klines: <symbol>@kline_<interval>
         Example: btcusdt@kline_5m
@@ -359,21 +373,17 @@ class MarketDataEngine:
             - On subsequent disconnects: exponential backoff (×2 each time).
             - Cap at 60 seconds.
         """
-        stream_names = []
-        for symbol in self.symbols:
-            for interval in self.intervals:
-                stream_names.append(f"{symbol.lower()}@kline_{interval}")
-
-        # Multi-stream URL — strip trailing /ws if present, use /stream?streams= format
-        base = self.ws_base_url.rstrip('/ws').rstrip('/')
-        ws_url = f"{base}/stream?streams={'/'.join(stream_names)}"
+        ws_url, stream_names = self._build_combined_stream_url()
+        ws_base_display = ws_url.split("?", 1)[0]
         reconnect_delay = self.ws_reconnect_delay
 
         while self._running:
             try:
                 async with self._session.ws_connect(ws_url, heartbeat=20.0) as ws:
                     self._ws_connection = ws
-                    logger.info(f"WebSocket connected: {len(stream_names)} streams")
+                    logger.info(
+                        f"WebSocket connected: {len(stream_names)} streams ({ws_base_display})"
+                    )
                     reconnect_delay = self.ws_reconnect_delay  # Reset on successful connect
 
                     async for msg in ws:
@@ -382,6 +392,9 @@ class MarketDataEngine:
                         elif msg.type == aiohttp.WSMsgType.ERROR:
                             logger.error(f"WebSocket error: {ws.exception()}")
                             break
+
+                if self._running:
+                    await asyncio.sleep(min(reconnect_delay, 5.0))
 
             except asyncio.CancelledError:
                 break

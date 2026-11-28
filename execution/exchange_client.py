@@ -303,8 +303,8 @@ class ExchangeClient:
                 else "https://fapi.binance.com"
             )
             self._ws_base = (
-                "wss://stream.binancefuture.com/ws" if testnet
-                else "wss://fstream.binance.com/ws"
+                "wss://fstream.binancefuture.com/private/ws" if testnet
+                else "wss://fstream.binance.com/private/ws"
             )
             self._api_prefix = "/fapi/v1"
             self._user_stream_endpoint = "/fapi/v1/listenKey"
@@ -374,6 +374,7 @@ class ExchangeClient:
         method: str,
         endpoint: str,
         params: Optional[Dict[str, Any]] = None,
+        quiet_codes: Tuple[int, ...] = (),
     ) -> Dict[str, Any]:
         """
         Make a signed request to the Binance API.
@@ -381,7 +382,8 @@ class ExchangeClient:
         Args:
             method: HTTP method (GET, POST, DELETE).
             endpoint: API endpoint (e.g., f"{self._api_prefix}/order").
-            params: Query parameters.
+            params: Query parameters (never mutated in-place).
+            quiet_codes: Binance error codes logged at DEBUG instead of ERROR.
 
         Returns:
             Parsed JSON response.
@@ -390,14 +392,14 @@ class ExchangeClient:
             BinanceAPIError: On API-level errors.
             ExchangeConnectionError: On network errors.
         """
-        if params is None:
-            params = {}
+        req_params: Dict[str, Any] = dict(params) if params is not None else {}
+        req_params.pop("signature", None)
 
-        params["timestamp"] = int(time.time() * 1000 + self._time_offset_ms)
-        params["recvWindow"] = self.recv_window
-        params["signature"] = self._sign(params)
+        req_params["timestamp"] = int(time.time() * 1000 + self._time_offset_ms)
+        req_params["recvWindow"] = self.recv_window
+        req_params["signature"] = self._sign(req_params)
 
-        query_string = "&".join(f"{k}={v}" for k, v in sorted(params.items()))
+        query_string = "&".join(f"{k}={v}" for k, v in sorted(req_params.items()))
         full_url = f"{self._rest_base}{endpoint}?{query_string}"
         headers = {"X-MBX-APIKEY": self.api_key}
 
@@ -432,14 +434,17 @@ class ExchangeClient:
                                 f"Re-syncing server time..."
                             )
                             await self._sync_server_time()
-                            params.pop("signature", None)
-                            params["timestamp"] = int(time.time() * 1000 + self._time_offset_ms)
-                            params["signature"] = self._sign(params)
-                            query_string = "&".join(f"{k}={v}" for k, v in sorted(params.items()))
+                            req_params.pop("signature", None)
+                            req_params["timestamp"] = int(time.time() * 1000 + self._time_offset_ms)
+                            req_params["signature"] = self._sign(req_params)
+                            query_string = "&".join(f"{k}={v}" for k, v in sorted(req_params.items()))
                             full_url = f"{self._rest_base}{endpoint}?{query_string}"
                             continue
 
-                        logger.error(f"Binance API error [{resp.status}]: {error_msg}")
+                        if error_code in quiet_codes:
+                            logger.debug(f"Binance API benign [{resp.status}] ({error_code}): {error_msg}")
+                        else:
+                            logger.error(f"Binance API error [{resp.status}]: {error_msg}")
                         if resp.status >= 500:
                             await asyncio.sleep(2 ** attempt)
                             continue
@@ -619,16 +624,15 @@ class ExchangeClient:
 
     async def get_open_orders(self, symbol: Optional[str] = None) -> List[Dict[str, Any]]:
         """Get all currently open orders (including Futures conditional algo orders)."""
-        params = {}
-        if symbol:
-            params["symbol"] = symbol.upper()
-        orders = await self._signed_request("GET", f"{self._api_prefix}/openOrders", params)
+        order_params: Dict[str, Any] = {"symbol": symbol.upper()} if symbol else {}
+        orders = await self._signed_request("GET", f"{self._api_prefix}/openOrders", order_params)
         if not isinstance(orders, list):
             orders = []
 
         if self.market == "futures":
             try:
-                algo_raw = await self._signed_request("GET", "/fapi/v1/openAlgoOrders", params)
+                algo_params: Dict[str, Any] = {"symbol": symbol.upper()} if symbol else {}
+                algo_raw = await self._signed_request("GET", "/fapi/v1/openAlgoOrders", algo_params)
                 algo_list = algo_raw if isinstance(algo_raw, list) else algo_raw.get("orders", []) if isinstance(algo_raw, dict) else []
                 for a in algo_list:
                     orders.append({
@@ -646,7 +650,7 @@ class ExchangeClient:
                         "_is_algo": True,
                     })
             except Exception as e:
-                logger.debug(f"get openAlgoOrders non-fatal: {e}")
+                logger.warning(f"get openAlgoOrders failed (non-fatal): {e}")
 
         return orders
 
@@ -683,7 +687,9 @@ class ExchangeClient:
             return {}
         params = {"symbol": symbol.upper(), "marginType": margin_type.upper()}
         try:
-            return await self._signed_request("POST", "/fapi/v1/marginType", params)
+            return await self._signed_request(
+                "POST", "/fapi/v1/marginType", params, quiet_codes=(-4046,)
+            )
         except BinanceAPIError as e:
             if "-4046" in str(e) or "No need to change margin type" in str(e):
                 return {"msg": "already_set"}
