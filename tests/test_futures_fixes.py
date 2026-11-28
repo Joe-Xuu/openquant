@@ -86,6 +86,7 @@ class TestExchangeClientFixes:
                     "symbol": "DOGEUSDT",
                     "side": "BUY",
                     "orderType": "STOP_MARKET",
+                    "price": "0.00000",
                     "triggerPrice": "0.059",
                     "quantity": "1000",
                     "reduceOnly": True,
@@ -103,7 +104,8 @@ class TestExchangeClientFixes:
         fake_sess.requested_urls.clear()
         orders = await client.get_open_orders("DOGEUSDT")
         assert len(orders) == 2
-        assert any(o.get("_is_algo") for o in orders)
+        algo_order = next(o for o in orders if o.get("_is_algo"))
+        assert algo_order["price"] == "0.059"
         assert len(fake_sess.requested_urls) == 2
 
         for url in fake_sess.requested_urls:

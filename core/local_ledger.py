@@ -414,8 +414,6 @@ class LedgerEngine:
         conn = self._get_conn()
         with self._write_lock:
             try:
-                with conn.cursor() as cur:
-                    cur.execute("BEGIN")
                 yield conn
                 conn.commit()
             except Exception:

@@ -2001,7 +2001,9 @@ class TradingSystem:
             buys = []
             sells = []
             for o in orders:
-                px = float(o.get("price") or o.get("stopPrice") or 0.0)
+                px = float(o.get("price") or 0.0)
+                if px <= 0:
+                    px = float(o.get("stopPrice") or 0.0)
                 qty = float(o.get("origQty") or 0.0)
                 is_sl = bool(o.get("_is_algo")) or "STOP" in str(o.get("type", "")).upper()
                 if str(o.get("side", "")).upper() == "BUY":

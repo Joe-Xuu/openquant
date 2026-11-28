@@ -635,14 +635,17 @@ class ExchangeClient:
                 algo_raw = await self._signed_request("GET", "/fapi/v1/openAlgoOrders", algo_params)
                 algo_list = algo_raw if isinstance(algo_raw, list) else algo_raw.get("orders", []) if isinstance(algo_raw, dict) else []
                 for a in algo_list:
+                    raw_px = float(a.get("price") or 0.0)
+                    trig_px = float(a.get("triggerPrice") or 0.0)
+                    eff_px = a.get("price") if raw_px > 0 else (a.get("triggerPrice") or "0")
                     orders.append({
                         "symbol": a.get("symbol", symbol or ""),
                         "orderId": str(a.get("algoId", "")),
                         "clientOrderId": str(a.get("clientAlgoId", "")),
                         "side": a.get("side", ""),
                         "type": a.get("orderType", a.get("type", "STOP_MARKET")),
-                        "price": str(a.get("price") or a.get("triggerPrice") or "0"),
-                        "stopPrice": str(a.get("triggerPrice") or "0"),
+                        "price": str(eff_px),
+                        "stopPrice": str(a.get("triggerPrice") or ("0" if trig_px <= 0 else trig_px)),
                         "origQty": str(a.get("quantity", "0")),
                         "executedQty": "0",
                         "reduceOnly": bool(a.get("reduceOnly", False)),
