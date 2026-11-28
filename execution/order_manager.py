@@ -271,9 +271,10 @@ class OrderManager:
             cid = o.get("clientOrderId", "")
             if any(cid.startswith(p) for p in prefixes):
                 try:
-                    await self._client.cancel_order(
-                        symbol, order_id=str(o.get("orderId", ""))
-                    )
+                    cancel_kw: Dict[str, Any] = {"order_id": str(o.get("orderId", ""))}
+                    if o.get("_is_algo"):
+                        cancel_kw["is_algo"] = True
+                    await self._client.cancel_order(symbol, **cancel_kw)
                     cancelled += 1
                 except Exception as e:
                     logger.debug(f"Could not cancel {symbol} {cid}: {e}")

@@ -441,7 +441,16 @@ class ExchangeClient:
                             full_url = f"{self._rest_base}{endpoint}?{query_string}"
                             continue
 
-                        if error_code in quiet_codes:
+                        benign = (
+                            error_code in quiet_codes
+                            or (endpoint == "/fapi/v1/marginType" and error_code == -4046)
+                            or (
+                                method == "DELETE"
+                                and endpoint == "/fapi/v1/order"
+                                and error_code == -2011
+                            )
+                        )
+                        if benign:
                             logger.debug(f"Binance API benign [{resp.status}] ({error_code}): {error_msg}")
                         else:
                             logger.error(f"Binance API error [{resp.status}]: {error_msg}")
@@ -573,14 +582,28 @@ class ExchangeClient:
                 raw_response=response,
             )
 
-    async def cancel_order(self, symbol: str, order_id: Optional[str] = None,
-                           client_order_id: Optional[str] = None) -> Dict[str, Any]:
+    async def cancel_order(
+        self,
+        symbol: str,
+        order_id: Optional[str] = None,
+        client_order_id: Optional[str] = None,
+        is_algo: bool = False,
+    ) -> Dict[str, Any]:
         """
         Cancel an order by exchange order ID or client order ID.
-        In Futures mode, falls back to DELETE /fapi/v1/algoOrder for conditional stops.
+        In Futures mode, routes known algo orders directly to DELETE /fapi/v1/algoOrder
+        and falls back cleanly on -2011 when order type is unknown.
         """
         if not order_id and not client_order_id:
             raise ValueError("Either order_id or client_order_id is required")
+
+        if self.market == "futures" and is_algo:
+            algo_params: Dict[str, Any] = {}
+            if order_id:
+                algo_params["algoId"] = order_id
+            elif client_order_id:
+                algo_params["clientAlgoId"] = client_order_id
+            return await self._signed_request("DELETE", "/fapi/v1/algoOrder", algo_params)
 
         params = {"symbol": symbol.upper()}
         if order_id:
@@ -593,7 +616,7 @@ class ExchangeClient:
         except BinanceAPIError:
             if self.market != "futures":
                 raise
-            algo_params: Dict[str, Any] = {}
+            algo_params = {}
             if order_id:
                 algo_params["algoId"] = order_id
             elif client_order_id:
@@ -690,9 +713,7 @@ class ExchangeClient:
             return {}
         params = {"symbol": symbol.upper(), "marginType": margin_type.upper()}
         try:
-            return await self._signed_request(
-                "POST", "/fapi/v1/marginType", params, quiet_codes=(-4046,)
-            )
+            return await self._signed_request("POST", "/fapi/v1/marginType", params)
         except BinanceAPIError as e:
             if "-4046" in str(e) or "No need to change margin type" in str(e):
                 return {"msg": "already_set"}

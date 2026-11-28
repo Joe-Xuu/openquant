@@ -289,10 +289,11 @@ class TrendStrategy:
                 reason = "trailing_stop_hit" if state.trailing_stop_price > state.stop_loss_price else "stop_loss_hit"
                 return self._generate_exit_signal(symbol, state, price, reason)
 
-            # Chandelier trailing stop anchored to highest price since entry
+            # Chandelier trailing stop anchored to highest price since entry (0.1% min ratchet step)
             peak = max(state.highest_price or state.entry_price, price)
             new_trail = peak - self.trailing_stop_atr_multiplier * atr
-            if new_trail > state.trailing_stop_price and new_trail > state.stop_loss_price:
+            min_improve = state.trailing_stop_price * 1.001 if state.trailing_stop_price > 0 else 0.0
+            if new_trail > min_improve and new_trail > state.stop_loss_price:
                 return self._generate_adjust_stop_signal(
                     symbol, state, price, new_trail, atr, highest_price=peak
                 )
@@ -306,10 +307,14 @@ class TrendStrategy:
                 ) else "stop_loss_hit"
                 return self._generate_exit_signal(symbol, state, price, reason)
 
-            # Chandelier trailing stop anchored to lowest price since entry
+            # Chandelier trailing stop anchored to lowest price since entry (0.1% min ratchet step)
             trough = min(state.lowest_price or state.entry_price, price)
             new_trail = trough + self.trailing_stop_atr_multiplier * atr
-            if (state.trailing_stop_price <= 0 or new_trail < state.trailing_stop_price) and new_trail < state.stop_loss_price:
+            improves = (
+                state.trailing_stop_price <= 0
+                or new_trail < state.trailing_stop_price * 0.999
+            )
+            if improves and new_trail < state.stop_loss_price:
                 return self._generate_adjust_stop_signal(
                     symbol, state, price, new_trail, atr, lowest_price=trough
                 )
